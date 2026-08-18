@@ -1,5 +1,7 @@
 /target
 /models/
 /report*.csv
+/metrics*.csv
 /testpic/
+/archive/
 /samples/generated/

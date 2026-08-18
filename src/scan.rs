@@ -26,6 +26,11 @@ pub struct PhotoEntry {
     pub f_number: String,
     pub shutter_speed: String,
     pub focal_length: String,
+    // ---- 评分字段（score 子命令填充；scan 子命令为空）----
+    pub sharpness_score: String,
+    pub exposure_score: String,
+    pub noise_score: String,
+    pub total_score: String,
 }
 
 /// 是否为支持的照片文件扩展名

@@ -1,0 +1,10 @@
+path,filename,extension,is_raw,has_pair,date_time_original,camera_make,camera_model,lens_model,iso,f_number,shutter_speed,focal_length,sharpness_score,exposure_score,noise_score,total_score
+samples/generated\DSC00001.ARW,DSC00001.ARW,arw,true,true,,,,,,,,,0.0,0.0,100.0,25.0
+samples/generated\DSC00001.JPG,DSC00001.JPG,jpg,false,true,,,,,,,,,0.0,0.0,100.0,25.0
+samples/generated\DSC00002.ARW,DSC00002.ARW,arw,true,true,,,,,,,,,0.0,0.0,100.0,25.0
+samples/generated\DSC00002.JPG,DSC00002.JPG,jpg,false,true,,,,,,,,,0.0,0.0,100.0,25.0
+samples/generated\DSC00003.JPG,DSC00003.JPG,jpg,false,false,,,,,,,,,0.5,83.3,76.2,44.3
+samples/generated\DSC00004.ARW,DSC00004.ARW,arw,true,false,,,,,,,,,,,,
+samples/generated\Sony_Alpha7_III_20_apr_2018b.jpg,Sony_Alpha7_III_20_apr_2018b.jpg,jpg,false,false,2018:04:20 12:44:22,,,XC16-50mmF3.5-5.6 OIS,,5.3,1/60,37.1,100.0,76.1,23.3,73.7
+samples/generated\Sony_Alpha7_III_20_apr_2018f.jpg,Sony_Alpha7_III_20_apr_2018f.jpg,jpg,false,false,2018:04:20 12:46:40,,,XC16-50mmF3.5-5.6 OIS,,9,1/56,28.2,100.0,91.1,58.9,87.1
+samples/generated\Sony_ILCE-7M3_18.jpg,Sony_ILCE-7M3_18.jpg,jpg,false,false,2022:09:23 17:48:42,Canon,Canon PowerShot SX620 HS,,400,3.2,1/15,4.5,100.0,95.7,68.4,90.8
