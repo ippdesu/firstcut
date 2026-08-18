@@ -30,7 +30,11 @@ pub struct PhotoEntry {
     pub sharpness_score: String,
     pub exposure_score: String,
     pub noise_score: String,
+    pub composition_score: String,
+    pub aesthetic_score: String,
     pub total_score: String,
+    /// 检测到的人脸数
+    pub faces: String,
     // ---- 连拍去重字段（score 子命令填充）----
     /// 连拍组号（0 = 非连拍）
     pub burst_group: String,

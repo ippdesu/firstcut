@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use pic_process::config::{DedupParams, ScoreWeights};
 use pic_process::dedup::{self, BurstInfo};
 use pic_process::scan::{self, stem_of};
-use pic_process::score::{self, AnalysisResult};
+use pic_process::score::{self, AiEngine, AnalysisResult};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -24,7 +24,7 @@ enum Commands {
         #[arg(short, long, default_value = "report.csv")]
         output: PathBuf,
     },
-    /// 扫描并对 JPG 做像素评分 + 连拍去重，输出加权总分 CSV
+    /// 扫描并评分（清晰度/曝光/噪点/构图/美学 + 连拍去重），输出 CSV
     Score {
         /// 照片目录
         dir: PathBuf,
@@ -34,6 +34,9 @@ enum Commands {
         /// 连拍子簇内保留前 K 张
         #[arg(short, long, default_value_t = 2)]
         keep: usize,
+        /// 跳过 AI 推理（无模型时快速预览）
+        #[arg(long)]
+        no_ai: bool,
     },
 }
 
@@ -46,15 +49,32 @@ fn main() -> Result<()> {
             pic_process::output::csv::write_csv(&output, &entries)?;
             eprintln!("[scan] CSV 已写出: {}", output.display());
         }
-        Commands::Score { dir, output, keep } => {
+        Commands::Score { dir, output, keep, no_ai } => {
             let mut entries = scan::scan_directory(&dir)?;
             eprintln!("[score] 发现 {} 个文件（JPG/ARW）", entries.len());
 
-            // 1) JPG 像素分析（Phase 1 约定：JPG 评分 → 映射到 ARW）
+            // 0) AI 引擎（可跳过）
+            let engine = if no_ai {
+                eprintln!("[score] 跳过 AI 推理（--no-ai）");
+                AiEngine::none()
+            } else {
+                match AiEngine::load() {
+                    Ok(e) => e,
+                    Err(err) => {
+                        eprintln!("[score] 警告: {err:#}");
+                        eprintln!("[score] 降级为纯像素评分；或使用 --no-ai 关闭提示");
+                        AiEngine::none()
+                    }
+                }
+            };
+
+            // 1) JPG 像素分析 + AI（Phase 1 约定：JPG 评分 → 映射到 ARW）
             let jpg_count = entries.iter().filter(|e| !e.is_raw).count();
-            let analyzed = score::analyze_jpgs(&entries);
+            let analyzed = score::analyze_jpgs(&entries, &engine);
             eprintln!(
-                "[score] 像素分析完成: {}/{} 张 JPG",
+                "[score] 分析完成: {}/{} 张 JPG（AI: {}/{}）",
+                analyzed.len(),
+                jpg_count,
                 analyzed.len(),
                 jpg_count
             );
@@ -68,7 +88,7 @@ fn main() -> Result<()> {
             for e in entries.iter_mut().filter(|e| !e.is_raw) {
                 let stem = stem_of(&e.filename);
                 if let Some(r) = by_stem.get(&stem) {
-                    apply_scores(e, &r.scores);
+                    apply_scores(e, &r.scores, r.faces);
                 }
                 if let Some(info) = burst_info.get(&stem) {
                     apply_burst(e, info);
@@ -78,7 +98,7 @@ fn main() -> Result<()> {
             for e in entries.iter_mut().filter(|e| e.is_raw) {
                 let stem = stem_of(&e.filename);
                 if let Some(r) = by_stem.get(&stem) {
-                    apply_scores(e, &r.scores);
+                    apply_scores(e, &r.scores, r.faces);
                 }
                 if let Some(info) = burst_info.get(&stem) {
                     apply_burst(e, info);
@@ -137,11 +157,14 @@ fn run_burst_analysis(
 }
 
 /// 把分数写入 PhotoEntry 的 CSV 字段
-fn apply_scores(e: &mut scan::PhotoEntry, s: &score::PixelScores) {
+fn apply_scores(e: &mut scan::PhotoEntry, s: &score::PixelScores, faces: usize) {
     e.sharpness_score = fmt(s.sharpness);
     e.exposure_score = fmt(s.exposure);
     e.noise_score = fmt(s.noise);
+    e.composition_score = fmt(s.composition);
+    e.aesthetic_score = fmt(s.aesthetic);
     e.total_score = fmt(score::total_score(s, &ScoreWeights::default()));
+    e.faces = faces.to_string();
 }
 
 /// 把连拍信息写入 PhotoEntry 的 CSV 字段

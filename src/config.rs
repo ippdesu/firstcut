@@ -6,14 +6,18 @@ pub struct ScoreWeights {
     pub sharpness: f64,
     pub exposure: f64,
     pub noise: f64,
+    pub composition: f64,
+    pub aesthetic: f64,
 }
 
 impl Default for ScoreWeights {
     fn default() -> Self {
         ScoreWeights {
-            sharpness: 0.45,
-            exposure: 0.30,
-            noise: 0.25,
+            sharpness: 0.35,
+            exposure: 0.20,
+            noise: 0.15,
+            composition: 0.15,
+            aesthetic: 0.15,
         }
     }
 }

@@ -8,12 +8,14 @@ use std::path::Path;
 use anyhow::Result;
 use image::GenericImageView;
 
-/// 分析用图像：灰度数据 + 直方图
+/// 分析用图像：灰度数据 + 直方图 + RGB 数据（AI 推理用）
 pub struct AnalyzedImage {
     pub width: u32,
     pub height: u32,
     /// 灰度像素（长度 = width*height）
     pub luma: Vec<u8>,
+    /// RGB 像素（长度 = width*height*3，AI 模型输入用）
+    pub rgb: Vec<u8>,
     /// 256 级亮度直方图
     pub histogram: [u64; 256],
     /// 亮度方差（对比度，用于归一化清晰度指标）
@@ -75,6 +77,7 @@ pub fn load_analysis_image(path: &Path) -> Result<Option<AnalyzedImage>> {
         width: nw,
         height: nh,
         luma: luma.into_raw(),
+        rgb: small.to_rgb8().into_raw(),
         histogram,
         luma_variance,
     }))
