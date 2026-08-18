@@ -69,13 +69,30 @@ pub fn total_score(s: &PixelScores, w: &ScoreWeights) -> f64 {
     (total * 10.0).round() / 10.0
 }
 
-/// 对全部 JPG 并行做像素分析 + AI 推理，返回 stem -> 分析结果
-pub fn analyze_jpgs(entries: &[PhotoEntry], ai: &AiEngine) -> HashMap<String, AnalysisResult> {
+/// 分析结果 + 缓存统计
+pub struct AnalysisOutcome {
+    /// stem -> 分析结果
+    pub results: HashMap<String, AnalysisResult>,
+    /// 缓存命中数
+    pub hits: usize,
+    /// 新分析数
+    pub misses: usize,
+    /// 需要写入缓存的新行：(path, size, mtime, result)
+    pub new_rows: Vec<(String, u64, i64, AnalysisResult)>,
+}
+
+/// 对全部 JPG 并行做像素分析 + AI 推理（优先命中缓存），返回 stem -> 分析结果
+pub fn analyze_jpgs(
+    entries: &[PhotoEntry],
+    ai: &AiEngine,
+    cache: Option<&crate::cache::ScoreCache>,
+) -> AnalysisOutcome {
     let params = MetricParams::default();
     let counter = AtomicUsize::new(0);
+    let hits = AtomicUsize::new(0);
     let total = entries.iter().filter(|e| !e.is_raw).count().max(1);
 
-    entries
+    let (results, new_rows): (HashMap<String, AnalysisResult>, Vec<(String, u64, i64, AnalysisResult)>) = entries
         .par_iter()
         .filter(|e| !e.is_raw)
         .filter_map(|e| {
@@ -83,10 +100,45 @@ pub fn analyze_jpgs(entries: &[PhotoEntry], ai: &AiEngine) -> HashMap<String, An
             if done % 25 == 0 || done == total {
                 eprintln!("[score] 进度 {}/{}", done, total);
             }
+            // 缓存命中则跳过分析
+            if let Some(c) = cache {
+                if let Some((size, mtime)) = crate::cache::file_fingerprint(Path::new(&e.path)) {
+                    if let Some(r) = c.get(&e.path, size, mtime) {
+                        hits.fetch_add(1, Ordering::Relaxed);
+                        return Some((stem_of(&e.filename), r, None));
+                    }
+                }
+            }
             let result = analyze_one(e, &params, ai).ok().flatten()?;
-            Some((stem_of(&e.filename), result))
+            let row = crate::cache::file_fingerprint(Path::new(&e.path))
+                .map(|(size, mtime)| (e.path.clone(), size, mtime, result));
+            Some((stem_of(&e.filename), result, row))
         })
-        .collect()
+        .fold(
+            || (HashMap::new(), Vec::new()),
+            |(mut m, mut v), (stem, result, row)| {
+                m.insert(stem, result);
+                if let Some(r) = row {
+                    v.push(r);
+                }
+                (m, v)
+            },
+        )
+        .reduce(
+            || (HashMap::new(), Vec::new()),
+            |(mut m1, mut v1), (m2, v2)| {
+                m1.extend(m2);
+                v1.extend(v2);
+                (m1, v1)
+            },
+        );
+
+    AnalysisOutcome {
+        hits: hits.load(Ordering::Relaxed),
+        misses: results.len().saturating_sub(hits.load(Ordering::Relaxed)),
+        results,
+        new_rows,
+    }
 }
 
 /// 单张 JPG 的完整分析（像素指标 + MUSIQ 美学 + YuNet 人脸 + dHash）

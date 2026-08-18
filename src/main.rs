@@ -1,7 +1,9 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use pic_process::cache::ScoreCache;
 use pic_process::config::{DedupParams, ScoreWeights};
 use pic_process::dedup::{self, BurstInfo};
+use pic_process::output;
 use pic_process::scan::{self, stem_of};
 use pic_process::score::{self, AiEngine, AnalysisResult};
 use std::collections::HashMap;
@@ -37,6 +39,15 @@ enum Commands {
         /// 跳过 AI 推理（无模型时快速预览）
         #[arg(long)]
         no_ai: bool,
+        /// 写 XMP 星级侧车（xmp:Rating + firstcut 子分）
+        #[arg(long)]
+        xmp: bool,
+        /// 增量缓存文件路径（默认 pic_process_cache.sqlite）
+        #[arg(long, default_value = "pic_process_cache.sqlite")]
+        cache: PathBuf,
+        /// 禁用增量缓存
+        #[arg(long)]
+        no_cache: bool,
     },
 }
 
@@ -49,7 +60,7 @@ fn main() -> Result<()> {
             pic_process::output::csv::write_csv(&output, &entries)?;
             eprintln!("[scan] CSV 已写出: {}", output.display());
         }
-        Commands::Score { dir, output, keep, no_ai } => {
+        Commands::Score { dir, output, keep, no_ai, xmp, cache, no_cache } => {
             let mut entries = scan::scan_directory(&dir)?;
             eprintln!("[score] 发现 {} 个文件（JPG/ARW）", entries.len());
 
@@ -68,23 +79,45 @@ fn main() -> Result<()> {
                 }
             };
 
-            // 1) JPG 像素分析 + AI（Phase 1 约定：JPG 评分 → 映射到 ARW）
+            // 1) 增量缓存（可禁用）
+            let mut cache = if no_cache {
+                None
+            } else {
+                match ScoreCache::open(&cache) {
+                    Ok(c) => {
+                        eprintln!("[score] 缓存: {} 条（{}）", c.len(), cache.display());
+                        Some(c)
+                    }
+                    Err(err) => {
+                        eprintln!("[score] 警告: {err:#}（本次不使用缓存）");
+                        None
+                    }
+                }
+            };
+
+            // 2) JPG 像素分析 + AI（优先缓存命中）
             let jpg_count = entries.iter().filter(|e| !e.is_raw).count();
-            let analyzed = score::analyze_jpgs(&entries, &engine);
+            let outcome = score::analyze_jpgs(&entries, &engine, cache.as_ref());
             eprintln!(
-                "[score] 分析完成: {}/{} 张 JPG（AI: {}/{}）",
-                analyzed.len(),
-                jpg_count,
-                analyzed.len(),
-                jpg_count
+                "[score] 分析完成: {} 张 JPG（缓存命中 {}，新分析 {}）",
+                jpg_count, outcome.hits, outcome.misses
             );
+            // 新结果落盘
+            if let Some(c) = &mut cache {
+                for (path, size, mtime, r) in &outcome.new_rows {
+                    let _ = c.put(path, *size, *mtime, r);
+                }
+                if let Err(err) = c.flush() {
+                    eprintln!("[score] 警告: 缓存写入失败: {err:#}");
+                }
+            }
 
-            // 2) 连拍去重（只针对有分析的 JPG）
+            // 3) 连拍去重（只针对有分析的 JPG）
             let dedup_params = DedupParams { keep_k: keep, ..Default::default() };
-            let burst_info = run_burst_analysis(&mut entries, &analyzed, &dedup_params);
+            let burst_info = run_burst_analysis(&mut entries, &outcome.results, &dedup_params);
 
-            // 3) 回填 JPG 分数 + 连拍信息
-            let by_stem: HashMap<String, AnalysisResult> = analyzed;
+            // 4) 回填 JPG 分数 + 连拍信息
+            let by_stem: HashMap<String, AnalysisResult> = outcome.results;
             for e in entries.iter_mut().filter(|e| !e.is_raw) {
                 let stem = stem_of(&e.filename);
                 if let Some(r) = by_stem.get(&stem) {
@@ -94,7 +127,7 @@ fn main() -> Result<()> {
                     apply_burst(e, info);
                 }
             }
-            // 4) JPG 结果映射到同名 ARW
+            // 5) JPG 结果映射到同名 ARW
             for e in entries.iter_mut().filter(|e| e.is_raw) {
                 let stem = stem_of(&e.filename);
                 if let Some(r) = by_stem.get(&stem) {
@@ -103,6 +136,23 @@ fn main() -> Result<()> {
                 if let Some(info) = burst_info.get(&stem) {
                     apply_burst(e, info);
                 }
+            }
+
+            // 6) XMP 星级侧车（可选）
+            if xmp {
+                let mut written = 0usize;
+                let mut skipped = 0usize;
+                for e in &entries {
+                    if let Some(r) = by_stem.get(&stem_of(&e.filename)) {
+                        let total = score::total_score(&r.scores, &ScoreWeights::default());
+                        match output::xmp::write_sidecar(e, &r.scores, total) {
+                            Ok(true) => written += 1,
+                            Ok(false) => skipped += 1,
+                            Err(err) => eprintln!("[xmp] 写入失败 {}: {err:#}", e.path),
+                        }
+                    }
+                }
+                eprintln!("[xmp] 侧车写入 {written} 个，跳过 {skipped} 个");
             }
 
             pic_process::output::csv::write_csv(&output, &entries)?;

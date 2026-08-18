@@ -1,6 +1,7 @@
 //! pic_process 库入口（Phase 1：扫描/评分）
 
 pub mod ai;
+pub mod cache;
 pub mod config;
 pub mod decode;
 pub mod dedup;
