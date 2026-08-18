@@ -1,0 +1,5 @@
+/target
+/models/
+/report*.csv
+/testpic/
+/samples/generated/

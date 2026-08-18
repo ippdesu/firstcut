@@ -1,0 +1,13 @@
+[package]
+name = "pic_process"
+version = "0.1.0"
+edition = "2021"
+description = "索尼照片初筛评分工具（Phase 1: 扫描/评分/报告）"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+csv = "1"
+kamadak-exif = "0.5"
+serde = { version = "1", features = ["derive"] }
+walkdir = "2"
