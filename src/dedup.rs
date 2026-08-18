@@ -290,15 +290,15 @@ mod tests {
         assert_eq!(h1, h2);
         assert_eq!(hamming(h1, h2), 0);
 
-        // 高低交替图案（每对相邻列左>右）vs 全灰：所有比较位相反 → 距离 64
+        // 严格递减图案（每对相邻列左>右）vs 全灰：所有比较位相反 → 距离 64
         let mut luma3 = vec![128u8; 9 * 8];
         for y in 0..8 {
             for x in 0..9 {
-                luma3[y * 9 + x] = if x % 2 == 0 { 200 } else { 50 };
+                luma3[y * 9 + x] = 255 - (x as u8) * 28; // 255,227,199,...,31 严格递减
             }
         }
         let h3 = dhash(&luma3, 9, 8);
-        assert_eq!(h3, u64::MAX, "高低交替应产生全 1 哈希");
+        assert_eq!(h3, u64::MAX, "严格递减应产生全 1 哈希");
         assert_eq!(hamming(h1, h3), 64);
     }
 
