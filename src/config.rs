@@ -37,3 +37,24 @@ impl Default for MetricParams {
         }
     }
 }
+
+/// 连拍去重参数（M2）
+#[derive(Debug, Clone, Copy)]
+pub struct DedupParams {
+    /// 时间聚类间隔阈值（秒）：间隔 ≤ 此值视为同一连拍组
+    pub gap_secs: f64,
+    /// dHash 汉明距离阈值：≤ 此值视为同一场景子簇
+    pub dhash_threshold: u32,
+    /// 每个子簇保留前 K 张
+    pub keep_k: usize,
+}
+
+impl Default for DedupParams {
+    fn default() -> Self {
+        DedupParams {
+            gap_secs: 2.0,
+            dhash_threshold: 10,
+            keep_k: 2,
+        }
+    }
+}

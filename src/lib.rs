@@ -2,6 +2,7 @@
 
 pub mod config;
 pub mod decode;
+pub mod dedup;
 pub mod metrics;
 pub mod output;
 pub mod scan;

@@ -8,6 +8,7 @@ use rayon::prelude::*;
 
 use crate::config::{MetricParams, ScoreWeights};
 use crate::decode;
+use crate::dedup;
 use crate::metrics;
 use crate::scan::{PhotoEntry, stem_of};
 
@@ -19,14 +20,21 @@ pub struct PixelScores {
     pub noise: f64,
 }
 
+/// 单张照片的完整分析结果：分数 + 感知哈希（连拍去重用）
+#[derive(Debug, Clone, Copy)]
+pub struct AnalysisResult {
+    pub scores: PixelScores,
+    pub dhash: u64,
+}
+
 /// 加权总分（0-100，1 位小数）
 pub fn total_score(s: &PixelScores, w: &ScoreWeights) -> f64 {
     let total = s.sharpness * w.sharpness + s.exposure * w.exposure + s.noise * w.noise;
     (total * 10.0).round() / 10.0
 }
 
-/// 对全部 JPG 并行做像素分析，返回 stem -> 分数
-pub fn analyze_jpgs(entries: &[PhotoEntry]) -> HashMap<String, PixelScores> {
+/// 对全部 JPG 并行做像素分析，返回 stem -> 分析结果
+pub fn analyze_jpgs(entries: &[PhotoEntry]) -> HashMap<String, AnalysisResult> {
     let params = MetricParams::default();
     let counter = AtomicUsize::new(0);
     let total = entries.iter().filter(|e| !e.is_raw).count().max(1);
@@ -39,14 +47,14 @@ pub fn analyze_jpgs(entries: &[PhotoEntry]) -> HashMap<String, PixelScores> {
             if done % 25 == 0 || done == total {
                 eprintln!("[score] 进度 {}/{}", done, total);
             }
-            let scores = analyze_one(e, &params)?;
-            Some((stem_of(&e.filename), scores))
+            let result = analyze_one(e, &params)?;
+            Some((stem_of(&e.filename), result))
         })
         .collect()
 }
 
-/// 单张 JPG 的三维像素评分；非 JPG/解码失败返回 None
-pub fn analyze_one(e: &PhotoEntry, p: &MetricParams) -> Option<PixelScores> {
+/// 单张 JPG 的像素分析（分数 + dHash）；非 JPG/解码失败返回 None
+pub fn analyze_one(e: &PhotoEntry, p: &MetricParams) -> Option<AnalysisResult> {
     let img = decode::load_analysis_image(Path::new(&e.path)).ok().flatten()?;
 
     let sharp_var = metrics::sharpness::tenengrad_variance(&img);
@@ -60,9 +68,14 @@ pub fn analyze_one(e: &PhotoEntry, p: &MetricParams) -> Option<PixelScores> {
     let noise_metric = metrics::noise::dark_noise_metric(&img);
     let noise = metrics::noise::noise_score(noise_metric, iso, p.noise_k0);
 
-    Some(PixelScores {
-        sharpness,
-        exposure,
-        noise,
+    let dhash = dedup::dhash(&img.luma, img.width, img.height);
+
+    Some(AnalysisResult {
+        scores: PixelScores {
+            sharpness,
+            exposure,
+            noise,
+        },
+        dhash,
     })
 }

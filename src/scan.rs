@@ -31,6 +31,15 @@ pub struct PhotoEntry {
     pub exposure_score: String,
     pub noise_score: String,
     pub total_score: String,
+    // ---- 连拍去重字段（score 子命令填充）----
+    /// 连拍组号（0 = 非连拍）
+    pub burst_group: String,
+    /// 组内照片数
+    pub burst_size: String,
+    /// 子簇内排名（1 = 最优）
+    pub burst_rank: String,
+    /// 是否建议保留（true/false）
+    pub burst_keep: String,
 }
 
 /// 是否为支持的照片文件扩展名
