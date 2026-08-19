@@ -70,22 +70,21 @@ pub fn dark_noise_metric(img: &AnalyzedImage) -> f64 {
         let mean = dark_px.iter().sum::<f64>() / n;
         (dark_px.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n).sqrt()
     } else {
+        // 取低百分位（P15）：最平滑的暗块反映传感器噪声，
+        // 避免暗部场景纹理（树叶/深色衣物等）污染指标
         block_stds.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let n = block_stds.len();
-        if n % 2 == 1 {
-            block_stds[n / 2]
-        } else {
-            (block_stds[n / 2 - 1] + block_stds[n / 2]) / 2.0
-        }
+        let idx = ((n as f64) * 0.15) as usize;
+        block_stds[idx.min(n - 1)]
     }
 }
 
 /// 噪点分数（0-100，100 最干净）
 ///
 /// `iso` 来自 EXIF（缺失时按 100 计）。容忍度随 ISO 升高而放宽：
-/// k = K0 * (1 + 0.5 * log10(iso/100))
+/// k = K0 * (1 + 0.3 * log10(iso/100))
 pub fn noise_score(metric: f64, iso: u32, k0: f64) -> f64 {
     let iso = iso.max(100);
-    let k = k0 * (1.0 + 0.5 * (iso as f64 / 100.0).log10());
+    let k = k0 * (1.0 + 0.3 * (iso as f64 / 100.0).log10());
     (100.0 * (-metric / k).exp()).clamp(0.0, 100.0)
 }

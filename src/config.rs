@@ -29,7 +29,7 @@ pub struct MetricParams {
     /// 实测范围（1024px 分析图，33MP 索尼 JPG）：12 万 ~ 172 万
     pub sharpness_k: f64,
     /// 噪点容忍度基准（ISO 100 时）：暗部噪声 = k0 时得 ~37 分
-    /// 实测范围：0.5 ~ 10.4
+    /// 实测范围（P15 暗块法）：0.2 ~ 6
     pub noise_k0: f64,
 }
 
@@ -37,7 +37,7 @@ impl Default for MetricParams {
     fn default() -> Self {
         MetricParams {
             sharpness_k: 800_000.0,
-            noise_k0: 4.5,
+            noise_k0: 3.0,
         }
     }
 }
