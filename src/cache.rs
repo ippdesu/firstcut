@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use crate::score::{AnalysisResult, PixelScores};
 
 /// 缓存分析版本：评分参数（k 值/权重/模型）变化时递增
-pub const CACHE_VERSION: i64 = 4;
+pub const CACHE_VERSION: i64 = 5;
 
 /// 照片分析缓存
 pub struct ScoreCache {

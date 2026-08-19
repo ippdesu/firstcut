@@ -29,8 +29,8 @@ pub struct YuNet {
 const INPUT_SIZE: usize = 640;
 /// 三个特征层下采样步长
 const STRIDES: [usize; 3] = [8, 16, 32];
-/// 置信度阈值
-const SCORE_THRESHOLD: f32 = 0.6;
+/// 置信度阈值（0.6 过紧：实测有人脸照片候选分数 0.59x 被滤，降至 0.5）
+const SCORE_THRESHOLD: f32 = 0.5;
 /// NMS IoU 阈值
 const NMS_IOU: f32 = 0.3;
 
@@ -51,8 +51,19 @@ impl YuNet {
         Ok(Self { session })
     }
 
-    /// 检测人脸，返回归一化人脸框列表（已解码 + NMS）
+    /// 检测人脸，返回归一化人脸框列表（已解码 + NMS，阈值 0.6）
     pub fn detect(&mut self, rgb: &[u8], w: u32, h: u32) -> Result<Vec<FaceBox>> {
+        self.detect_with_threshold(rgb, w, h, SCORE_THRESHOLD)
+    }
+
+    /// 检测人脸（可指定置信度阈值，调试/低阈值场景用）
+    pub fn detect_with_threshold(
+        &mut self,
+        rgb: &[u8],
+        w: u32,
+        h: u32,
+        threshold: f32,
+    ) -> Result<Vec<FaceBox>> {
         let img = image::RgbImage::from_raw(w, h, rgb.to_vec())
             .ok_or_else(|| anyhow::anyhow!("RGB 数据尺寸不一致"))?;
         let small = image::DynamicImage::ImageRgb8(img).resize_exact(
@@ -95,7 +106,8 @@ impl YuNet {
                 let cls_score = cls[idx].clamp(0.0, 1.0);
                 let obj_score = obj[idx].clamp(0.0, 1.0);
                 let score = (cls_score * obj_score).sqrt();
-                if score < SCORE_THRESHOLD {
+                // 浮点边界保护：0.600 的 f32 表示可能略小于 0.6f32 而误滤
+                if score + 1e-5 < threshold {
                     continue;
                 }
                 let c = (idx % cols) as f32;

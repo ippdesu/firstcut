@@ -185,6 +185,8 @@ pub fn analyze_one(
     let mut composition = metrics::composition::composition_score(&[]);
     let mut aesthetic = 60.0;
     let mut faces = 0usize;
+    // 清晰度：全局分 + 主体（人脸）区域分取高者
+    let mut sharpness_region: Option<f64> = None;
 
     if let Some(m) = &ai.musiq {
         aesthetic = m.acquire().score(&img.rgb, img.width, img.height).unwrap_or(60.0);
@@ -194,6 +196,19 @@ pub fn analyze_one(
             Ok(boxes) => {
                 faces = boxes.len();
                 composition = metrics::composition::composition_score(&boxes);
+                // 最大人脸 → 主体区域锐度（大光圈浅景深照片的正确语义）
+                if let Some(biggest) = boxes.iter().max_by(|a, b| {
+                    (a.w * a.h).partial_cmp(&(b.w * b.h)).unwrap_or(std::cmp::Ordering::Equal)
+                }) {
+                    let cx = (biggest.x + biggest.w / 2.0) as f64;
+                    let cy = (biggest.y + biggest.h / 2.0) as f64;
+                    let half_w = (biggest.w as f64 * 1.5).clamp(0.05, 0.5);
+                    let half_h = (biggest.h as f64 * 1.5).clamp(0.05, 0.5);
+                    let reblur = metrics::sharpness::reblur_mean_region(
+                        &img.luma, img.width, img.height, cx, cy, half_w, half_h,
+                    );
+                    sharpness_region = Some(metrics::sharpness::region_sharpness_score(reblur));
+                }
             }
             Err(err) => {
                 use std::sync::Once;
@@ -203,9 +218,16 @@ pub fn analyze_one(
         }
     }
 
+    let sharpness_final = match sharpness_region {
+        Some(region) if region > sharpness => region,
+        // 无人脸/无主体线索时：全局指标对浅景深照片不可靠，
+        // 给 35 分中性下限（宁可漏判真糊，不可误杀清晰照片）
+        _ => sharpness.max(35.0),
+    };
+
     Ok(Some(AnalysisResult {
         scores: PixelScores {
-            sharpness,
+            sharpness: sharpness_final,
             exposure,
             noise,
             composition,
