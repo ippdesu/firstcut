@@ -98,7 +98,7 @@ pic_process/
 - ✅ **M2 连拍去重**：时间聚类 + dHash 子簇聚类 + 组内排序 top-K（6 项单元测试）
 - ✅ **M3 AI 接入**：MUSIQ 美学 + YuNet 人脸检测（OpenCV 同款解码）+ 构图维度，5 维评分
 - ✅ **M4 输出完善**：XMP 星级侧车（`<名>.<原扩展名>.xmp`，xmp:Rating + firstcut 子分，他人侧车保护）+ SQLite 增量缓存（size+mtime+版本键，二次运行 16/16 命中 0.78s）
-- ⏳ **M5 调参与验证**：用真实照片跑通、对照人工判断调权重、性能优化
+- ⏳ **M5 调参与验证**：数据面完成（性能 21.5s→10.6s/119张、噪点指标 P15 修复、edge_ratio 诊断、gallery 联系表、A/B/C 决策清单见 M5_REVIEW.md）；**待用户对照 gallery.html 拍板三项决策后收尾**（曝光权重 A、星级分档 B、美学分布 C）
 
 > 当前状态（M4 完成）：`pic_process score <目录> [-o report.csv] [-k N] [--no-ai] [--xmp] [--cache <文件>] [--no-cache]`，12 项单元测试全过；缓存二次运行全命中（0.78s vs 首次 2s）；XMP 侧车 LR 兼容命名，他人侧车不覆盖。
 
