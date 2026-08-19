@@ -52,6 +52,41 @@ pub fn normalized_sharpness(var: f64, luma_variance: f64) -> f64 {
     var / luma_variance
 }
 
+/// 强边缘像素占比（Sobel 梯度幅值 > 阈值 的比例，0-1）
+///
+/// 用于区分"真糊"与"平滑场景"：
+/// - 真糊（运动模糊/失焦）：场景本有边缘，边缘占比正常，但梯度被抹低
+/// - 平滑场景（天空/虚化背景）：边缘占比极低（<2%），低清晰度分是误杀
+pub fn edge_ratio(luma: &[u8], w: u32, h: u32, grad_threshold: f64) -> f64 {
+    let w = w as usize;
+    let h = h as usize;
+    if w < 3 || h < 3 {
+        return 0.0;
+    }
+    let thr2 = grad_threshold * grad_threshold;
+    let mut strong = 0u64;
+    let mut total = 0u64;
+    for y in (1..h - 1).step_by(2) {
+        for x in (1..w - 1).step_by(2) {
+            let i = |dx: isize, dy: isize| ((y as isize + dy) * w as isize + (x as isize + dx)) as usize;
+            let gx = luma[i(1, -1)] as f64 + 2.0 * luma[i(1, 0)] as f64 + luma[i(1, 1)] as f64
+                - (luma[i(-1, -1)] as f64 + 2.0 * luma[i(-1, 0)] as f64 + luma[i(-1, 1)] as f64);
+            let gy = luma[i(-1, 1)] as f64 + 2.0 * luma[i(0, 1)] as f64 + luma[i(1, 1)] as f64
+                - (luma[i(-1, -1)] as f64 + 2.0 * luma[i(0, -1)] as f64 + luma[i(1, -1)] as f64);
+            let g2 = gx * gx + gy * gy;
+            if g2 > thr2 {
+                strong += 1;
+            }
+            total += 1;
+        }
+    }
+    if total == 0 {
+        0.0
+    } else {
+        strong as f64 / total as f64
+    }
+}
+
 /// 清晰度分数（0-100，100 最清晰）
 ///
 /// `k` 控制饱和速度：归一化值 = k 时约得 63 分。

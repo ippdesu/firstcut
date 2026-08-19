@@ -1,7 +1,8 @@
 //! 调参工具（M1/M5 用）：输出每张照片的原始指标，用于校准评分曲线
 //!
 //! 用法: pic_process-tune <目录> [-o metrics.csv]
-//! 输出列: filename, iso, width, height, tenengrad_var, dark_noise, over_pct, under_pct, mean_luma
+//! 输出列: filename, iso, width, height, tenengrad_var, luma_var,
+//!         norm_sharp, edge_ratio, dark_noise, over_pct, under_pct, mean_luma
 
 use std::path::{Path, PathBuf};
 
@@ -28,7 +29,7 @@ fn main() -> Result<()> {
     let mut wtr = csv::Writer::from_path(&args.output)?;
     wtr.write_record([
         "filename", "iso", "width", "height", "tenengrad_var", "luma_var",
-        "norm_sharp", "dark_noise", "over_pct", "under_pct", "mean_luma",
+        "norm_sharp", "edge_ratio", "dark_noise", "over_pct", "under_pct", "mean_luma",
     ])?;
 
     let rows: Vec<Vec<String>> = jpgs
@@ -37,6 +38,7 @@ fn main() -> Result<()> {
             let img = decode::load_analysis_image(Path::new(&e.path)).ok().flatten()?;
             let var = metrics::sharpness::tenengrad_variance(&img);
             let norm = metrics::sharpness::normalized_sharpness(var, img.luma_variance);
+            let edge = metrics::sharpness::edge_ratio(&img.luma, img.width, img.height, 40.0);
             let noise = metrics::noise::dark_noise_metric(&img);
             let stats = metrics::exposure::exposure_stats(&img);
             let iso = e.iso.parse::<u32>().unwrap_or(100);
@@ -48,6 +50,7 @@ fn main() -> Result<()> {
                 format!("{:.1}", var),
                 format!("{:.1}", img.luma_variance),
                 format!("{:.3}", norm),
+                format!("{:.4}", edge),
                 format!("{:.2}", noise),
                 format!("{:.4}", stats.over_ratio),
                 format!("{:.4}", stats.under_ratio),
@@ -77,8 +80,9 @@ fn main() -> Result<()> {
         eprintln!("[tune] tenengrad_var  min/med/max: {:?}", stat(4));
         eprintln!("[tune] luma_var       min/med/max: {:?}", stat(5));
         eprintln!("[tune] norm_sharp     min/med/max: {:?}", stat(6));
-        eprintln!("[tune] dark_noise     min/med/max: {:?}", stat(7));
-        eprintln!("[tune] mean_luma      min/med/max: {:?}", stat(10));
+        eprintln!("[tune] edge_ratio     min/med/max: {:?}", stat(7));
+        eprintln!("[tune] dark_noise     min/med/max: {:?}", stat(8));
+        eprintln!("[tune] mean_luma      min/med/max: {:?}", stat(11));
     }
     Ok(())
 }
