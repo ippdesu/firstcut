@@ -6,3 +6,5 @@
 /testpic/
 /archive/
 /samples/generated/
+
+/bench*.csv
