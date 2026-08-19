@@ -35,10 +35,13 @@ const SCORE_THRESHOLD: f32 = 0.6;
 const NMS_IOU: f32 = 0.3;
 
 impl YuNet {
-    pub fn load() -> Result<Self> {
+    /// 加载模型；`intra_threads` 为每个 session 的 ORT 内部线程数
+    pub fn load(intra_threads: usize) -> Result<Self> {
         let builder = Session::builder().map_err(crate::ai::ort_err)?;
         let session = builder
             .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)
+            .map_err(crate::ai::ort_err)?
+            .with_intra_threads(intra_threads)
             .map_err(crate::ai::ort_err)?
             .commit_from_file(format!(
                 "{}/face_detection_yunet_2023mar.onnx",

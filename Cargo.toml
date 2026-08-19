@@ -16,3 +16,4 @@ rayon = "1"
 rusqlite = { version = "0.31", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 walkdir = "2"
+jpeg-decoder = "0.3"

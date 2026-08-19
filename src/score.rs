@@ -10,28 +10,39 @@ use rayon::prelude::*;
 use crate::ai;
 use crate::ai::facedetect::YuNet;
 use crate::ai::musiq::Musiq;
+use crate::ai::SessionPool;
 use crate::config::{MetricParams, ScoreWeights};
 use crate::decode;
 use crate::dedup;
 use crate::metrics;
 use crate::scan::{PhotoEntry, stem_of};
 
-/// AI 推理引擎（MUSIQ + YuNet，进程内共享）
+/// AI 推理引擎（MUSIQ + YuNet 多 session 池，进程内共享）
 ///
-/// onnxruntime 的 run 需要 &mut self，用 Mutex 串行化调用；
-/// ORT 内部自带线程级并行（intra-op），串行调用仍能吃到多核。
+/// onnxruntime 的 run 需要 &mut self，用 SessionPool 轮询分配实现并行；
+/// 每 session 内部线程数 = 核数 / 池大小。
 pub struct AiEngine {
-    pub musiq: Option<Mutex<Musiq>>,
-    pub yunet: Option<Mutex<YuNet>>,
+    pub musiq: Option<SessionPool<Musiq>>,
+    pub yunet: Option<SessionPool<YuNet>>,
 }
+
+/// AI session 池大小（实测池化无收益：AI 非瓶颈且每 session 线程减半变慢，保持 1）
+const AI_POOL_SIZE: usize = 1;
 
 impl AiEngine {
     /// 加载全部 AI 模型；模型缺失时返回错误（含下载指引）
     pub fn load() -> anyhow::Result<Self> {
         ai::ensure_models()?;
+        let intra = std::thread::available_parallelism()
+            .map(|n| (n.get() / AI_POOL_SIZE).max(1))
+            .unwrap_or(1);
         Ok(AiEngine {
-            musiq: Some(Mutex::new(Musiq::load()?)),
-            yunet: Some(Mutex::new(YuNet::load()?)),
+            musiq: Some(SessionPool::new(
+                (0..AI_POOL_SIZE).map(|_| Musiq::load(intra)).collect::<anyhow::Result<_>>()?,
+            )),
+            yunet: Some(SessionPool::new(
+                (0..AI_POOL_SIZE).map(|_| YuNet::load(intra)).collect::<anyhow::Result<_>>()?,
+            )),
         })
     }
 
@@ -177,10 +188,10 @@ pub fn analyze_one(
     let mut faces = 0usize;
 
     if let Some(m) = &ai.musiq {
-        aesthetic = m.lock().unwrap().score(&img.rgb, img.width, img.height).unwrap_or(60.0);
+        aesthetic = m.acquire().score(&img.rgb, img.width, img.height).unwrap_or(60.0);
     }
     if let Some(y) = &ai.yunet {
-        match y.lock().unwrap().detect(&img.rgb, img.width, img.height) {
+        match y.acquire().detect(&img.rgb, img.width, img.height) {
             Ok(boxes) => {
                 faces = boxes.len();
                 composition = metrics::composition::composition_score(&boxes);

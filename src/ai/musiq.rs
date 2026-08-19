@@ -12,10 +12,14 @@ pub struct Musiq {
 }
 
 impl Musiq {
-    pub fn load() -> Result<Self> {
+    /// 加载模型；`intra_threads` 为每个 session 的 ORT 内部线程数
+    /// （多 session 池时设为 核数/池大小，避免线程争抢）
+    pub fn load(intra_threads: usize) -> Result<Self> {
         let builder = Session::builder().map_err(crate::ai::ort_err)?;
         let session = builder
             .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)
+            .map_err(crate::ai::ort_err)?
+            .with_intra_threads(intra_threads)
             .map_err(crate::ai::ort_err)?
             .commit_from_file(format!("{}/musiq_model.onnx", crate::ai::MODELS_DIR))
             .map_err(crate::ai::ort_err)?;
