@@ -20,13 +20,13 @@ pub struct ScoreCache {
     rows: HashMap<String, CacheRow>,
 }
 
-/// 单条缓存行（内部结构）
+/// 单条缓存行（公开；供并行分析段只读快照使用）
 #[derive(Debug, Clone, Copy)]
-struct CacheRow {
-    size: i64,
-    mtime: i64,
-    version: i64,
-    result: AnalysisResult,
+pub struct CacheRow {
+    pub size: i64,
+    pub mtime: i64,
+    pub version: i64,
+    pub result: AnalysisResult,
 }
 
 impl ScoreCache {
@@ -50,36 +50,44 @@ impl ScoreCache {
             );",
         )?;
 
-        let mut rows = HashMap::new();
-        let mut stmt = conn.prepare(
-            "SELECT path, size, mtime, version, sharpness, exposure, noise, composition, aesthetic, dhash, faces FROM photo_cache",
-        )?;
-        let iter = stmt.query_map([], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                CacheRow {
-                    size: r.get(1)?,
-                    mtime: r.get(2)?,
-                    version: r.get(3)?,
-                    result: AnalysisResult {
-                        scores: PixelScores {
-                            sharpness: r.get(4)?,
-                            exposure: r.get(5)?,
-                            noise: r.get(6)?,
-                            composition: r.get(7)?,
-                            aesthetic: r.get(8)?,
+        let rows = {
+            let mut stmt = conn.prepare(
+                "SELECT path, size, mtime, version, sharpness, exposure, noise, composition, aesthetic, dhash, faces FROM photo_cache",
+            )?;
+            let iter = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    CacheRow {
+                        size: r.get(1)?,
+                        mtime: r.get(2)?,
+                        version: r.get(3)?,
+                        result: AnalysisResult {
+                            scores: PixelScores {
+                                sharpness: r.get(4)?,
+                                exposure: r.get(5)?,
+                                noise: r.get(6)?,
+                                composition: r.get(7)?,
+                                aesthetic: r.get(8)?,
+                            },
+                            dhash: r.get::<_, i64>(9)? as u64,
+                            faces: r.get(10)?,
                         },
-                        dhash: r.get::<_, i64>(9)? as u64,
-                        faces: r.get(10)?,
                     },
-                },
-            ))
-        })?;
-        for row in iter {
-            let (path, row) = row?;
-            rows.insert(path, row);
-        }
+                ))
+            })?;
+            let mut rows = HashMap::new();
+            for row in iter {
+                let (path, row) = row?;
+                rows.insert(path, row);
+            }
+            rows
+        };
         Ok(ScoreCache { conn, rows })
+    }
+
+    /// 只读快照（供 rayon 并行段使用；Connection 非 Sync 不能跨线程）
+    pub fn rows(&self) -> &HashMap<String, CacheRow> {
+        &self.rows
     }
 
     /// 查询缓存：文件未变（大小+mtime+版本一致）返回 Some
@@ -92,7 +100,7 @@ impl ScoreCache {
         }
     }
 
-    /// 写入（或更新）一条缓存；批量写入时逐条调用后统一 flush
+    /// 写入（或更新）一条缓存；批量写入后统一 flush
     pub fn put(&mut self, path: &str, size: u64, mtime: i64, result: &AnalysisResult) -> Result<()> {
         self.rows.insert(
             path.to_string(),
@@ -107,18 +115,15 @@ impl ScoreCache {
     }
 
     /// 将内存中的全部条目落盘（单事务）
-    pub fn flush(&self) -> Result<()> {
-        let mut stmt = self.conn.prepare(
-            "INSERT OR REPLACE INTO photo_cache
-                (path, size, mtime, version, sharpness, exposure, noise, composition, aesthetic, dhash, faces)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-        )?;
-        let tx = self.conn.unchecked_transaction()?;
-        {
-            let mut tx = tx;
-            for (path, row) in &self.rows {
-                let s = row.result.scores;
-                stmt.execute(rusqlite::params![
+    pub fn flush(&mut self) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        for (path, row) in &self.rows {
+            let s = row.result.scores;
+            tx.execute(
+                "INSERT OR REPLACE INTO photo_cache
+                    (path, size, mtime, version, sharpness, exposure, noise, composition, aesthetic, dhash, faces)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                rusqlite::params![
                     path,
                     row.size,
                     row.mtime,
@@ -130,8 +135,8 @@ impl ScoreCache {
                     s.aesthetic,
                     row.result.dhash as i64,
                     row.result.faces as i64,
-                ])?;
-            }
+                ],
+            )?;
         }
         tx.commit()?;
         Ok(())

@@ -95,9 +95,10 @@ fn main() -> Result<()> {
                 }
             };
 
-            // 2) JPG 像素分析 + AI（优先缓存命中）
+            // 2) JPG 像素分析 + AI（优先缓存命中；并行段只读快照）
             let jpg_count = entries.iter().filter(|e| !e.is_raw).count();
-            let outcome = score::analyze_jpgs(&entries, &engine, cache.as_ref());
+            let cache_rows = cache.as_ref().map(|c| c.rows());
+            let outcome = score::analyze_jpgs(&entries, &engine, cache_rows);
             eprintln!(
                 "[score] 分析完成: {} 张 JPG（缓存命中 {}，新分析 {}）",
                 jpg_count, outcome.hits, outcome.misses

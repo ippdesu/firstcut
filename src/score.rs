@@ -81,11 +81,11 @@ pub struct AnalysisOutcome {
     pub new_rows: Vec<(String, u64, i64, AnalysisResult)>,
 }
 
-/// 对全部 JPG 并行做像素分析 + AI 推理（优先命中缓存），返回 stem -> 分析结果
+/// 对全部 JPG 并行做像素分析 + AI 推理（优先命中缓存快照），返回分析结果
 pub fn analyze_jpgs(
     entries: &[PhotoEntry],
     ai: &AiEngine,
-    cache: Option<&crate::cache::ScoreCache>,
+    cache_rows: Option<&std::collections::HashMap<String, crate::cache::CacheRow>>,
 ) -> AnalysisOutcome {
     let params = MetricParams::default();
     let counter = AtomicUsize::new(0);
@@ -100,12 +100,17 @@ pub fn analyze_jpgs(
             if done % 25 == 0 || done == total {
                 eprintln!("[score] 进度 {}/{}", done, total);
             }
-            // 缓存命中则跳过分析
-            if let Some(c) = cache {
+            // 缓存命中则跳过分析（快照为纯数据，可跨线程共享）
+            if let Some(rows) = cache_rows {
                 if let Some((size, mtime)) = crate::cache::file_fingerprint(Path::new(&e.path)) {
-                    if let Some(r) = c.get(&e.path, size, mtime) {
-                        hits.fetch_add(1, Ordering::Relaxed);
-                        return Some((stem_of(&e.filename), r, None));
+                    if let Some(row) = rows.get(&e.path) {
+                        if row.size == size as i64
+                            && row.mtime == mtime
+                            && row.version == crate::cache::CACHE_VERSION
+                        {
+                            hits.fetch_add(1, Ordering::Relaxed);
+                            return Some((stem_of(&e.filename), row.result, None));
+                        }
                     }
                 }
             }

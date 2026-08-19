@@ -8,7 +8,6 @@
 //!   cx = (c + bbox[0]) * stride；w = exp(bbox[2]) * stride（无 anchor 尺寸，新式解码）
 
 use anyhow::Result;
-use image::GenericImageView;
 use ndarray::Array4;
 use ort::session::Session;
 

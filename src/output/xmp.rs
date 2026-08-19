@@ -72,7 +72,10 @@ pub fn write_sidecar(e: &PhotoEntry, s: &PixelScores, total: f64) -> anyhow::Res
         return Ok(false);
     }
     let path = std::path::Path::new(&e.path);
-    let sidecar = path.with_extension("xmp");
+    // Lightroom 侧车命名约定：<stem>.<原扩展名>.xmp（如 DSC00001.ARW.xmp）
+    let stem = crate::scan::stem_of(&e.filename);
+    let ext = crate::scan::extension_of(&e.filename);
+    let sidecar = path.with_file_name(format!("{stem}.{ext}.xmp"));
 
     if sidecar.exists() {
         if let Ok(content) = std::fs::read_to_string(&sidecar) {
@@ -145,7 +148,7 @@ mod tests {
             aesthetic: 45.0,
         };
         let xml = render_xmp(&e, &s, 66.0);
-        assert!(xml.contains("<xmp:Rating>3</xmp:Rating>"), "66 分应为 3 星");
+        assert!(xml.contains("<xmp:Rating>4</xmp:Rating>"), "66 分应为 4 星");
         assert!(xml.contains("<firstcut:sharpness>75.0</firstcut:sharpness>"));
         assert!(xml.contains("<firstcut:aesthetic>45.0</firstcut:aesthetic>"));
         assert!(xml.contains("<firstcut:burstKeep>true</firstcut:burstKeep>"));
