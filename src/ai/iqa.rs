@@ -1,19 +1,22 @@
-//! MUSIQ 美学/质量评分（M3）
+//! CLIPIQA 美学/质量评分（M5，替换 MUSIQ）
 //!
-//! 输入：224x224 RGB，归一化 (x/255 - 0.5)/0.5（Inception 风格，即 [-1,1]）
-//! 输出：0-100 质量分（MUSIQ 训练于 AVA/KonIQ 等数据集，兼具美学与技术质量）
+//! 86Cao/IQA-ONNX-Models 的 CLIP-IQA+ 变体（learned prompts 已烘焙进模型）：
+//! - 输入 224x224 RGB，CLIP 归一化 (x/255 - mean) / std
+//! - 输出 [1,1] 质量分（0-1，sigmoid 后），×100 为 0-100 分
 
 use anyhow::Result;
 use ndarray::Array4;
 use ort::session::Session;
 
-pub struct Musiq {
+pub struct ClipIqa {
     session: Session,
 }
 
-impl Musiq {
-    /// 加载模型；`intra_threads` 为每个 session 的 ORT 内部线程数
-    /// （多 session 池时设为 核数/池大小，避免线程争抢）
+/// CLIP 图像归一化参数
+const MEAN: [f32; 3] = [0.48145466, 0.4578275, 0.40821073];
+const STD: [f32; 3] = [0.26862954, 0.26130258, 0.27577711];
+
+impl ClipIqa {
     pub fn load(intra_threads: usize) -> Result<Self> {
         let builder = Session::builder().map_err(crate::ai::ort_err)?;
         let session = builder
@@ -21,7 +24,7 @@ impl Musiq {
             .map_err(crate::ai::ort_err)?
             .with_intra_threads(intra_threads)
             .map_err(crate::ai::ort_err)?
-            .commit_from_file(format!("{}/musiq_model.onnx", crate::ai::MODELS_DIR))
+            .commit_from_file(format!("{}/clipiqa_model.onnx", crate::ai::MODELS_DIR))
             .map_err(crate::ai::ort_err)?;
         Ok(Self { session })
     }
@@ -38,9 +41,9 @@ impl Musiq {
         for y in 0..224usize {
             for x in 0..224usize {
                 let p = px.get_pixel(x as u32, y as u32);
-                arr[[0, 0, y, x]] = (p[0] as f32 / 255.0 - 0.5) / 0.5;
-                arr[[0, 1, y, x]] = (p[1] as f32 / 255.0 - 0.5) / 0.5;
-                arr[[0, 2, y, x]] = (p[2] as f32 / 255.0 - 0.5) / 0.5;
+                for c in 0..3 {
+                    arr[[0, c, y, x]] = (p[c] as f32 / 255.0 - MEAN[c]) / STD[c];
+                }
             }
         }
 
@@ -48,7 +51,7 @@ impl Musiq {
         let input = ort::inputs!["input" => tensor];
         let out = self.session.run(input).map_err(crate::ai::ort_err)?;
         let (_, data) = out[0].try_extract_tensor::<f32>().map_err(crate::ai::ort_err)?;
-        let v = data.iter().copied().next().unwrap_or(50.0) as f64;
-        Ok(v.clamp(0.0, 100.0))
+        let v = data.iter().copied().next().unwrap_or(0.5) as f64;
+        Ok(v.clamp(0.0, 1.0) * 100.0)
     }
 }

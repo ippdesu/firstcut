@@ -96,11 +96,11 @@ pic_process/
 - ✅ **M0 骨架**：CLI + 目录扫描 + EXIF + CSV 输出（268 张真实照片实测通过）
 - ✅ **M1 像素指标**：清晰度/曝光/噪点 + 加权总分（纯算法，无 AI 依赖）
 - ✅ **M2 连拍去重**：时间聚类 + dHash 子簇聚类 + 组内排序 top-K（6 项单元测试）
-- ✅ **M3 AI 接入**：MUSIQ 美学 + YuNet 人脸检测（OpenCV 同款解码）+ 构图维度，5 维评分
+- ✅ **M3 AI 接入**：CLIPIQA 美学 + SCRFD 人脸检测 + 构图维度，5 维评分（后期从 MUSIQ/YuNet 升级，见 M5）
 - ✅ **M4 输出完善**：XMP 星级侧车（`<名>.<原扩展名>.xmp`，xmp:Rating + firstcut 子分，他人侧车保护）+ SQLite 增量缓存（size+mtime+版本键，二次运行 16/16 命中 0.78s）
-- ⏳ **M5 调参与验证**：数据面完成（性能 21.5s→10.6s/119张、噪点指标 P15 修复、edge_ratio 诊断、gallery 联系表、A/B/C 决策清单见 M5_REVIEW.md）；**待用户对照 gallery.html 拍板三项决策后收尾**（曝光权重 A、星级分档 B、美学分布 C）
+- ✅ **M5 调参与验证**：性能优化（21.5s→10.6s/119张）、噪点 P15 修复、浅景深清晰度误判修复（主体感知三层链路：SCRFD 人脸区域 reblur → YOLOv8-pose 头部区域 → 50 中性下限）、人脸漏检换 SCRFD（检出 23→75/119）、gallery 联系表；**用户决策落地**：A=多场景配置文件（--config/config-template，权重+曲线+星级+曝光目标可配）、B=星级放宽 75/60/45/30、C=换 CLIPIQA（美学分布 26-76，区分度提升）
 
-> 当前状态（M4 完成）：`pic_process score <目录> [-o report.csv] [-k N] [--no-ai] [--xmp] [--cache <文件>] [--no-cache]`，12 项单元测试全过；缓存二次运行全命中（0.78s vs 首次 2s）；XMP 侧车 LR 兼容命名，他人侧车不覆盖。
+> 当前状态（Phase 1 完成）：`pic_process score <目录> [--xmp] [--config x.toml] [--cache <文件>] [--no-ai] [-k N]`，12 项单元测试全过；5 星 24/119、4 星 74、3 星 21（新分档）；CLIPIQA 冷跑 ~155ms/张（含 SCRFD+姿态）。
 
 ## 8. 风险与开放问题
 

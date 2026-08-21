@@ -5,7 +5,7 @@
 //! - face_detection_yunet_2023mar.onnx（opencv_zoo，Git LFS media 下载）
 
 pub mod facedetect;
-pub mod musiq;
+pub mod iqa;
 pub mod pose;
 
 use anyhow::{bail, Result};

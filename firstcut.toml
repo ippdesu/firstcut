@@ -1,0 +1,21 @@
+# firstcut 评分配置模板（可多场景存多份，如 portrait.toml / bird.toml）
+# 用法: pic_process score <目录> --config portrait.toml
+[weights]
+sharpness = 0.35
+exposure = 0.2
+noise = 0.15
+composition = 0.15
+aesthetic = 0.15
+
+[metric]
+# 清晰度饱和常数（越大越宽松）
+sharpness_k = 800000
+# 噪点容忍基准（越大越宽容噪点）
+noise_k0 = 3
+# 曝光理想平均亮度（0-255）：夜景/暗调环境可调低如 90
+exposure_target = 128
+# 星级分档（总分 ≥ 阈值得对应星数）
+rating_5 = 75
+rating_4 = 60
+rating_3 = 45
+rating_2 = 30

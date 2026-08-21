@@ -8,21 +8,21 @@ use rayon::prelude::*;
 
 use crate::ai;
 use crate::ai::facedetect::Scrfd;
-use crate::ai::musiq::Musiq;
+use crate::ai::iqa::ClipIqa;
 use crate::ai::pose::{PoseDet, head_region};
 use crate::ai::SessionPool;
-use crate::config::{MetricParams, ScoreWeights};
+use crate::config::{MetricParams, ScoreConfig, ScoreWeights};
 use crate::decode;
 use crate::dedup;
 use crate::metrics;
 use crate::scan::{PhotoEntry, stem_of};
 
-/// AI 推理引擎（MUSIQ + SCRFD + YOLOv8-pose 多 session 池，进程内共享）
+/// AI 推理引擎（CLIPIQA + SCRFD + YOLOv8-pose 多 session 池，进程内共享）
 ///
 /// onnxruntime 的 run 需要 &mut self，用 SessionPool 轮询分配实现并行；
 /// 每 session 内部线程数 = 核数 / 池大小。
 pub struct AiEngine {
-    pub musiq: Option<SessionPool<Musiq>>,
+    pub iqa: Option<SessionPool<ClipIqa>>,
     pub yunet: Option<SessionPool<Scrfd>>,
     pub pose: Option<SessionPool<PoseDet>>,
 }
@@ -38,8 +38,8 @@ impl AiEngine {
             .map(|n| (n.get() / AI_POOL_SIZE).max(1))
             .unwrap_or(1);
         Ok(AiEngine {
-            musiq: Some(SessionPool::new(
-                (0..AI_POOL_SIZE).map(|_| Musiq::load(intra)).collect::<anyhow::Result<_>>()?,
+            iqa: Some(SessionPool::new(
+                (0..AI_POOL_SIZE).map(|_| ClipIqa::load(intra)).collect::<anyhow::Result<_>>()?,
             )),
             yunet: Some(SessionPool::new(
                 (0..AI_POOL_SIZE).map(|_| Scrfd::load(intra)).collect::<anyhow::Result<_>>()?,
@@ -52,7 +52,7 @@ impl AiEngine {
 
     /// 不加载 AI 模型（纯像素评分，用于快速预览）
     pub fn none() -> Self {
-        AiEngine { musiq: None, yunet: None, pose: None }
+        AiEngine { iqa: None, yunet: None, pose: None }
     }
 }
 
@@ -101,8 +101,8 @@ pub fn analyze_jpgs(
     entries: &[PhotoEntry],
     ai: &AiEngine,
     cache_rows: Option<&std::collections::HashMap<String, crate::cache::CacheRow>>,
+    cfg: &ScoreConfig,
 ) -> AnalysisOutcome {
-    let params = MetricParams::default();
     let counter = AtomicUsize::new(0);
     let hits = AtomicUsize::new(0);
     let total = entries.iter().filter(|e| !e.is_raw).count().max(1);
@@ -129,7 +129,7 @@ pub fn analyze_jpgs(
                     }
                 }
             }
-            let result = analyze_one(e, &params, ai).ok().flatten()?;
+            let result = analyze_one(e, &cfg.metric, ai).ok().flatten()?;
             let row = crate::cache::file_fingerprint(Path::new(&e.path))
                 .map(|(size, mtime)| (e.path.clone(), size, mtime, result));
             Some((stem_of(&e.filename), result, row))
@@ -161,7 +161,7 @@ pub fn analyze_jpgs(
     }
 }
 
-/// 单张 JPG 的完整分析（像素指标 + MUSIQ 美学 + YuNet 人脸 + dHash）
+/// 单张 JPG 的完整分析（像素指标 + CLIPIQA 美学 + SCRFD 人脸 + 姿态头部 + dHash）
 ///
 /// 返回 None 表示解码失败（跳过）；Err 表示 AI 推理失败（整批中断的候选，当前跳过）
 pub fn analyze_one(
@@ -178,7 +178,7 @@ pub fn analyze_one(
     let sharpness = metrics::sharpness::sharpness_score(norm, p.sharpness_k);
 
     let stats = metrics::exposure::exposure_stats(&img);
-    let exposure = metrics::exposure::exposure_score(&stats);
+    let exposure = metrics::exposure::exposure_score(&stats, p.exposure_target);
 
     let iso = e.iso.parse::<u32>().unwrap_or(100);
     let noise_metric = metrics::noise::dark_noise_metric(&img);
@@ -193,7 +193,7 @@ pub fn analyze_one(
     // 清晰度：全局分 + 主体（人脸）区域分取高者
     let mut sharpness_region: Option<f64> = None;
 
-    if let Some(m) = &ai.musiq {
+    if let Some(m) = &ai.iqa {
         aesthetic = m.acquire().score(&img.rgb, img.width, img.height).unwrap_or(60.0);
     }
     if let Some(y) = &ai.yunet {

@@ -37,10 +37,10 @@ pub fn exposure_stats(img: &AnalyzedImage) -> ExposureStats {
 ///
 /// 惩罚项：
 /// - 死白/死黑像素比例（过曝欠曝直接扣分）
-/// - 平均亮度偏离中间调（128）程度，用高斯曲线衰减
-pub fn exposure_score(stats: &ExposureStats) -> f64 {
+/// - 平均亮度偏离目标亮度（默认 128，暗调/亮调环境可配）程度，用高斯曲线衰减
+pub fn exposure_score(stats: &ExposureStats, target: f64) -> f64 {
     let clip_penalty = 4.0 * stats.over_ratio + 4.0 * stats.under_ratio;
-    let mean_dev = ((stats.mean - 128.0) / 70.0).powi(2);
+    let mean_dev = ((stats.mean - target) / 70.0).powi(2);
     let tone = (-mean_dev).exp();
     (100.0 * (1.0 - clip_penalty).max(0.0) * tone).clamp(0.0, 100.0)
 }

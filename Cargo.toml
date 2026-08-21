@@ -15,5 +15,6 @@ ort = { version = "2.0.0-rc.13", features = ["ndarray"] }
 rayon = "1"
 rusqlite = { version = "0.31", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
+toml = "0.8"
 walkdir = "2"
 jpeg-decoder = "0.3"

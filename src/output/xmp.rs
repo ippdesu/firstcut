@@ -7,21 +7,22 @@
 //! 保护策略：已存在的侧车若无 firstcut 命名空间（可能是 LR 等其他软件写的），
 //! 不覆盖，只警告。
 
+use crate::config::MetricParams;
 use crate::scan::PhotoEntry;
 use crate::score::PixelScores;
 
 /// 自定义命名空间 URI
 pub const NS_FIRSTCUT: &str = "http://firstcut.local/ns/";
 
-/// 总分 → 星级映射（M5 可校准）
-pub fn rating_from_total(total: f64) -> u8 {
-    if total >= 80.0 {
+/// 总分 → 星级映射（阈值来自配置，默认 75/60/45/30）
+pub fn rating_from_total(total: f64, m: &MetricParams) -> u8 {
+    if total >= m.rating_5 {
         5
-    } else if total >= 65.0 {
+    } else if total >= m.rating_4 {
         4
-    } else if total >= 50.0 {
+    } else if total >= m.rating_3 {
         3
-    } else if total >= 35.0 {
+    } else if total >= m.rating_2 {
         2
     } else {
         1
@@ -29,8 +30,8 @@ pub fn rating_from_total(total: f64) -> u8 {
 }
 
 /// 生成 XMP 侧车内容
-pub fn render_xmp(e: &PhotoEntry, s: &PixelScores, total: f64) -> String {
-    let rating = rating_from_total(total);
+pub fn render_xmp(e: &PhotoEntry, s: &PixelScores, total: f64, m: &MetricParams) -> String {
+    let rating = rating_from_total(total, m);
     let faces = e.faces.parse::<usize>().unwrap_or(0);
     format!(
         "<?xpacket begin=\"\u{feff}\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\n\
@@ -67,7 +68,12 @@ pub fn render_xmp(e: &PhotoEntry, s: &PixelScores, total: f64) -> String {
 
 /// 写出侧车；他人侧车（无 firstcut 命名空间）不覆盖。
 /// 返回 Ok(true) 表示已写入，Ok(false) 表示跳过（他人侧车/无分数）。
-pub fn write_sidecar(e: &PhotoEntry, s: &PixelScores, total: f64) -> anyhow::Result<bool> {
+pub fn write_sidecar(
+    e: &PhotoEntry,
+    s: &PixelScores,
+    total: f64,
+    m: &MetricParams,
+) -> anyhow::Result<bool> {
     if e.total_score.is_empty() {
         return Ok(false);
     }
@@ -86,7 +92,7 @@ pub fn write_sidecar(e: &PhotoEntry, s: &PixelScores, total: f64) -> anyhow::Res
         }
     }
 
-    let xml = render_xmp(e, s, total);
+    let xml = render_xmp(e, s, total, m);
     std::fs::write(&sidecar, xml)?;
     Ok(true)
 }
@@ -126,15 +132,16 @@ mod tests {
 
     #[test]
     fn rating_mapping() {
-        assert_eq!(rating_from_total(90.0), 5);
-        assert_eq!(rating_from_total(80.0), 5);
-        assert_eq!(rating_from_total(79.9), 4);
-        assert_eq!(rating_from_total(65.0), 4);
-        assert_eq!(rating_from_total(64.9), 3);
-        assert_eq!(rating_from_total(50.0), 3);
-        assert_eq!(rating_from_total(49.9), 2);
-        assert_eq!(rating_from_total(35.0), 2);
-        assert_eq!(rating_from_total(34.9), 1);
+        let m = MetricParams::default(); // 75/60/45/30
+        assert_eq!(rating_from_total(90.0, &m), 5);
+        assert_eq!(rating_from_total(75.0, &m), 5);
+        assert_eq!(rating_from_total(74.9, &m), 4);
+        assert_eq!(rating_from_total(60.0, &m), 4);
+        assert_eq!(rating_from_total(59.9, &m), 3);
+        assert_eq!(rating_from_total(45.0, &m), 3);
+        assert_eq!(rating_from_total(44.9, &m), 2);
+        assert_eq!(rating_from_total(30.0, &m), 2);
+        assert_eq!(rating_from_total(29.9, &m), 1);
     }
 
     #[test]
@@ -147,7 +154,8 @@ mod tests {
             composition: 60.0,
             aesthetic: 45.0,
         };
-        let xml = render_xmp(&e, &s, 66.0);
+        let m = MetricParams::default();
+        let xml = render_xmp(&e, &s, 66.0, &m);
         assert!(xml.contains("<xmp:Rating>4</xmp:Rating>"), "66 分应为 4 星");
         assert!(xml.contains("<firstcut:sharpness>75.0</firstcut:sharpness>"));
         assert!(xml.contains("<firstcut:aesthetic>45.0</firstcut:aesthetic>"));

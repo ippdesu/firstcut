@@ -18,7 +18,7 @@ cargo build --release
 
 | 文件 | 来源 | 大小 |
 |---|---|---|
-| `musiq_model.onnx` + `.onnx.data` | [86Cao/IQA-ONNX-Models](https://huggingface.co/86Cao/IQA-ONNX-Models)（国内可用 hf-mirror.com） | ~110MB |
+| `clipiqa_model.onnx` + `.onnx.data` | [86Cao/IQA-ONNX-Models](https://huggingface.co/86Cao/IQA-ONNX-Models)（CLIP-IQA+，learned prompts 烘焙进模型） | ~153MB |
 | `scrfd_10g_bnkps.onnx` | [RuteNL/SCRFD-face-detection-ONNX](https://huggingface.co/RuteNL/SCRFD-face-detection-ONNX)（InsightFace SCRFD 10g，小脸检测强） | 16.9MB |
 | `yolov8n_pose.onnx` | [Xenova/yolov8n-pose](https://huggingface.co/Xenova/yolov8n-pose)（人体姿态，人脸漏检时定位头部） | 13.5MB |
 
@@ -44,11 +44,21 @@ pic_process score <目录> -k 1           # 连拍子簇只保留第 1 名
 pic_process score <目录> --no-ai        # 跳过 AI 推理
 pic_process score <目录> --no-cache     # 禁用缓存
 pic_process score <目录> --cache x.db   # 指定缓存文件
+pic_process score <目录> --config x.toml # 自定义评分配置（多场景可存多份）
+
+# 生成评分配置模板（人像/打鸟/夜景各存一份）
+pic_process config-template -o portrait.toml
 
 # 辅助工具
 pic_process-gallery report.csv -o gallery.html   # HTML 联系表（缩略图+分数）
 pic_process-tune <目录> -o metrics.csv           # 原始指标（调参用）
 ```
+
+## 多场景配置
+
+不同拍摄场景用不同权重：人像（构图/美学权重高）、打鸟（清晰度权重高）、
+夜景（曝光权重低 + 曝光目标亮度调低）。`config-template` 生成模板后按需修改，
+`--config` 加载；**换配置时建议换缓存文件名**（`--cache night.sqlite`）。
 
 ## 输出说明
 
@@ -67,12 +77,12 @@ burst_group, burst_size, burst_rank, burst_keep`
 | 维度 | 权重 | 方法 |
 |---|---|---|
 | 清晰度 | 0.35 | 主体感知三层链路：SCRFD 人脸区域 reblur P80 → 人脸漏检时 YOLOv8-pose 头部关键点区域 reblur → 都无则 50 分中性下限（大光圈浅景深照片不会被误判） |
-| 曝光 | 0.20 | 过曝/欠曝像素比例 + 平均亮度偏离中间调 |
+| 曝光 | 0.20 | 过曝/欠曝像素比例 + 平均亮度偏离目标亮度（默认 128，配置可调） |
 | 噪点 | 0.15 | 暗部 8×8 块标准差 P15（最平滑暗块）+ ISO 容忍度曲线 |
-| 构图 | 0.15 | SCRFD 人脸检测：三分法位置 + 人脸大小 + 多人降权；无人脸中性 60 |
-| 美学 | 0.15 | MUSIQ 0-100 质量分 |
+| 构图 | 0.15 | SCRFD 人脸（无人脸时 YOLOv8-pose 人体框）：三分法位置 + 主体大小 + 多人降权；无主体中性 60 |
+| 美学 | 0.15 | CLIPIQA（CLIP 底座，0-100 质量分） |
 
-星级分档：≥80→5★ / ≥65→4★ / ≥50→3★ / ≥35→2★ / 其余 1★
+星级分档（默认，可配置）：≥75→5★ / ≥60→4★ / ≥45→3★ / ≥30→2★ / 其余 1★
 
 连拍去重：拍摄时间间隔 ≤2s 成组 → dHash 汉明距离 ≤10 分簇 → 簇内按总分
 排序，`-k` 控制每簇保留数（默认 2），`burst_keep` 标记建议保留。

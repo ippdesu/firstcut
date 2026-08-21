@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use pic_process::cache::ScoreCache;
-use pic_process::config::{DedupParams, ScoreWeights};
+use pic_process::config::{DedupParams, ScoreConfig, ScoreWeights};
 use pic_process::dedup::{self, BurstInfo};
 use pic_process::output;
 use pic_process::scan::{self, stem_of};
@@ -48,6 +48,15 @@ enum Commands {
         /// 禁用增量缓存
         #[arg(long)]
         no_cache: bool,
+        /// 评分配置文件（TOML，可多场景存多份；缺省用内置默认）
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// 输出默认评分配置模板（可存多份场景配置）
+    ConfigTemplate {
+        /// 输出路径（默认 firstcut.toml）
+        #[arg(short, long, default_value = "firstcut.toml")]
+        output: PathBuf,
     },
 }
 
@@ -60,7 +69,26 @@ fn main() -> Result<()> {
             pic_process::output::csv::write_csv(&output, &entries)?;
             eprintln!("[scan] CSV 已写出: {}", output.display());
         }
-        Commands::Score { dir, output, keep, no_ai, xmp, cache, no_cache } => {
+        Commands::ConfigTemplate { output } => {
+            std::fs::write(&output, pic_process::config::config_template())?;
+            eprintln!("[config] 模板已写出: {}", output.display());
+        }
+        Commands::Score { dir, output, keep, no_ai, xmp, cache, no_cache, config } => {
+            // 0) 评分配置（默认或文件）
+            let cfg = match &config {
+                Some(path) => match pic_process::config::load_config(path) {
+                    Ok(c) => {
+                        eprintln!("[score] 配置已加载: {}", path.display());
+                        c
+                    }
+                    Err(err) => {
+                        eprintln!("[score] 警告: 配置加载失败（使用默认）: {err:#}");
+                        ScoreConfig::default()
+                    }
+                },
+                None => ScoreConfig::default(),
+            };
+
             let mut entries = scan::scan_directory(&dir)?;
             eprintln!("[score] 发现 {} 个文件（JPG/ARW）", entries.len());
 
@@ -98,7 +126,7 @@ fn main() -> Result<()> {
             // 2) JPG 像素分析 + AI（优先缓存命中；并行段只读快照）
             let jpg_count = entries.iter().filter(|e| !e.is_raw).count();
             let cache_rows = cache.as_ref().map(|c| c.rows());
-            let outcome = score::analyze_jpgs(&entries, &engine, cache_rows);
+            let outcome = score::analyze_jpgs(&entries, &engine, cache_rows, &cfg);
             eprintln!(
                 "[score] 分析完成: {} 张 JPG（缓存命中 {}，新分析 {}）",
                 jpg_count, outcome.hits, outcome.misses
@@ -122,7 +150,7 @@ fn main() -> Result<()> {
             for e in entries.iter_mut().filter(|e| !e.is_raw) {
                 let stem = stem_of(&e.filename);
                 if let Some(r) = by_stem.get(&stem) {
-                    apply_scores(e, &r.scores, r.faces);
+                    apply_scores(e, &r.scores, r.faces, &cfg);
                 }
                 if let Some(info) = burst_info.get(&stem) {
                     apply_burst(e, info);
@@ -132,7 +160,7 @@ fn main() -> Result<()> {
             for e in entries.iter_mut().filter(|e| e.is_raw) {
                 let stem = stem_of(&e.filename);
                 if let Some(r) = by_stem.get(&stem) {
-                    apply_scores(e, &r.scores, r.faces);
+                    apply_scores(e, &r.scores, r.faces, &cfg);
                 }
                 if let Some(info) = burst_info.get(&stem) {
                     apply_burst(e, info);
@@ -145,8 +173,8 @@ fn main() -> Result<()> {
                 let mut skipped = 0usize;
                 for e in &entries {
                     if let Some(r) = by_stem.get(&stem_of(&e.filename)) {
-                        let total = score::total_score(&r.scores, &ScoreWeights::default());
-                        match output::xmp::write_sidecar(e, &r.scores, total) {
+                        let total = score::total_score(&r.scores, &cfg.weights);
+                        match output::xmp::write_sidecar(e, &r.scores, total, &cfg.metric) {
                             Ok(true) => written += 1,
                             Ok(false) => skipped += 1,
                             Err(err) => eprintln!("[xmp] 写入失败 {}: {err:#}", e.path),
@@ -208,13 +236,13 @@ fn run_burst_analysis(
 }
 
 /// 把分数写入 PhotoEntry 的 CSV 字段
-fn apply_scores(e: &mut scan::PhotoEntry, s: &score::PixelScores, faces: usize) {
+fn apply_scores(e: &mut scan::PhotoEntry, s: &score::PixelScores, faces: usize, cfg: &ScoreConfig) {
     e.sharpness_score = fmt(s.sharpness);
     e.exposure_score = fmt(s.exposure);
     e.noise_score = fmt(s.noise);
     e.composition_score = fmt(s.composition);
     e.aesthetic_score = fmt(s.aesthetic);
-    e.total_score = fmt(score::total_score(s, &ScoreWeights::default()));
+    e.total_score = fmt(score::total_score(s, &cfg.weights));
     e.faces = faces.to_string();
 }
 
