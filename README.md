@@ -20,6 +20,7 @@ cargo build --release
 |---|---|---|
 | `musiq_model.onnx` + `.onnx.data` | [86Cao/IQA-ONNX-Models](https://huggingface.co/86Cao/IQA-ONNX-Models)（国内可用 hf-mirror.com） | ~110MB |
 | `scrfd_10g_bnkps.onnx` | [RuteNL/SCRFD-face-detection-ONNX](https://huggingface.co/RuteNL/SCRFD-face-detection-ONNX)（InsightFace SCRFD 10g，小脸检测强） | 16.9MB |
+| `yolov8n_pose.onnx` | [Xenova/yolov8n-pose](https://huggingface.co/Xenova/yolov8n-pose)（人体姿态，人脸漏检时定位头部） | 13.5MB |
 
 模型缺失时 score 自动降级为纯像素评分并提示；`--no-ai` 可显式跳过。
 
@@ -65,7 +66,7 @@ burst_group, burst_size, burst_rank, burst_keep`
 
 | 维度 | 权重 | 方法 |
 |---|---|---|
-| 清晰度 | 0.35 | 主体感知：检出人脸时用人脸区域 reblur 差分 P80（合焦边缘证据），否则全局梯度（Sobel 方差/亮度方差）并给 50 分中性下限——大光圈浅景深照片不会被误判 |
+| 清晰度 | 0.35 | 主体感知三层链路：SCRFD 人脸区域 reblur P80 → 人脸漏检时 YOLOv8-pose 头部关键点区域 reblur → 都无则 50 分中性下限（大光圈浅景深照片不会被误判） |
 | 曝光 | 0.20 | 过曝/欠曝像素比例 + 平均亮度偏离中间调 |
 | 噪点 | 0.15 | 暗部 8×8 块标准差 P15（最平滑暗块）+ ISO 容忍度曲线 |
 | 构图 | 0.15 | SCRFD 人脸检测：三分法位置 + 人脸大小 + 多人降权；无人脸中性 60 |

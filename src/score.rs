@@ -9,6 +9,7 @@ use rayon::prelude::*;
 use crate::ai;
 use crate::ai::facedetect::Scrfd;
 use crate::ai::musiq::Musiq;
+use crate::ai::pose::{PoseDet, head_region};
 use crate::ai::SessionPool;
 use crate::config::{MetricParams, ScoreWeights};
 use crate::decode;
@@ -16,13 +17,14 @@ use crate::dedup;
 use crate::metrics;
 use crate::scan::{PhotoEntry, stem_of};
 
-/// AI 推理引擎（MUSIQ + SCRFD 多 session 池，进程内共享）
+/// AI 推理引擎（MUSIQ + SCRFD + YOLOv8-pose 多 session 池，进程内共享）
 ///
 /// onnxruntime 的 run 需要 &mut self，用 SessionPool 轮询分配实现并行；
 /// 每 session 内部线程数 = 核数 / 池大小。
 pub struct AiEngine {
     pub musiq: Option<SessionPool<Musiq>>,
     pub yunet: Option<SessionPool<Scrfd>>,
+    pub pose: Option<SessionPool<PoseDet>>,
 }
 
 /// AI session 池大小（实测池化无收益：AI 非瓶颈且每 session 线程减半变慢，保持 1）
@@ -42,12 +44,15 @@ impl AiEngine {
             yunet: Some(SessionPool::new(
                 (0..AI_POOL_SIZE).map(|_| Scrfd::load(intra)).collect::<anyhow::Result<_>>()?,
             )),
+            pose: Some(SessionPool::new(
+                (0..AI_POOL_SIZE).map(|_| PoseDet::load(intra)).collect::<anyhow::Result<_>>()?,
+            )),
         })
     }
 
     /// 不加载 AI 模型（纯像素评分，用于快速预览）
     pub fn none() -> Self {
-        AiEngine { musiq: None, yunet: None }
+        AiEngine { musiq: None, yunet: None, pose: None }
     }
 }
 
@@ -213,7 +218,33 @@ pub fn analyze_one(
             Err(err) => {
                 use std::sync::Once;
                 static LOGGED: Once = Once::new();
-                LOGGED.call_once(|| eprintln!("[score] YuNet 检测失败（后续静默）: {err:#}"));
+                LOGGED.call_once(|| eprintln!("[score] SCRFD 检测失败（后续静默）: {err:#}"));
+            }
+        }
+    }
+
+    // 人脸漏检（小脸/侧脸）时：姿态检测定位头部，评估头部区域锐度
+    if faces == 0 && sharpness_region.is_none() {
+        if let Some(pp) = &ai.pose {
+            match pp.acquire().detect(&img.rgb, img.width, img.height) {
+                Ok(persons) => {
+                    if let Some(biggest) = persons.iter().max_by(|a, b| {
+                        (a.w * a.h).partial_cmp(&(b.w * b.h)).unwrap_or(std::cmp::Ordering::Equal)
+                    }) {
+                        if let Some((cx, cy, half_w, half_h)) = head_region(biggest) {
+                            let reblur = metrics::sharpness::reblur_mean_region(
+                                &img.luma, img.width, img.height, cx, cy, half_w, half_h,
+                            );
+                            sharpness_region =
+                                Some(metrics::sharpness::region_sharpness_score(reblur));
+                        }
+                    }
+                }
+                Err(err) => {
+                    use std::sync::Once;
+                    static LOGGED: Once = Once::new();
+                    LOGGED.call_once(|| eprintln!("[score] 姿态检测失败（后续静默）: {err:#}"));
+                }
             }
         }
     }

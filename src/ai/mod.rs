@@ -6,6 +6,7 @@
 
 pub mod facedetect;
 pub mod musiq;
+pub mod pose;
 
 use anyhow::{bail, Result};
 use std::path::Path;
@@ -52,13 +53,15 @@ pub fn ensure_models() -> Result<()> {
         "musiq_model.onnx",
         "musiq_model.onnx.data",
         "scrfd_10g_bnkps.onnx",
+        "yolov8n_pose.onnx",
     ] {
         if !Path::new(MODELS_DIR).join(f).exists() {
             bail!(
                 "缺少模型文件 models/{f}\n\
                  请先下载（见 DESIGN.md 9.1 节）：\n\
                  - MUSIQ: hf-mirror.com/86Cao/IQA-ONNX-Models\n\
-                 - SCRFD: hf-mirror.com/RuteNL/SCRFD-face-detection-ONNX"
+                 - SCRFD: hf-mirror.com/RuteNL/SCRFD-face-detection-ONNX\n\
+                 - YOLOv8n-pose: hf-mirror.com/Xenova/yolov8n-pose"
             );
         }
     }
