@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use rayon::prelude::*;
 
 use crate::ai;
-use crate::ai::facedetect::YuNet;
+use crate::ai::facedetect::Scrfd;
 use crate::ai::musiq::Musiq;
 use crate::ai::SessionPool;
 use crate::config::{MetricParams, ScoreWeights};
@@ -16,13 +16,13 @@ use crate::dedup;
 use crate::metrics;
 use crate::scan::{PhotoEntry, stem_of};
 
-/// AI 推理引擎（MUSIQ + YuNet 多 session 池，进程内共享）
+/// AI 推理引擎（MUSIQ + SCRFD 多 session 池，进程内共享）
 ///
 /// onnxruntime 的 run 需要 &mut self，用 SessionPool 轮询分配实现并行；
 /// 每 session 内部线程数 = 核数 / 池大小。
 pub struct AiEngine {
     pub musiq: Option<SessionPool<Musiq>>,
-    pub yunet: Option<SessionPool<YuNet>>,
+    pub yunet: Option<SessionPool<Scrfd>>,
 }
 
 /// AI session 池大小（实测池化无收益：AI 非瓶颈且每 session 线程减半变慢，保持 1）
@@ -40,7 +40,7 @@ impl AiEngine {
                 (0..AI_POOL_SIZE).map(|_| Musiq::load(intra)).collect::<anyhow::Result<_>>()?,
             )),
             yunet: Some(SessionPool::new(
-                (0..AI_POOL_SIZE).map(|_| YuNet::load(intra)).collect::<anyhow::Result<_>>()?,
+                (0..AI_POOL_SIZE).map(|_| Scrfd::load(intra)).collect::<anyhow::Result<_>>()?,
             )),
         })
     }
@@ -221,8 +221,9 @@ pub fn analyze_one(
     let sharpness_final = match sharpness_region {
         Some(region) if region > sharpness => region,
         // 无人脸/无主体线索时：全局指标对浅景深照片不可靠，
-        // 给 35 分中性下限（宁可漏判真糊，不可误杀清晰照片）
-        _ => sharpness.max(35.0),
+        // 给 50 分中性下限（用户确认其场景均为大光圈浅景深人像，
+        // 宁可漏判真糊，不可误杀清晰照片；真糊由人工在 gallery 复核）
+        _ => sharpness.max(50.0),
     };
 
     Ok(Some(AnalysisResult {

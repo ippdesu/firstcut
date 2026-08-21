@@ -163,10 +163,11 @@ fn box_blur_3x3(luma: &[u8], w: usize, h: usize) -> Vec<u8> {
     out
 }
 
-/// 指定区域（归一化坐标）内的 reblur 差分均值——"主体区域锐度"。
+/// 指定区域（归一化坐标）内的 reblur 差分 **P80**——"主体区域锐度"。
 ///
-/// 用于人脸检测命中时：评估人脸及周边区域的合焦程度，
-/// 不受大面积虚化背景影响（大光圈人像的正确语义）。
+/// 用于人脸检测命中时：评估人脸及周边区域的合焦程度。
+/// 取高百分位而非均值：人脸区域以平滑皮肤为主（blur 前后差异小），
+/// 均值会被皮肤稀释；眼睛/眉毛/头发边缘的高差异像素才是合焦证据。
 pub fn reblur_mean_region(
     luma: &[u8],
     w: u32,
@@ -186,21 +187,20 @@ pub fn reblur_mean_region(
     let x1 = (((cx + half_w) * w as f64).round() as i64).clamp(0, w as i64 - 1) as usize;
     let y0 = (((cy - half_h) * h as f64).round() as i64).clamp(0, h as i64 - 1) as usize;
     let y1 = (((cy + half_h) * h as f64).round() as i64).clamp(0, h as i64 - 1) as usize;
-    let mut sum = 0f64;
-    let mut n = 0f64;
+    let mut diffs: Vec<f64> = Vec::with_capacity((x1 - x0 + 1) * (y1 - y0 + 1));
     for y in y0..=y1 {
         let row = y * w;
         for x in x0..=x1 {
             let i = row + x;
-            sum += (luma[i] as f64 - blurred[i] as f64).abs();
-            n += 1.0;
+            diffs.push((luma[i] as f64 - blurred[i] as f64).abs());
         }
     }
-    if n == 0.0 {
-        0.0
-    } else {
-        sum / n
+    if diffs.is_empty() {
+        return 0.0;
     }
+    diffs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let idx = ((diffs.len() as f64) * 0.80) as usize;
+    diffs[idx.min(diffs.len() - 1)]
 }
 
 /// 主体区域锐度 → 分数（reblur 均值 4~14 映射 30~95）

@@ -19,7 +19,7 @@ cargo build --release
 | 文件 | 来源 | 大小 |
 |---|---|---|
 | `musiq_model.onnx` + `.onnx.data` | [86Cao/IQA-ONNX-Models](https://huggingface.co/86Cao/IQA-ONNX-Models)（国内可用 hf-mirror.com） | ~110MB |
-| `face_detection_yunet_2023mar.onnx` | [opencv_zoo](https://github.com/opencv/opencv_zoo)（Git LFS，用 media.githubusercontent.com 下载） | 232KB |
+| `scrfd_10g_bnkps.onnx` | [RuteNL/SCRFD-face-detection-ONNX](https://huggingface.co/RuteNL/SCRFD-face-detection-ONNX)（InsightFace SCRFD 10g，小脸检测强） | 16.9MB |
 
 模型缺失时 score 自动降级为纯像素评分并提示；`--no-ai` 可显式跳过。
 
@@ -65,10 +65,10 @@ burst_group, burst_size, burst_rank, burst_keep`
 
 | 维度 | 权重 | 方法 |
 |---|---|---|
-| 清晰度 | 0.35 | Sobel 梯度方差 ÷ 亮度方差（场景归一化），饱和曲线 k=800k |
+| 清晰度 | 0.35 | 主体感知：检出人脸时用人脸区域 reblur 差分 P80（合焦边缘证据），否则全局梯度（Sobel 方差/亮度方差）并给 50 分中性下限——大光圈浅景深照片不会被误判 |
 | 曝光 | 0.20 | 过曝/欠曝像素比例 + 平均亮度偏离中间调 |
 | 噪点 | 0.15 | 暗部 8×8 块标准差 P15（最平滑暗块）+ ISO 容忍度曲线 |
-| 构图 | 0.15 | YuNet 人脸检测：三分法位置 + 人脸大小 + 多人降权；无人脸中性 60 |
+| 构图 | 0.15 | SCRFD 人脸检测：三分法位置 + 人脸大小 + 多人降权；无人脸中性 60 |
 | 美学 | 0.15 | MUSIQ 0-100 质量分 |
 
 星级分档：≥80→5★ / ≥65→4★ / ≥50→3★ / ≥35→2★ / 其余 1★
