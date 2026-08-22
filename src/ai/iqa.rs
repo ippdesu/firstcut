@@ -37,15 +37,20 @@ impl ClipIqa {
             .resize_exact(224, 224, image::imageops::FilterType::Triangle);
         let px = small.into_rgb8();
 
-        let mut arr = Array4::<f32>::zeros((1, 3, 224, 224));
-        for y in 0..224usize {
-            for x in 0..224usize {
-                let p = px.get_pixel(x as u32, y as u32);
-                for c in 0..3 {
-                    arr[[0, c, y, x]] = (p[c] as f32 / 255.0 - MEAN[c]) / STD[c];
-                }
+        // 预处理：CLIP 归一化 (x/255 - mean) / std（批量操作）
+        let raw = px.into_raw();
+        let pixels = 224 * 224;
+        let mut arr_data = Vec::with_capacity(1 * 3 * 224 * 224);
+        for c in 0..3 {
+            let offset = c * pixels;
+            let mean = MEAN[c];
+            let std = STD[c];
+            for i in 0..pixels {
+                arr_data.push((raw[offset + i] as f32 / 255.0 - mean) / std);
             }
         }
+        let arr = Array4::<f32>::from_shape_vec((1, 3, 224, 224), arr_data)
+            .map_err(crate::ai::ort_err)?;
 
         let tensor = ort::value::Tensor::from_array(arr).map_err(crate::ai::ort_err)?;
         let input = ort::inputs!["input" => tensor];

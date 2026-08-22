@@ -22,7 +22,7 @@ impl Default for ScoreWeights {
     fn default() -> Self {
         ScoreWeights {
             sharpness: 0.35,
-            exposure: 0.20,
+            exposure: 0.25,
             noise: 0.15,
             composition: 0.15,
             aesthetic: 0.15,

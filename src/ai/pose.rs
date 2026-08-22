@@ -63,16 +63,19 @@ impl PoseDet {
         );
         let px = small.into_rgb8();
 
-        // 预处理：RGB、/255
-        let mut arr = Array4::<f32>::zeros((1, 3, INPUT_SIZE, INPUT_SIZE));
-        for y in 0..INPUT_SIZE {
-            for x in 0..INPUT_SIZE {
-                let p = px.get_pixel(x as u32, y as u32);
-                arr[[0, 0, y, x]] = p[0] as f32 / 255.0;
-                arr[[0, 1, y, x]] = p[1] as f32 / 255.0;
-                arr[[0, 2, y, x]] = p[2] as f32 / 255.0;
-            }
-        }
+        // 预处理：RGB、/255（批量操作）
+        let raw = px.into_raw();
+        let pixels = INPUT_SIZE * INPUT_SIZE;
+        let data: Vec<f32> = [
+            raw[..pixels].iter().map(|&p| p as f32 / 255.0).collect::<Vec<f32>>(),
+            raw[pixels..pixels * 2].iter().map(|&p| p as f32 / 255.0).collect::<Vec<f32>>(),
+            raw[pixels * 2..pixels * 3].iter().map(|&p| p as f32 / 255.0).collect::<Vec<f32>>(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        let arr = Array4::<f32>::from_shape_vec((1, 3, INPUT_SIZE, INPUT_SIZE), data)
+            .map_err(crate::ai::ort_err)?;
 
         let tensor = ort::value::Tensor::from_array(arr).map_err(crate::ai::ort_err)?;
         let input = ort::inputs!["images" => tensor];
