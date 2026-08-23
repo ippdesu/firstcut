@@ -21,8 +21,10 @@ pub struct ScoreWeights {
 impl Default for ScoreWeights {
     fn default() -> Self {
         ScoreWeights {
-            sharpness: 0.35,
-            exposure: 0.20,
+            // M5 决策 A：曝光权重提高到 0.25（欠曝照片不再虚高），
+            // 从清晰度挪 0.05 保持权重和 = 1.0（与 A2 模拟验证一致）
+            sharpness: 0.30,
+            exposure: 0.25,
             noise: 0.15,
             composition: 0.15,
             aesthetic: 0.15,

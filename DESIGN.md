@@ -1,9 +1,9 @@
 # 照片初筛评分工具（Rust）— 设计与实现文档
 
-> 状态：**Phase 1 已完成并发布 v1.0**（GitHub: ippdesu/firstcut，tag v1.0）
+> 状态：**Phase 1 已完成并发布 v1.0**（GitHub: ippdesu/firstcut，tag v1.0；test/fixes 修复已合并）
 > 日期：2026 规划稿 / 2026 实施完成
 > 需求来源：索尼相机 JPG+ARW 连拍/风景/人像选片地狱，需要自动初步评分
-> 配套文档：`README.md`（用户手册）/ `release_notes.md`（版本说明）/ `M5_REVIEW.md`（M5 决策记录）
+> 配套文档：`README.md`（用户手册）/ `release_notes.md`（版本说明）/ `M5_REVIEW.md`（M5 决策记录）/ `firstcut.toml`（配置模板）
 
 ## 0. 目标（根据确认的需求）
 
@@ -26,34 +26,32 @@
 
 | 用途 | Crate/方案 | 说明（实际实现） |
 |---|---|---|
-| CLI | `clap` | 子命令：scan（建索引）/ score（分析+评分）/ config-template（生成配置模板）；CSV 由 score 直接产出 |
-| JPG 解码 | `jpeg-decoder`（快速路径）+ `image` 兜底 | JPEG 全解码后 **box 块平均降采样**到 ~1024px（~50ms/张 33MP；无 DCT 缩放，0.3 版库已移除该特性） |
+| CLI | `clap` | 子命令：`scan`（建索引）/ `score`（分析+评分）/ `config-template`（生成配置模板）。**`report` / `download-models` 已规划但未实现**——CSV 由 `score` 直接产出；模型缺失时给出下载链接并自动降级。 |
+| JPG 解码 | `jpeg-decoder`（快速路径）+ `image` 兜底 | JPEG 全解码后 **box 块平均降采样**到 ~1MP 分析尺寸（~50ms/张 33MP；jpeg-decoder 0.3 无 DCT 缩放，故全解码+块平均） |
 | EXIF | `kamadak-exif` | ISO、光圈、快门、拍摄时间（连拍聚类用）；多值 ASCII 字段取首个非空值 |
-| 像素处理 | `image` / 自写 | 灰度（BT.601）、直方图、Sobel 梯度、3×3 box blur、8×8 块统计 |
-| AI 推理 | `ort` 2.0.0-rc.13（onnxruntime-rs，静态链接自包含，免 DLL） | CLIPIQA + SCRFD + YOLOv8-pose；GPU（DirectML）未启用 |
-| 美学评分 | **CLIPIQA+ ONNX**（[86Cao/IQA-ONNX-Models](https://huggingface.co/86Cao/IQA-ONNX-Models)） | 224×224、CLIP 归一化 (x/255 - mean)/std、输出 0-100；M5 决策从 MUSIQ 换成（区分度 36-65 → 26-76） |
-| 人脸检测 | **SCRFD 10g**（[RuteNL/SCRFD-face-detection-ONNX](https://huggingface.co/RuteNL/SCRFD-face-detection-ONNX)） | 640×640、(x-127.5)/128、distance(l,t,r,b)×stride 格中心解码、score 已 sigmoid、阈值 0.3 + 贪心 NMS；M5 决策从 YuNet 换成（检出 23→75/119） |
-| 人体姿态 | **YOLOv8n-pose**（[Xenova/yolov8n-pose](https://huggingface.co/Xenova/yolov8n-pose)） | 640×640、/255 归一化、[1,56,8400] 通道优先布局（score 已 sigmoid、坐标已像素空间）；SCRFD 漏检时头部关键点定位主体区域 |
-| 并行 | `rayon` | JPG 解码 + 像素指标并行；AI 推理经 Mutex 串行（实测池化无收益） |
-| 缓存 | `rusqlite`（bundled） | 按 (path, size, mtime, CACHE_VERSION) 缓存；命中跳过解码与推理；并行段用预加载快照 |
-| XMP 写出 | 自写轻量 XML 侧车 | `<名>.<原扩展名>.xmp`，`xmp:Rating` + `firstcut:` 命名空间；他人侧车（无 firstcut 标记）不覆盖 |
-| 序列化/日志 | `serde`+`csv` | CSV 报告；进度日志到 stderr（未用 tracing） |
+| 像素处理 | `image` / `imageproc` / 自写 | 灰度（BT.601 加权）、直方图、Sobel 梯度、3×3 box blur |
+| AI 推理 | `ort` 2.0.0-rc.13（onnxruntime-rs，静态链接自包含，无需 DLL） | 跑 CLIPIQA + SCRFD + YOLOv8-pose；GPU（DirectML）暂未启用，CPU 池化收益不显著 |
+| 美学评分 | **CLIPIQA+ ONNX**（[86Cao/IQA-ONNX-Models](https://huggingface.co/86Cao/IQA-ONNX-Models)） | 224×224、CLIP 归一化、`(x/255 - mean) / std`、sigmoid 输出 ×100 → 0-100 分；M5 决策从 MUSIQ 换到 CLIPIQA（区分度更高） |
+| 人脸检测 | **SCRFD 10g**（[RuteNL/SCRFD-face-detection-ONNX](https://huggingface.co/RuteNL/SCRFD-face-detection-ONNX)） | 640×640 输入、(x-127.5)/128 归一化、9 个输出张量（score/bbox × stride [8,16,32]、score 已 sigmoid）；阈值 0.3 + 贪心 NMS；M5 决策从 YuNet 换到 SCRFD（小脸/侧脸检出 23→75/119） |
+| 人体姿态 | **YOLOv8n-pose**（[Xenova/yolov8n-pose](https://huggingface.co/Xenova/yolov8n-pose)） | 640×640 输入、/255 归一化、输出 [1, 56, 8400]；SCRFD 漏检时用头部关键点定位主体区域 |
+| 并行 | `rayon` | JPG 解码 + 像素指标并行分块；AI 推理经 Mutex 串行（实测池化无收益）；上万张走分块并行 |
+| 缓存 | `rusqlite`（bundled） | 按 (path, size, mtime, CACHE_VERSION) 缓存；命中跳过解码与推理 |
+| XMP 写出 | 自写轻量 XML 侧车 | 只写 `xmp:Rating` + `firstcut:` 命名空间存子分；他人侧车（无 `firstcut` 标记）不覆盖 |
+| 序列化/日志 | `serde`+`csv` | CSV 报告 + 进度日志到 stderr |
 
 > ARW 解码（rawler/rawloader）**本期不做** —— 已确认用 JPG 评分、分数映射到同名 ARW。后续若想精确分析动态范围再加。
 
 ## 3. 评分引擎（5 评分维度 + 连拍去重）【已实现】
 
-1. **清晰度/合焦**（主体感知三层链路）：
-   - SCRFD 检出人脸 → 人脸框 1.5× 区域 reblur 差分 **P80**（合焦边缘证据；皮肤平滑不稀释）
-   - 人脸漏检 → YOLOv8-pose 头部关键点包围盒（鼻/眼/耳 1.4× 扩展）区域 reblur P80
-   - 都无主体 → 全局 Tenengrad÷亮度方差，并给 **50 分中性下限**（大光圈浅景深照片不被误判；用户确认其场景均为浅景深人像/动物）
-2. **曝光**：直方图过曝（≥250）与欠曝（≤5）像素比例 + 平均亮度偏离**目标亮度**（默认 128，exposure_target 可配）惩罚。
-3. **噪点**：暗部（<40）8×8 块标准差 **P15 低百分位**（最平滑暗块≈传感器噪声，避免场景纹理污染）+ ISO 容忍度曲线 k=3.0·(1+0.3·log10(iso/100))。
-4. **构图**：SCRFD 人脸框（无人脸时 pose 人体框）→ 三分法交点距离 + 主体大小占比（2%~30% 理想区间）+ 多人降权；无主体给中性 60 分。
-5. **美学**：CLIPIQA 0-100 分（224×224、CLIP 归一化，直接映射）。
-6. **连拍去重**：按 `DateTimeOriginal` 时间戳聚类（间隔 ≤2s 为一组）→ 组内 dHash 感知哈希（汉明距离 ≤10 为同一子簇）→ 子簇内按总分排序保留 top-K（默认 2）并标记"组内第 N 名"。
+1. **清晰度/合焦**：下采样 1024px → Tenengrad（Sobel 梯度方差）÷ 亮度方差归一化（消除场景纹理差异），饱和曲线映射（k=800k，实测范围 12 万~172 万）。
+   - **M5 主体感知三层兜底**：SCRFD 人脸命中 → 人脸区域 1.5× 框内 reblur P80（避开皮肤平滑区，捕眼睛/发丝锐边）；SCRFD 漏检 → YOLOv8-pose 头部关键点扩展 1.4×1.6× 区域 reblur P80；都无 → 50 分中性下限（大光圈浅景深照片不误判，真糊由人工 gallery 复核）。
+2. **曝光**：直方图过曝（≥250）与欠曝（≤5）像素比例（4× 系数惩罚）+ 平均亮度偏离 `exposure_target`（默认 128，可配）的高斯衰减。
+3. **噪点**：暗部（<40）8×8 块标准差 **P15**（最平滑暗块，避开暗部场景纹理污染）+ ISO 容忍度曲线 `k = K0·(1 + 0.3·log10(iso/100))`，`K0=3.0`。
+4. **构图**：SCRFD 人脸框 → 三分法交点（4 点）距离（最大 0.47）+ 人脸高度占比（2~30% 理想）+ 多人降权（1→1.0、2-4→0.95、5+→0.85）；无人脸给中性 60 分（不惩罚风景/静物）。
+5. **美学**：CLIPIQA+ 0-100 分（224×224、CLIP 归一化、sigmoid×100）；M5 从 MUSIQ 换入，分布区分度提升至 26-76 区间。
+6. **连拍去重**：按 `DateTimeOriginal` 时间戳聚类（间隔 ≤2s 为一组，`keep_k=2`）→ 组内 dHash 感知哈希（9×8 → 64 bit、汉明距离 ≤10 为同一子簇）→ 子簇内按总分排序保留 top-K 并标记"组内第 N 名 / 是否保留"。
 
-**汇总权重（默认，M5 校准）**：清晰 0.35 / 曝光 0.20 / 噪点 0.15 / 构图 0.15 / 美学 0.15。总分 0-100 + 5 个子分 + 人脸数全部进 CSV。
+**汇总权重（默认，M5 决策 A+修复）**：清晰 0.30 / 曝光 0.25（M5 从 0.20 提升）/ 噪点 0.15 / 构图 0.15 / 美学 0.15（和 = 1.0）。总分 0-100 + 5 个子分 + 人脸数全部进 CSV。
 
 ## 4. 流水线设计（上万张性能）
 
@@ -112,10 +110,11 @@ pic_process/
 
 ## 8. 风险与开放问题（当前状态）
 
-- **美学模型**：MUSIQ → **已换 CLIPIQA+**（类别度 36-65 → 26-76，详见 M5_REVIEW.md 决策 C）。
-- **onnxruntime GPU**：DirectML 启用属于后续优化（当前 CPU ~155ms/张，1 万张冷跑 ~26 分钟；批量场景建议）。
-- **权重校准**：默认权重经真实照片验证（清晰 0.35/曝光 0.20/噪点 0.15/构图 0.15/美学 0.15，和=1.0）；多场景用 `--config` 按需调整。
-- **Lightroom 读 XMP 星级**：侧车命名与 `xmp:Rating` 均按 LR 约定；建议实机验证一次（可在 Phase 2 环境验证时一并做）。
+- **美学模型**：~~MUSIQ~~ → **已定案：CLIPIQA+ ONNX**（M5 切换，86Cao/IQA-ONNX-Models，224×224、CLIP 归一化、sigmoid×100，分布区分度 26-76 高于 MUSIQ 的 36-65；已下载至 `models/clipiqa_model.onnx{,.data}`）。
+- **人脸检测**：~~YuNet~~ → **已定案：SCRFD 10g**（M5 切换，RuteNL/SCRFD-face-detection-ONNX，640×640、9 输出解码、阈值 0.3 + 贪心 NMS；119 张真实照片检出 23→75）。
+- **onnxruntime Windows GPU**：DirectML provider 支持 OK；无 GPU 时自动回落 CPU。AI_POOL_SIZE=1（Mutex 串行）——实测池化无收益（AI 非瓶颈且每 session 线程减半变慢）。
+- **权重校准**：默认权重 0.30/0.25/0.15/0.15/0.15（和=1.0，M5 决策 A：曝光 0.25 压欠曝虚高）；多场景用 `--config` 按需调整（人像/打鸟/夜景/飞机各存一份）。
+- **Lightroom 读 XMP 星级**：侧车命名与 `xmp:Rating` 均按 LR 约定；建议 v1.0 后用 Lightroom 实测验证一次（可并入 Phase 2 环境验证）。
 
 ## 9. Phase 2（远期）：批量 RAW 开发，替代 Lightroom 手动流程
 

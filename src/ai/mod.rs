@@ -1,8 +1,15 @@
-//! AI 推理模块（M3）：MUSIQ 美学评分 + YuNet 人脸检测
+//! AI 推理模块（M3/M5）：CLIPIQA 美学评分 + SCRFD 人脸检测 + YOLOv8-pose 姿态检测
 //!
-//! 模型文件位于 models/（已 gitignore）：
-//! - musiq_model.onnx + musiq_model.onnx.data（86Cao/IQA-ONNX-Models，hf-mirror 下载）
-//! - face_detection_yunet_2023mar.onnx（opencv_zoo，Git LFS media 下载）
+//! 三个模型均走 `ort` (onnxruntime-rs)，静态链接自包含，免 DLL：
+//! - **CLIPIQA+**（`models/clipiqa_model.onnx` + `.onnx.data`）：
+//!   [86Cao/IQA-ONNX-Models](https://huggingface.co/86Cao/IQA-ONNX-Models)，
+//!   224×224 输入、CLIP 归一化、sigmoid 输出 ×100 → 0-100 美学分。
+//! - **SCRFD 10g**（`models/scrfd_10g_bnkps.onnx`）：
+//!   [RuteNL/SCRFD-face-detection-ONNX](https://huggingface.co/RuteNL/SCRFD-face-detection-ONNX)，
+//!   640×640 输入、3 尺度检测 + 贪心 NMS，小脸/侧脸检出优于 YuNet。
+//! - **YOLOv8n-pose**（`models/yolov8n_pose.onnx`）：
+//!   [Xenova/yolov8n-pose](https://huggingface.co/Xenova/yolov8n-pose)，
+//!   640×640 输入、SCRFD 漏检时定位人体框与头部关键点，供"主体区域锐度"评估。
 
 pub mod facedetect;
 pub mod iqa;
@@ -50,17 +57,17 @@ impl<T> SessionPool<T> {
 /// 校验模型文件是否存在；缺失时给出明确指引
 pub fn ensure_models() -> Result<()> {
     for f in [
-        "musiq_model.onnx",
-        "musiq_model.onnx.data",
+        "clipiqa_model.onnx",
+        "clipiqa_model.onnx.data",
         "scrfd_10g_bnkps.onnx",
         "yolov8n_pose.onnx",
     ] {
         if !Path::new(MODELS_DIR).join(f).exists() {
             bail!(
                 "缺少模型文件 models/{f}\n\
-                 请先下载（见 DESIGN.md 9.1 节）：\n\
-                 - MUSIQ: hf-mirror.com/86Cao/IQA-ONNX-Models\n\
-                 - SCRFD: hf-mirror.com/RuteNL/SCRFD-face-detection-ONNX\n\
+                 请先下载（模型列表见 README.md）：\n\
+                 - CLIPIQA+: hf-mirror.com/86Cao/IQA-ONNX-Models\n\
+                 - SCRFD:    hf-mirror.com/RuteNL/SCRFD-face-detection-ONNX\n\
                  - YOLOv8n-pose: hf-mirror.com/Xenova/yolov8n-pose"
             );
         }

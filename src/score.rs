@@ -23,7 +23,8 @@ use crate::scan::{PhotoEntry, stem_of};
 /// 每 session 内部线程数 = 核数 / 池大小。
 pub struct AiEngine {
     pub iqa: Option<SessionPool<ClipIqa>>,
-    pub yunet: Option<SessionPool<Scrfd>>,
+    /// SCRFD 10g 人脸检测（M5 从 YuNet 替换）
+    pub face: Option<SessionPool<Scrfd>>,
     pub pose: Option<SessionPool<PoseDet>>,
 }
 
@@ -41,7 +42,7 @@ impl AiEngine {
             iqa: Some(SessionPool::new(
                 (0..AI_POOL_SIZE).map(|_| ClipIqa::load(intra)).collect::<anyhow::Result<_>>()?,
             )),
-            yunet: Some(SessionPool::new(
+            face: Some(SessionPool::new(
                 (0..AI_POOL_SIZE).map(|_| Scrfd::load(intra)).collect::<anyhow::Result<_>>()?,
             )),
             pose: Some(SessionPool::new(
@@ -52,7 +53,7 @@ impl AiEngine {
 
     /// 不加载 AI 模型（纯像素评分，用于快速预览）
     pub fn none() -> Self {
-        AiEngine { iqa: None, yunet: None, pose: None }
+        AiEngine { iqa: None, face: None, pose: None }
     }
 }
 
@@ -196,7 +197,7 @@ pub fn analyze_one(
     if let Some(m) = &ai.iqa {
         aesthetic = m.acquire().score(&img.rgb, img.width, img.height).unwrap_or(60.0);
     }
-    if let Some(y) = &ai.yunet {
+    if let Some(y) = &ai.face {
         match y.acquire().detect(&img.rgb, img.width, img.height) {
             Ok(boxes) => {
                 faces = boxes.len();
