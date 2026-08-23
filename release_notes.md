@@ -29,10 +29,13 @@ pic_process.exe score <照片目录> --xmp
 pic_process.exe score <照片目录> --config portrait.toml --cache portrait.sqlite
 
 # HTML 联系表（人工复核）
-gallery.exe report.csv -o gallery.html
+pic_process-gallery.exe report.csv -o gallery.html
+
+# 调参：导出每张图的原始指标
+pic_process-tune.exe <照片目录> -o metrics.csv
 ```
 
-## 模型准备（一次性，models/ 目录）
+## 模型准备（一次性，`models/` 目录）
 
 | 文件 | 来源 | 大小 |
 |---|---|---|
@@ -44,6 +47,12 @@ gallery.exe report.csv -o gallery.html
 
 ## 本版本内容
 
-- Phase 1 完整实现：M0 扫描/EXIF → M1 像素指标 → M2 连拍去重 → M3 AI 五维评分 → M4 XMP+缓存 → M5 调参验证
-- 用户反馈驱动的修复：浅景深清晰度误判（主体区域 reblur）、人脸漏检（SCRFD + YOLOv8-pose 姿态兜底）、多场景权重配置
-- 12 项单元测试通过；119 张 33MP 真实照片冷跑 ~18s（16 核），增量秒级
+- **Phase 1 完整实现**：M0 扫描/EXIF → M1 像素指标 → M2 连拍去重 → M3 AI 五维评分（MUSIQ → CLIPIQA）→ M4 XMP+缓存 → M5 调参验证
+- **用户反馈驱动的修复**：
+  - 浅景深清晰度误判（主体感知三层链路：SCRFD 人脸区域 reblur → YOLOv8-pose 头部区域 reblur → 50 分中性下限）
+  - 人脸漏检（YuNet → SCRFD 10g，119 张真实照片检出 23→75）
+  - 小脸人像主体定位（SCRFD 漏检时回退 YOLOv8-pose 头部关键点）
+  - 噪点暗部纹理污染（中位数 → P15 低百分位）
+  - 多场景权重配置（`--config` / `config-template`）
+- **测试覆盖**：12 单元测试（dedup 6 + composition 4 + xmp 2）+ 5 集成测试，端到端 pipeline 验证
+- **性能**：119 张 33MP 真实照片冷跑 ~10.6s（16 核，含 CLIPIQA + SCRFD + 姿态），增量重跑秒级
