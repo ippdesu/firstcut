@@ -89,24 +89,24 @@ burst_group, burst_size, burst_rank, burst_keep`
 
 ## 性能（16 核机器实测）
 
-- 冷缓存：33MP JPG 约 **90ms/张**（解码 + 五维评分），119 张 10.6s
+- 冷缓存：33MP JPG 约 **155ms/张**（解码 + CLIPIQA + SCRFD + 姿态），119 张 18.4s（16 核）
 - 增量重跑：秒级（SQLite 缓存，键 = 文件大小 + mtime + 分析版本）
-- 评分参数变更自动使缓存失效（CACHE_VERSION）
+- 评分参数变更自动使缓存失效（CACHE_VERSION）；换 --config 建议换 --cache 文件名
 
 ## 目录结构
 
 ```
 src/
-├── main.rs        # CLI（scan / score）
+├── main.rs        # CLI（scan / score / config-template）
 ├── scan.rs        # 目录扫描 + EXIF + JPG/ARW 配对
 ├── decode.rs      # JPEG 解码（box 降采样）+ 灰度/直方图
 ├── metrics/       # sharpness / exposure / noise / composition
-├── ai/            # musiq / facedetect（ort 推理）
+├── ai/            # iqa(CLIPIQA) / facedetect(SCRFD) / pose(YOLOv8)（ort 推理）
 ├── dedup.rs       # 连拍分组 + dHash 聚类 + 排序
 ├── cache.rs       # SQLite 增量缓存
 ├── output/        # csv / xmp 侧车
-├── config.rs      # 权重与曲线参数
-└── bin/           # tune（调参）、gallery（联系表）
+├── config.rs      # 权重与曲线参数（--config 可配）
+└── bin/           # tune（调参）、gallery（联系表）、debug_scrfd、debug_pose、probe
 ```
 
 ## Phase 2（规划中，未实现）

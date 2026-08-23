@@ -1,0 +1,9 @@
+﻿docs: 全量文档对齐 Phase 1/v1.0 实际状态
+
+- DESIGN.md: 状态改已完成并发布 v1.0；技术选型表按实际实现重写
+  (jpeg-decoder box 降采样、CLIPIQA/SCRFD/YOLOv8-pose、缓存键)
+- 评分引擎更新: 主体感知三层链路、噪点 P15、exposure_target
+- 项目结构/XMP 约定/风险更新；目标改 5 维+去重
+- README.md: 性能数字 155ms/张、目录树 ai 模块名、星级分档
+- M5_REVIEW.md: 从待拍板清单重写为已关闭决策记录
+- release_notes.md 入库
