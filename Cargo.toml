@@ -3,6 +3,33 @@ name = "pic_process"
 version = "1.0.0"
 edition = "2021"
 description = "索尼照片初筛评分工具（Phase 1: 扫描/评分/报告）"
+autobins = false  # 关闭 src/bin/ 的自动发现，统一由下方 [[bin]] 列表控制
+
+# 二进制名统一以 pic_process- 为前缀（main 例外），
+# 避免多个子工具与主命令混淆
+[[bin]]
+name = "pic_process"
+path = "src/main.rs"
+
+[[bin]]
+name = "pic_process-tune"
+path = "src/bin/tune.rs"
+
+[[bin]]
+name = "pic_process-gallery"
+path = "src/bin/gallery.rs"
+
+[[bin]]
+name = "pic_process-debug-pose"
+path = "src/bin/debug_pose.rs"
+
+[[bin]]
+name = "pic_process-debug-scrfd"
+path = "src/bin/debug_scrfd.rs"
+
+[[bin]]
+name = "pic_process-probe"
+path = "src/bin/probe.rs"
 
 [dependencies]
 anyhow = "1"
