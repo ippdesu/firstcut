@@ -61,13 +61,14 @@ impl Scrfd {
         );
         let px = small.into_rgb8();
 
-        // 预处理：RGB、(x-127.5)/128（批量操作，避免逐像素 get_pixel）
+        // 预处理：RGB、(x-127.5)/128（批量操作；into_raw 为交错布局，按 3 字节拆通道）
         let raw = px.into_raw();
-        let pixels = INPUT_SIZE * INPUT_SIZE;
-        let r: Vec<f32> = raw[..pixels].iter().map(|&p| (p as f32 - 127.5) / 128.0).collect();
-        let g: Vec<f32> = raw[pixels..pixels * 2].iter().map(|&p| (p as f32 - 127.5) / 128.0).collect();
-        let b: Vec<f32> = raw[pixels * 2..pixels * 3].iter().map(|&p| (p as f32 - 127.5) / 128.0).collect();
-        let data: Vec<f32> = [r, g, b].into_iter().flatten().collect::<Vec<_>>();
+        let mut data: Vec<f32> = Vec::with_capacity(3 * INPUT_SIZE * INPUT_SIZE);
+        for c in 0..3 {
+            for px3 in raw.chunks_exact(3) {
+                data.push((px3[c] as f32 - 127.5) / 128.0);
+            }
+        }
         let arr = Array4::<f32>::from_shape_vec((1, 3, INPUT_SIZE, INPUT_SIZE), data)
             .map_err(crate::ai::ort_err)?;
 

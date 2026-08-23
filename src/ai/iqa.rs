@@ -37,16 +37,15 @@ impl ClipIqa {
             .resize_exact(224, 224, image::imageops::FilterType::Triangle);
         let px = small.into_rgb8();
 
-        // 预处理：CLIP 归一化 (x/255 - mean) / std（批量操作）
+        // 预处理：CLIP 归一化 (x/255 - mean) / std（批量操作；
+        // into_raw 是 RGB 交错布局，按 chunks_exact(3) 拆平面通道）
         let raw = px.into_raw();
-        let pixels = 224 * 224;
         let mut arr_data = Vec::with_capacity(1 * 3 * 224 * 224);
         for c in 0..3 {
-            let offset = c * pixels;
             let mean = MEAN[c];
             let std = STD[c];
-            for i in 0..pixels {
-                arr_data.push((raw[offset + i] as f32 / 255.0 - mean) / std);
+            for px3 in raw.chunks_exact(3) {
+                arr_data.push((px3[c] as f32 / 255.0 - mean) / std);
             }
         }
         let arr = Array4::<f32>::from_shape_vec((1, 3, 224, 224), arr_data)

@@ -1,6 +1,8 @@
 //! 集成测试：端到端 pipeline 验证（扫描 → 评分 → 输出）
 //!
-//! 使用项目自带的 testpic/ 目录中的真实照片进行测试。
+//! 使用项目本地的 testpic/ 目录中的真实照片进行测试；
+//! testpic 不入库（gitignore），缺失时跳过依赖它的用例（打印提示），
+//! 其余纯逻辑用例（配置/去重/评分/星级/模板）始终执行。
 
 use pic_process::config::{DedupParams, ScoreConfig};
 use pic_process::dedup;
@@ -9,12 +11,13 @@ use pic_process::score;
 use pic_process::output;
 use std::path::Path;
 
-/// 验证扫描结果包含预期的照片文件
+/// 验证扫描结果包含预期的照片文件（依赖本地 testpic，缺失时跳过）
 #[test]
 fn test_scan_directory_finds_photos() {
     let dir = Path::new("testpic");
     if !dir.exists() {
-        panic!("testpic 目录不存在，无法运行集成测试");
+        eprintln!("testpic 不存在，跳过 test_scan_directory_finds_photos（克隆环境无真实照片）");
+        return;
     }
     let entries = scan::scan_directory(dir).expect("scan_directory 应成功");
     // 应该至少找到 testpic/JPG 和 testpic/RAW 中的照片
@@ -148,8 +151,9 @@ fn test_total_score_with_updated_weights() {
 
     let total = score::total_score(&scores, &cfg.weights);
 
-    // 预期：80*0.35 + 70*0.25 + 60*0.15 + 75*0.15 + 65*0.15 = 28 + 17.5 + 9 + 11.25 + 9.75 = 75.5
-    let expected: f64 = 80.0 * 0.35 + 70.0 * 0.25 + 60.0 * 0.15 + 75.0 * 0.15 + 65.0 * 0.15;
+    // 预期（M5 决策 A 修复后：清晰 0.30 + 曝光 0.25，权重和 = 1.0）：
+    // 80*0.30 + 70*0.25 + 60*0.15 + 75*0.15 + 65*0.15 = 24 + 17.5 + 9 + 11.25 + 9.75 = 71.5
+    let expected: f64 = 80.0 * 0.30 + 70.0 * 0.25 + 60.0 * 0.15 + 75.0 * 0.15 + 65.0 * 0.15;
     let expected_rounded = (expected * 10.0).round() / 10.0;
 
     assert!((total - expected_rounded).abs() < 0.01,

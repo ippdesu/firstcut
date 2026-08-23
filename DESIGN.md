@@ -27,7 +27,7 @@
 | 用途 | Crate/方案 | 说明 |
 |---|---|---|
 | CLI | `clap` | 子命令：`scan`（建索引）/ `score`（分析+评分）/ `config-template`（生成配置模板）。**`report` / `download-models` 已规划但未实现**——CSV 由 `score` 直接产出；模型缺失时给出下载链接并自动降级。 |
-| JPG 解码 | `jpeg-decoder`（快速路径，DCT 直读） + `image` 兜底 | JPEG 走 box 降采样直接到 ~1MP 分析尺寸（~50ms/张 33MP） |
+| JPG 解码 | `jpeg-decoder`（快速路径）+ `image` 兜底 | JPEG 全解码后 **box 块平均降采样**到 ~1MP 分析尺寸（~50ms/张 33MP；jpeg-decoder 0.3 无 DCT 缩放，故全解码+块平均） |
 | EXIF | `kamadak-exif` | ISO、光圈、快门、拍摄时间（连拍聚类用）；多值 ASCII 字段过滤空串 |
 | 像素处理 | `image` / `imageproc` / 自写 | 灰度（BT.601 加权）、直方图、Sobel 梯度、3×3 box blur |
 | AI 推理 | `ort` 2.0.0-rc.13（onnxruntime-rs，静态链接自包含，无需 DLL） | 跑 CLIPIQA + SCRFD + YOLOv8-pose；GPU（DirectML）暂未启用，CPU 池化收益不显著 |
@@ -51,7 +51,7 @@
 5. **美学**：CLIPIQA+ 0-100 分（224×224、CLIP 归一化、sigmoid×100）；M5 从 MUSIQ 换入，分布区分度提升至 26-76 区间。
 6. **连拍去重**：按 `DateTimeOriginal` 时间戳聚类（间隔 ≤2s 为一组，`keep_k=2`）→ 组内 dHash 感知哈希（9×8 → 64 bit、汉明距离 ≤10 为同一子簇）→ 子簇内按总分排序保留 top-K 并标记"组内第 N 名 / 是否保留"。
 
-**汇总权重（默认，M5 校准）**：清晰 0.35 / 曝光 0.25（M5 从 0.20 提升）/ 噪点 0.15 / 构图 0.15 / 美学 0.15。总分 0-100 + 5 个子分 + 人脸数全部进 CSV。
+**汇总权重（默认，M5 决策 A+修复）**：清晰 0.30 / 曝光 0.25（M5 从 0.20 提升）/ 噪点 0.15 / 构图 0.15 / 美学 0.15（和 = 1.0）。总分 0-100 + 5 个子分 + 人脸数全部进 CSV。
 
 ## 4. 流水线设计（上万张性能）
 

@@ -63,17 +63,14 @@ impl PoseDet {
         );
         let px = small.into_rgb8();
 
-        // 预处理：RGB、/255（批量操作）
+        // 预处理：RGB、/255（批量操作；into_raw 为交错布局，按 3 字节拆通道）
         let raw = px.into_raw();
-        let pixels = INPUT_SIZE * INPUT_SIZE;
-        let data: Vec<f32> = [
-            raw[..pixels].iter().map(|&p| p as f32 / 255.0).collect::<Vec<f32>>(),
-            raw[pixels..pixels * 2].iter().map(|&p| p as f32 / 255.0).collect::<Vec<f32>>(),
-            raw[pixels * 2..pixels * 3].iter().map(|&p| p as f32 / 255.0).collect::<Vec<f32>>(),
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
+        let mut data: Vec<f32> = Vec::with_capacity(3 * INPUT_SIZE * INPUT_SIZE);
+        for c in 0..3 {
+            for px3 in raw.chunks_exact(3) {
+                data.push(px3[c] as f32 / 255.0);
+            }
+        }
         let arr = Array4::<f32>::from_shape_vec((1, 3, INPUT_SIZE, INPUT_SIZE), data)
             .map_err(crate::ai::ort_err)?;
 
