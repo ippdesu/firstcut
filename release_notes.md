@@ -1,10 +1,25 @@
-# firstcut v1.0 — 索尼照片初筛评分工具
+# firstcut v1.1 — 修复合并版（AI 预处理通道布局 + 权重修正）
 
 用 Rust 编写的本地照片初筛工具：扫描索尼相机 JPG+ARW 目录，五维评分（清晰度 / 曝光 / 噪点 / 构图 / 美学）+ 连拍去重，输出 CSV 报告与 Lightroom 兼容的 XMP 星级侧车。全程本地离线运行，照片不上传。
 
+## v1.1 变更（相对 v1.0）
+
+**🐛 修复：AI 预处理通道布局 bug**
+- 人脸检测（SCRFD）、美学评分（CLIPIQA）、姿态检测（YOLOv8-pose）的预处理
+  批量改写曾误将 RGB 交错数据按平面拆分，导致三模型输入通道错乱
+  （实测美学分 15-25、人像 0 脸）
+- 修复后与 v1.0 逐像素实现**输出完全一致**（逐张比对通过）
+
+**⚖️ 权重修正**：默认权重 0.30/0.25/0.15/0.15/0.15（和 = 1.0）
+- 曝光从 0.20 提升到 0.25（欠曝照片不再虚高），从清晰度挪 0.05 保持总和 1.0
+
+**🧪 集成测试**：新增 6 项端到端测试；本地 testpic 缺失时自动跳过（克隆环境不再报错）
+
+**🔧 工程改进**：二进制统一命名（`pic_process-*`）、base64 标准 crate 替代自写、版本号 1.0.0
+
 ## 功能
 
-- **五维评分**（权重可配）：
+- **五维评分**（权重可配，`--config` 多场景配置）：
   - 清晰度：主体感知三层链路（SCRFD 人脸区域 → YOLOv8-pose 头部区域 → 中性兜底），大光圈浅景深照片不会被误判
   - 曝光：过曝/欠曝比例 + 亮度偏离目标（目标亮度可配，夜景/亮调环境自适应）
   - 噪点：暗部平滑块 P15 + ISO 容忍度
@@ -13,29 +28,18 @@
 - **连拍去重**：时间聚类 + dHash 感知哈希 → 组内排序，`-k` 控制保留数
 - **XMP 星级侧车**（`--xmp`）：Lightroom 直接可读；他人侧车不覆盖
 - **SQLite 增量缓存**：重跑只处理新照片（秒级）
-- **多场景配置**：`--config` 加载 TOML（人像/打鸟/夜景/飞机各存一份），`config-template` 生成模板
-- **gallery 工具**：HTML 联系表（缩略图 + 分数，浏览器快速选片）
+- **gallery 工具**：HTML 联系表（缩略图 + 分数）
 
 ## 使用
 
 ```bash
-# 生成评分配置模板（可选，改权重用）
-pic_process.exe config-template -o portrait.toml
-
-# 评分 + 写 XMP 星级（Lightroom 可读）
-pic_process.exe score <照片目录> --xmp
-
-# 多场景配置
+pic_process.exe config-template -o portrait.toml   # 生成评分配置模板
+pic_process.exe score <照片目录> --xmp             # 评分 + XMP 星级
 pic_process.exe score <照片目录> --config portrait.toml --cache portrait.sqlite
-
-# HTML 联系表（人工复核）
-pic_process-gallery.exe report.csv -o gallery.html
-
-# 调参：导出每张图的原始指标
-pic_process-tune.exe <照片目录> -o metrics.csv
+pic_process-gallery.exe report.csv -o gallery.html # HTML 联系表
 ```
 
-## 模型准备（一次性，`models/` 目录）
+## 模型准备（一次性，models/ 目录）
 
 | 文件 | 来源 | 大小 |
 |---|---|---|
@@ -45,14 +49,7 @@ pic_process-tune.exe <照片目录> -o metrics.csv
 
 模型缺失时自动降级为纯像素评分；`--no-ai` 可显式跳过。
 
-## 本版本内容
+## 验证
 
-- **Phase 1 完整实现**：M0 扫描/EXIF → M1 像素指标 → M2 连拍去重 → M3 AI 五维评分（MUSIQ → CLIPIQA）→ M4 XMP+缓存 → M5 调参验证
-- **用户反馈驱动的修复**：
-  - 浅景深清晰度误判（主体感知三层链路：SCRFD 人脸区域 reblur → YOLOv8-pose 头部区域 reblur → 50 分中性下限）
-  - 人脸漏检（YuNet → SCRFD 10g，119 张真实照片检出 23→75）
-  - 小脸人像主体定位（SCRFD 漏检时回退 YOLOv8-pose 头部关键点）
-  - 噪点暗部纹理污染（中位数 → P15 低百分位）
-  - 多场景权重配置（`--config` / `config-template`）
-- **测试覆盖**：12 单元测试（dedup 6 + composition 4 + xmp 2）+ 5 集成测试，端到端 pipeline 验证
-- **性能**：119 张 33MP 真实照片冷跑 ~10.6s（16 核，含 CLIPIQA + SCRFD + 姿态），增量重跑秒级
+- 12 单元测试 + 6 集成测试全过
+- 119 张 33MP 真实照片冷跑 ~18s（16 核）；修复后 AI 输出与 v1.0 逐张一致
