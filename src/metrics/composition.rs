@@ -16,12 +16,15 @@ const NO_FACE_SCORE: f64 = 60.0;
 
 /// 构图分数（0-100）
 pub fn composition_score(faces: &[FaceBox]) -> f64 {
-    if faces.is_empty() {
+    // 只统计"显著人脸"（高度占比 ≥ 2%）：背景路人的小脸不应影响主体构图判断
+    // （EXIF 方向修复后，浅景深人像常检出多张背景脸）
+    let significant: Vec<&FaceBox> = faces.iter().filter(|f| f.h >= 0.02).collect();
+    if significant.is_empty() {
         return NO_FACE_SCORE;
     }
 
     let mut best = 0.0f64;
-    for f in faces {
+    for f in &significant {
         let cx = f.x + f.w / 2.0;
         let cy = f.y + f.h / 2.0;
         // 到最近三分交点的距离（最大可能距离约 0.47）
@@ -33,9 +36,7 @@ pub fn composition_score(faces: &[FaceBox]) -> f64 {
 
         // 人脸高度占比
         let size_pct = (f.h * 100.0) as f64;
-        let size_score = if size_pct < 2.0 {
-            0.3 // 太远，主体不突出
-        } else if size_pct < 8.0 {
+        let size_score = if size_pct < 8.0 {
             0.5 + (size_pct / 8.0) * 0.5
         } else if size_pct <= 30.0 {
             1.0 // 理想区间
@@ -49,9 +50,11 @@ pub fn composition_score(faces: &[FaceBox]) -> f64 {
         }
     }
 
-    // 多人合影轻微降权（5 人以上明显降）
-    let count_factor = match faces.len() {
-        1 => 1.0,
+    // 多人合影轻微降权——只计"主体级人脸"（高度占比 ≥ 5%），
+    // 背景路人/远景小脸不参与合影判定（否则浅景深人像会被误判为合影）
+    let subject_faces = faces.iter().filter(|f| f.h >= 0.05).count();
+    let count_factor = match subject_faces {
+        0 | 1 => 1.0,
         2..=4 => 0.95,
         _ => 0.85,
     };

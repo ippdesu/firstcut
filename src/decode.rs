@@ -27,9 +27,12 @@ pub const ANALYSIS_MAX_DIM: u32 = 1024;
 
 /// 解码并预处理照片；非 JPG 或解码失败返回 None（不阻断流水线）
 ///
-/// JPEG 走 zune-jpeg DCT 缩放快速路径（33MP 全解码 ~75ms → DCT 1/8 直读 ~15ms），
+/// JPEG 走 jpeg-decoder 全解码 + box 降采样快速路径，
 /// 其他格式回退 image crate 全解码。
+/// **EXIF Orientation 在降采样后应用**（1MP 图旋转成本远低于 33MP）。
 pub fn load_analysis_image(path: &Path) -> Result<Option<AnalyzedImage>> {
+    let orientation = read_orientation(path);
+
     // 先看文件头是否为 JPEG（避免大 ARW 被整体读入）
     let mut head = [0u8; 4];
     let is_jpeg = match std::fs::File::open(path) {
@@ -43,8 +46,8 @@ pub fn load_analysis_image(path: &Path) -> Result<Option<AnalyzedImage>> {
 
     if is_jpeg {
         if let Ok(bytes) = std::fs::read(path) {
-            if let Some(img) = decode_jpeg_scaled(&bytes) {
-                return Ok(Some(img));
+            if let Some(rgb) = decode_jpeg_to_rgb(&bytes) {
+                return Ok(Some(build_analysis_image(apply_orientation(rgb, orientation))));
             }
         }
     }
@@ -74,14 +77,43 @@ pub fn load_analysis_image(path: &Path) -> Result<Option<AnalyzedImage>> {
     } else {
         img
     };
-    Ok(Some(build_analysis_image(small.to_rgb8())))
+    Ok(Some(build_analysis_image(apply_orientation(small.to_rgb8(), orientation))))
 }
 
-/// JPEG 快速解码：jpeg-decoder 全解码 + box 降采样（块平均）
-///
-/// 33MP 全解码 ~400ms；Triangle 滤波缩放 33MP 是另一大开销（~600ms），
-/// box 降采样用 8x8 块平均直接到 ~1MP（~50ms），且无振铃、对像素指标更稳。
-fn decode_jpeg_scaled(bytes: &[u8]) -> Option<AnalyzedImage> {
+/// 读取 EXIF Orientation（1-8）；缺失/失败返回 1（无变换）
+pub fn read_orientation(path: &Path) -> u16 {
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => std::io::BufReader::new(f),
+        Err(_) => return 1,
+    };
+    match exif::Reader::new().read_from_container(&mut file) {
+        Ok(exif) => exif
+            .get_field(exif::Tag::Orientation, exif::In::PRIMARY)
+            .and_then(|f| f.value.get_uint(0))
+            .map(|v| v as u16)
+            .filter(|v| (1..=8).contains(v))
+            .unwrap_or(1),
+        Err(_) => 1,
+    }
+}
+
+/// 按 EXIF Orientation 旋转/镜像像素（1MP 图，成本可忽略）
+pub fn apply_orientation(img: image::RgbImage, orientation: u16) -> image::RgbImage {
+    use image::imageops::{flip_horizontal, flip_vertical, rotate180, rotate270, rotate90};
+    match orientation {
+        2 => flip_horizontal(&img),
+        3 => rotate180(&img),
+        4 => flip_vertical(&img),
+        5 => rotate90(&flip_horizontal(&img)),
+        6 => rotate90(&img),
+        7 => rotate270(&flip_horizontal(&img)),
+        8 => rotate270(&img),
+        _ => img,
+    }
+}
+
+/// JPEG 解码 + box 降采样，返回分析尺寸的 RGB（未应用 EXIF 旋转）
+fn decode_jpeg_to_rgb(bytes: &[u8]) -> Option<image::RgbImage> {
     let mut decoder = jpeg_decoder::Decoder::new(bytes);
     let pixels = decoder.decode().ok()?;
     let info = decoder.info()?;
@@ -89,23 +121,21 @@ fn decode_jpeg_scaled(bytes: &[u8]) -> Option<AnalyzedImage> {
     if w == 0 || h == 0 {
         return None;
     }
-    let rgb = pixels;
     if w.max(h) <= ANALYSIS_MAX_DIM {
-        return Some(build_analysis_image(image::RgbImage::from_raw(w, h, rgb)?));
+        return image::RgbImage::from_raw(w, h, pixels);
     }
     // box 降采样：步长 = ceil(长边/1024)
     let step = (w.max(h) as f32 / ANALYSIS_MAX_DIM as f32).ceil() as u32;
-    let (nw, nh, out) = box_downsample(&rgb, w, h, step);
+    let (nw, nh, out) = box_downsample(&pixels, w, h, step);
+    let img = image::RgbImage::from_raw(nw, nh, out)?;
     // 极少情况下（非整数倍）仍略超 1024，用 image crate 收尾
     if nw.max(nh) > ANALYSIS_MAX_DIM {
-        let img = image::RgbImage::from_raw(nw, nh, out)?;
         let scale = ANALYSIS_MAX_DIM as f32 / nw.max(nh) as f32;
         let rw = ((nw as f32 * scale).round() as u32).max(1);
         let rh = ((nh as f32 * scale).round() as u32).max(1);
-        let resized = image::imageops::resize(&img, rw, rh, image::imageops::FilterType::Triangle);
-        return Some(build_analysis_image(resized));
+        return Some(image::imageops::resize(&img, rw, rh, image::imageops::FilterType::Triangle));
     }
-    Some(build_analysis_image(image::RgbImage::from_raw(nw, nh, out)?))
+    Some(img)
 }
 
 /// 块平均降采样：每 step×step 块取均值
