@@ -35,7 +35,7 @@
 | 人脸检测 | **SCRFD 10g**（[RuteNL/SCRFD-face-detection-ONNX](https://huggingface.co/RuteNL/SCRFD-face-detection-ONNX)） | 640×640 输入、(x-127.5)/128 归一化、9 个输出张量（score/bbox × stride [8,16,32]、score 已 sigmoid）；阈值 0.3 + 贪心 NMS；M5 决策从 YuNet 换到 SCRFD（小脸/侧脸检出 23→75/119） |
 | 人体姿态 | **YOLOv8n-pose**（[Xenova/yolov8n-pose](https://huggingface.co/Xenova/yolov8n-pose)） | 640×640 输入、/255 归一化、输出 [1, 56, 8400]；SCRFD 漏检时用头部关键点定位主体区域 |
 | 并行 | `rayon` | JPG 解码 + 像素指标并行分块；AI 推理经 Mutex 串行（实测池化无收益）；上万张走分块并行 |
-| 缓存 | `rusqlite`（bundled） | 按 (path, size, mtime, CACHE_VERSION) 缓存；命中跳过解码与推理 |
+| 缓存 | `rusqlite`（bundled） | 按 (path, size, mtime, CACHE_VERSION, 配置指纹) 缓存；命中跳过解码与推理 |
 | XMP 写出 | 自写轻量 XML 侧车 | 只写 `xmp:Rating` + `firstcut:` 命名空间存子分；他人侧车（无 `firstcut` 标记）不覆盖 |
 | 序列化/日志 | `serde`+`csv` | CSV 报告 + 进度日志到 stderr |
 
@@ -110,7 +110,7 @@ pic_process/
 - ✅ **M1 像素指标**：清晰度/曝光/噪点 + 加权总分（纯算法，无 AI 依赖）
 - ✅ **M2 连拍去重**：时间聚类 + dHash 子簇聚类 + 组内排序 top-K（6 项单元测试）
 - ✅ **M3 AI 接入**：CLIPIQA 美学 + SCRFD 人脸检测 + 构图维度，5 维评分（后期从 MUSIQ/YuNet 升级，见 M5）
-- ✅ **M4 输出完善**：XMP 星级侧车（`<名>.<原扩展名>.xmp`，xmp:Rating + firstcut 子分，他人侧车保护）+ SQLite 增量缓存（size+mtime+版本键，二次运行 16/16 命中 0.78s）
+- ✅ **M4 输出完善**：XMP 星级侧车（`<名>.<原扩展名>.xmp`，xmp:Rating + firstcut 子分，他人侧车保护）+ SQLite 增量缓存（size+mtime+版本键，二次运行 16/16 命中 0.78s；M6 追加配置指纹）
 - ✅ **M5 调参与验证**：性能优化（21.5s→10.6s/119张）、噪点 P15 修复、浅景深清晰度误判修复（主体感知三层链路：SCRFD 人脸区域 reblur → YOLOv8-pose 头部区域 → 50 中性下限）、人脸漏检换 SCRFD（检出 23→75/119）、gallery 联系表；**用户决策落地**：A=多场景配置文件（--config/config-template，权重+曲线+星级+曝光目标可配）、B=星级放宽 75/60/45/30、C=换 CLIPIQA（美学分布 26-76，区分度提升）
 - ✅ **M6 缺陷修复**（2026-07，见 §10 决策记录）：AI 预处理通道顺序 bug、EXIF 方向未处理、构图被贴纸脸/背景脸污染、曝光模型改为 EV 容差带 + 主体感知单向修正、缓存键缺配置指纹、场景预设落地
 
