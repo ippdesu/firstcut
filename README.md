@@ -2,7 +2,7 @@
 
 用 Rust 编写的本地照片初筛工具：扫描索尼相机 JPG+ARW 目录，对 JPG 做
 **五维评分**（清晰度 / 曝光 / 噪点 / 构图 / 美学），连拍去重排序，输出
-**CSV 报告**和 **Lightroom 兼容的 XMP 星级侧车**。全程本地运行、照片不上传。
+**CSV 报告**和 **XMP 星级侧车**。全程本地运行、照片不上传。
 
 > 当前状态：**v1.1 已发布**，并已合入 M6 缺陷修复（AI 预处理通道顺序、EXIF 方向、
 > 构图主体脸门槛、曝光 EV 容差带 + 主体感知、缓存配置指纹、场景预设）。
@@ -111,9 +111,16 @@ pic_process score <目录> --config stage.toml
 | `faces` | SCRFD 检测到的人脸数 |
 | `burst_group, burst_size, burst_rank, burst_keep` | 连拍去重：组号、组内张数、组内排名、是否建议保留 |
 
-**XMP 侧车**（`--xmp`）：按 Lightroom 命名约定写 `<stem>.<原扩展名>.xmp`，
+**XMP 侧车**（`--xmp`）：写 `<stem>.<原扩展名>.xmp`（如 `DSC00001.ARW.xmp`），
 含 `xmp:Rating`（1-5 星）+ `firstcut:` 命名空间（五维子分/人脸/连拍信息）。
 **已有其他软件写的侧车不会被覆盖**（只提示跳过）。
+
+> ⚠️ **命名兼容性（重要）**：`<stem>.<扩展名>.xmp` 是 **darktable** 的约定。
+> Lightroom / Camera Raw 读的是 `<stem>.xmp`（不带扩展名）——按
+> [darktable 官方文档](https://docs.darktable.org/usermanual/4.2/en/overview/sidecar-files/sidecar-import/)，
+> darktable 两种都会读，Lightroom 只读后者。
+> 所以**当前输出 Lightroom 读不到星级**，需改用 `<stem>.xmp` 或双写；
+> 该决策待定（见 `DESIGN.md` §8）。
 
 ## 评分维度（默认权重，总和 1.0）
 
@@ -122,7 +129,7 @@ pic_process score <目录> --config stage.toml
 | 清晰度 | 0.30 | 主体感知三层链路：SCRFD 人脸区域 reblur P80 → 人脸漏检时 YOLOv8-pose 头部关键点区域 reblur → 都无则 50 分中性下限（大光圈浅景深照片不会被误判） |
 | 曝光 | 0.25 | 过曝/欠曝像素比例（4× 惩罚）+ 判定亮度偏离理想值的 **EV 容差带**（默认 ±1 档内满分，-4 档 / +2 档降为 0）；判定亮度在有主体级人脸时用主体脸亮度做单向修正 |
 | 噪点 | 0.15 | 暗部 8×8 块标准差 P15（最平滑暗块）+ ISO 容忍度曲线 `k = 3.0·(1+0.3·log10(iso/100))` |
-| 构图 | 0.15 | SCRFD 人脸（无人脸时 YOLOv8-pose 人体框）：三分法位置 + 主体大小（2~30% 理想）+ 多人降权；无主体中性 60 |
+| 构图 | 0.15 | SCRFD 主体级人脸（高度 ≥ 4%）：三分法位置 + 主体大小（8%~30% 理想）+ 多人降权；无主体脸时中性 60（不惩罚风景/静物） |
 | 美学 | 0.15 | CLIPIQA+（CLIP 底座，sigmoid 输出 ×100 → 0-100 分） |
 
 > 加载 `--config` 时，权重和需在 1.0±0.05 范围内；曝光容差带必须严格嵌套

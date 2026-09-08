@@ -1,6 +1,6 @@
 # 照片初筛评分工具（Rust）— 设计与实现文档
 
-> 状态：**Phase 1 已完成并发布 v1.0**（GitHub: ippdesu/firstcut，tag v1.0；test/fixes 修复已合并）
+> 状态：**Phase 1 已完成并发布 v1.1**（GitHub: ippdesu/firstcut，tag v1.0 / v1.1）；M6 缺陷修复已合并 main（未另发 Release）
 > 日期：2026 规划稿 / 2026 实施完成
 > 需求来源：索尼相机 JPG+ARW 连拍/风景/人像选片地狱，需要自动初步评分
 > 配套文档：`README.md`（用户手册）/ `release_notes.md`（版本说明）/ `M5_REVIEW.md`（M5 决策记录）/ `firstcut.toml`（配置模板）
@@ -29,10 +29,10 @@
 | CLI | `clap` | 子命令：`scan`（建索引）/ `score`（分析+评分）/ `config-template`（生成配置模板）。**`report` / `download-models` 已规划但未实现**——CSV 由 `score` 直接产出；模型缺失时给出下载链接并自动降级。 |
 | JPG 解码 | `jpeg-decoder`（快速路径）+ `image` 兜底 | JPEG 全解码后 **box 块平均降采样**到 ~1MP 分析尺寸（~50ms/张 33MP；jpeg-decoder 0.3 无 DCT 缩放，故全解码+块平均） |
 | EXIF | `kamadak-exif` | ISO、光圈、快门、拍摄时间（连拍聚类用）；多值 ASCII 字段取首个非空值 |
-| 像素处理 | `image` / `imageproc` / 自写 | 灰度（BT.601 加权）、直方图、Sobel 梯度、3×3 box blur |
+| 像素处理 | `image` / 自写 | 灰度（BT.601 加权）、直方图、Sobel 梯度、3×3 box blur（未用 `imageproc`） |
 | AI 推理 | `ort` 2.0.0-rc.13（onnxruntime-rs，静态链接自包含，无需 DLL） | 跑 CLIPIQA + SCRFD + YOLOv8-pose；GPU（DirectML）暂未启用，CPU 池化收益不显著 |
 | 美学评分 | **CLIPIQA+ ONNX**（[86Cao/IQA-ONNX-Models](https://huggingface.co/86Cao/IQA-ONNX-Models)） | 224×224、CLIP 归一化、`(x/255 - mean) / std`、sigmoid 输出 ×100 → 0-100 分；M5 决策从 MUSIQ 换到 CLIPIQA（区分度更高） |
-| 人脸检测 | **SCRFD 10g**（[RuteNL/SCRFD-face-detection-ONNX](https://huggingface.co/RuteNL/SCRFD-face-detection-ONNX)） | 640×640 输入、(x-127.5)/128 归一化、9 个输出张量（score/bbox × stride [8,16,32]、score 已 sigmoid）；阈值 0.3 + 贪心 NMS；M5 决策从 YuNet 换到 SCRFD（小脸/侧脸检出 23→75/119） |
+| 人脸检测 | **SCRFD 10g**（[RuteNL/SCRFD-face-detection-ONNX](https://huggingface.co/RuteNL/SCRFD-face-detection-ONNX)） | 640×640 输入、(x-127.5)/128 归一化、9 个输出张量（score/bbox × stride [8,16,32]、score 已 sigmoid）；阈值 0.3 + 贪心 NMS；M5 决策从 YuNet 换到 SCRFD（检出 23→75/119，M6 修 EXIF 方向后 109/119） |
 | 人体姿态 | **YOLOv8n-pose**（[Xenova/yolov8n-pose](https://huggingface.co/Xenova/yolov8n-pose)） | 640×640 输入、/255 归一化、输出 [1, 56, 8400]；SCRFD 漏检时用头部关键点定位主体区域 |
 | 并行 | `rayon` | JPG 解码 + 像素指标并行分块；AI 推理经 Mutex 串行（实测池化无收益）；上万张走分块并行 |
 | 缓存 | `rusqlite`（bundled） | 按 (path, size, mtime, CACHE_VERSION, 配置指纹) 缓存；命中跳过解码与推理 |
@@ -51,7 +51,7 @@
    - **主体感知单向修正**：有主体级人脸（高度 ≥ 4%）时取最亮的一张主体脸区域均值，把判定值往中灰方向拉（夹在"全图 ~ 中灰"之间，不越过中灰）。所以暗色/亮色误检框不会把正常照片打下去，同时暗背景/亮背景场景能被救回。
    - 全图侧仍用**截尾均值**（排除最暗 25% 像素）作为基准。
 3. **噪点**：暗部（<40）8×8 块标准差 **P15**（最平滑暗块，避开暗部场景纹理污染）+ ISO 容忍度曲线 `k = K0·(1 + 0.3·log10(iso/100))`，`K0=3.0`。
-4. **构图**：SCRFD 人脸框 → 三分法交点（4 点）距离（最大 0.47）+ 人脸高度占比（2~30% 理想）+ 多人降权（1→1.0、2-4→0.95、5+→0.85）；无人脸给中性 60 分（不惩罚风景/静物）。**只统计主体级人脸（高度 ≥ 4%）**：贴纸脸/背景路人不参与，避免误判。
+4. **构图**：SCRFD 人脸框 → 三分法交点（4 点）距离（最大 0.47）+ 人脸高度占比（8%~30% 理想，<8% 线性递减至 0.5，>30% 视为怼脸降至 0.75）+ 多人降权（1→1.0、2-4→0.95、5+→0.85）；无人脸给中性 60 分（不惩罚风景/静物）。**只统计主体级人脸（高度 ≥ 4%）**：贴纸脸/背景路人不参与，避免误判。
 5. **美学**：CLIPIQA+ 0-100 分（224×224、CLIP 归一化、sigmoid×100）；M5 从 MUSIQ 换入，分布区分度提升至 26-76 区间。
 6. **连拍去重**：按 `DateTimeOriginal` 时间戳聚类（间隔 ≤2s 为一组，`keep_k=2`）→ 组内 dHash 感知哈希（9×8 → 64 bit、汉明距离 ≤10 为同一子簇）→ 子簇内按总分排序保留 top-K 并标记"组内第 N 名 / 是否保留"。
 
@@ -75,8 +75,9 @@ scan（读 EXIF 建索引，SQLite 增量）
 
 ## 5. XMP 输出约定
 
-- 为每张照片写同名侧车（`DSC00001.ARW.xmp`、`DSC00001.JPG.xmp`，按 Lightroom 命名约定），含 `xmp:Rating`（1-5 星，默认分档 75/60/45/30，可配）+ `firstcut:` 命名空间（5 维子分/人脸/连拍信息）。
+- 为每张照片写侧车 `<stem>.<原扩展名>.xmp`（`DSC00001.ARW.xmp`、`DSC00001.JPG.xmp`），含 `xmp:Rating`（1-5 星，默认分档 75/60/45/30，可配）+ `firstcut:` 命名空间（5 维子分/人脸/连拍信息）。
 - 他人侧车（无 firstcut 命名空间，如 LR 写的调色参数）**不覆盖**，只提示跳过。
+- ⚠️ **命名兼容性（未解决）**：`<stem>.<扩展名>.xmp` 是 **darktable** 的约定；**Lightroom/ACR 读的是 `<stem>.xmp`**（不带扩展名）。按 [darktable 官方文档](https://docs.darktable.org/usermanual/4.2/en/overview/sidecar-files/sidecar-import/)，darktable 两种都会读、Lightroom 只读后者 → **当前输出 Lightroom 读不到星级**。待决策：改 `<stem>.xmp` / 双写 / 加 `--xmp-naming` 开关。
 - CSV 每行：文件、拍摄时间、相机、ISO/光圈/快门、5 维子分、总分、人脸数、连拍组号、组内排名、建议操作。
 
 ## 6. 项目结构
@@ -119,10 +120,10 @@ pic_process/
 ## 8. 风险与开放问题（当前状态）
 
 - **美学模型**：~~MUSIQ~~ → **已定案：CLIPIQA+ ONNX**（M5 切换，86Cao/IQA-ONNX-Models，224×224、CLIP 归一化、sigmoid×100，分布区分度 26-76 高于 MUSIQ 的 36-65；已下载至 `models/clipiqa_model.onnx{,.data}`）。
-- **人脸检测**：~~YuNet~~ → **已定案：SCRFD 10g**（M5 切换，RuteNL/SCRFD-face-detection-ONNX，640×640、9 输出解码、阈值 0.3 + 贪心 NMS；119 张真实照片检出 23→75）。
+- **人脸检测**：~~YuNet~~ → **已定案：SCRFD 10g**（M5 切换，RuteNL/SCRFD-face-detection-ONNX，640×640、9 输出解码、阈值 0.3 + 贪心 NMS；119 张真实照片检出 23→75，M6 修 EXIF 方向后 109/119）。
 - **onnxruntime Windows GPU**：DirectML provider 支持 OK；无 GPU 时自动回落 CPU。AI_POOL_SIZE=1（Mutex 串行）——实测池化无收益（AI 非瓶颈且每 session 线程减半变慢）。
 - **权重校准**：默认权重 0.30/0.25/0.15/0.15/0.15（和=1.0，M5 决策 A：曝光 0.25 压欠曝虚高）；多场景用 `--config` 按需调整，内置 `presets/` 5 份（portrait/stage/highkey/sports/lowlight）。
-- **Lightroom 读 XMP 星级**：侧车命名与 `xmp:Rating` 均按 LR 约定；建议 v1.0 后用 Lightroom 实测验证一次（可并入 Phase 2 环境验证）。
+- **Lightroom 读 XMP 星级**：**实测缺口**。侧车命名当前是 darktable 约定（`<stem>.<ext>.xmp`），而 Lightroom 读 `<stem>.xmp`，因此现在 Lightroom 很可能读不到星级。要么改命名/双写，要么明确以 darktable 为侧车消费方。需要一次真实导入验证。
 - **遮挡脸/超大脸漏检**（未解决）：口罩/头盔遮挡时 SCRFD 置信度会掉到 0.2 附近，超大人脸特写也会漏检（PORTRAIT_TEST 0.117）。当前对评分的影响已通过"主体感知单向修正 + 构图只计主体脸"降级处理，未换模型。
 
 ## 9. Phase 2（远期）：批量 RAW 开发，替代 Lightroom 手动流程

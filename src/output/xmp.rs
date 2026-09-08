@@ -78,7 +78,9 @@ pub fn write_sidecar(
         return Ok(false);
     }
     let path = std::path::Path::new(&e.path);
-    // Lightroom 侧车命名约定：<stem>.<原扩展名>.xmp（如 DSC00001.ARW.xmp）
+    // 侧车命名：<stem>.<原扩展名>.xmp（如 DSC00001.ARW.xmp）——这是 darktable 的
+    // 约定；Lightroom/ACR 读的是 <stem>.xmp（无扩展名）。darktable 两种都会读，
+    // Lightroom 只读后者。见 README「XMP 侧车」一节的兼容性说明。
     let stem = crate::scan::stem_of(&e.filename);
     let ext = crate::scan::extension_of(&e.filename);
     let sidecar = path.with_file_name(format!("{stem}.{ext}.xmp"));
