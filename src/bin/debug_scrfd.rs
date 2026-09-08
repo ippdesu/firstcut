@@ -16,6 +16,9 @@ struct Args {
     path: std::path::PathBuf,
     #[arg(long, default_value_t = 0.5)]
     threshold: f32,
+    /// 额外打印最大人脸的姿态描述子（10 维，M9 定标用）
+    #[arg(long)]
+    desc: bool,
 }
 
 const INPUT_SIZE: usize = 640;
@@ -49,10 +52,11 @@ fn main() -> Result<()> {
     let input = ort::inputs!["input.1" => tensor];
     let out = session.run(input).map_err(|e| anyhow::anyhow!("{e:?}"))?;
 
-    let mut dets: Vec<(f32, f32, f32, f32, f32)> = Vec::new(); // x1,y1,x2,y2,score
+    let mut dets: Vec<(f32, f32, f32, f32, f32, [(f32, f32); 5])> = Vec::new(); // x1,y1,x2,y2,score,kps
     for (si, &stride) in STRIDES.iter().enumerate() {
         let (_, scores) = out[si].try_extract_tensor::<f32>().map_err(|e| anyhow::anyhow!("{e:?}"))?;
         let (_, bbox) = out[si + 3].try_extract_tensor::<f32>().map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        let (_, kps) = out[si + 6].try_extract_tensor::<f32>().map_err(|e| anyhow::anyhow!("{e:?}"))?;
         let grid = INPUT_SIZE / stride;
         let n = scores.len();
         for i in 0..n {
@@ -79,32 +83,86 @@ fn main() -> Result<()> {
             );
             let (x1, y1) = ((cx - l).max(0.0), (cy - t).max(0.0));
             let (x2, y2) = ((cx + r).min(640.0), (cy + b).min(640.0));
+            // kps：格中心 + offset×stride（与 bbox 同一距离约定）
+            let k10 = i * 10;
+            let mut pts = [(0.0f32, 0.0f32); 5];
+            for (j, p) in pts.iter_mut().enumerate() {
+                let px = (cx + kps[k10 + j * 2] * stride as f32) / 640.0;
+                let py = (cy + kps[k10 + j * 2 + 1] * stride as f32) / 640.0;
+                *p = (px, py);
+            }
             eprintln!(
-                "[raw] stride={stride} i={i} grid=({gx},{gy}) center=({cx:.1},{cy:.1}) dist=({:.2},{:.2},{:.2},{:.2}) -> box=({x1:.1},{y1:.1},{x2:.1},{y2:.1}) s={s:.3}",
-                raw[0], raw[1], raw[2], raw[3]
+                "[raw] stride={stride} i={i} grid=({gx},{gy}) center=({cx:.1},{cy:.1}) dist=({:.2},{:.2},{:.2},{:.2}) -> box=({x1:.1},{y1:.1},{x2:.1},{y2:.1}) s={s:.3}\n      kps_raw=[{:.2},{:.2} {:.2},{:.2} {:.2},{:.2} {:.2},{:.2} {:.2},{:.2}]",
+                raw[0], raw[1], raw[2], raw[3],
+                kps[k10], kps[k10+1], kps[k10+2], kps[k10+3], kps[k10+4], kps[k10+5],
+                kps[k10+6], kps[k10+7], kps[k10+8], kps[k10+9],
             );
-            dets.push((x1, y1, x2, y2, s));
+            dets.push((x1, y1, x2, y2, s, pts));
         }
     }
     // 简单 NMS（按分数降序）
     dets.sort_by(|a, b| b.4.partial_cmp(&a.4).unwrap());
-    let mut kept: Vec<(f32, f32, f32, f32, f32)> = Vec::new();
+    let mut kept: Vec<(f32, f32, f32, f32, f32, [(f32, f32); 5])> = Vec::new();
     for d in dets {
-        if kept.iter().all(|k| iou(k, &d) < 0.3) {
-            kept.push(d);
+        if kept.iter().all(|k| iou5(k, &d) < 0.3) {            kept.push(d);
         }
     }
     println!("阈值 {:.2} 检测: {} 个人脸", args.threshold, kept.len());
-    for (x1, y1, x2, y2, s) in kept {
-        println!(
-            "  框=({:.1},{:.1},{:.1},{:.1}) 置信度={:.3}",
-            x1 / 640.0, y1 / 640.0, (x2 - x1) / 640.0, (y2 - y1) / 640.0, s
+    // kps 解码自检：5 个关键点应落在人脸框（放大 20% 容差）内。
+    // 若距离约定弄错（如忘了 ×stride 或误用绝对坐标），这里会大面积外落。
+    // 注意 kept 里是 640 空间像素坐标、pts 是归一化坐标，统一到归一化再比。
+    let mut inside = 0usize;
+    let mut total_pts = 0usize;
+    for (x1, y1, x2, y2, s, pts) in &kept {
+        let (nx1, ny1, nw, nh) = (x1 / 640.0, y1 / 640.0, (x2 - x1) / 640.0, (y2 - y1) / 640.0);
+        let (ax1, ay1, ax2, ay2) = (
+            nx1 - nw * 0.2,
+            ny1 - nh * 0.2,
+            nx1 + nw * 1.2,
+            ny1 + nh * 1.2,
         );
+        for (px, py) in pts {
+            total_pts += 1;
+            if *px >= ax1 && *px <= ax2 && *py >= ay1 && *py <= ay2 {
+                inside += 1;
+            }
+        }
+        println!(
+            "  框=({:.1},{:.1},{:.1},{:.1}) 置信度={:.3} kps=[{:.3},{:.3} {:.3},{:.3} {:.3},{:.3} {:.3},{:.3} {:.3},{:.3}]",
+            x1 / 640.0, y1 / 640.0, (x2 - x1) / 640.0, (y2 - y1) / 640.0, s,
+            pts[0].0, pts[0].1, pts[1].0, pts[1].1, pts[2].0, pts[2].1, pts[3].0, pts[3].1,
+            pts[4].0, pts[4].1,
+        );
+    }
+    println!(
+        "kps 框内占比: {}/{}（{}%）",
+        inside,
+        total_pts,
+        if total_pts == 0 { 0 } else { inside * 100 / total_pts }
+    );
+    if args.desc {
+        let biggest = kept.iter().max_by(|a, b| {
+            ((a.2 - a.0) * (a.3 - a.1)).partial_cmp(&((b.2 - b.0) * (b.3 - b.1))).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        if let Some((x1, y1, x2, y2, _, pts)) = biggest {
+            let (w, h) = ((x2 - x1) / 640.0, (y2 - y1) / 640.0);
+            if w > 1e-4 && h > 1e-4 {
+                let mut d = [0.0f32; 10];
+                for (j, p) in pts.iter().enumerate() {
+                    d[j * 2] = (p.0 - x1 / 640.0) / w;
+                    d[j * 2 + 1] = (p.1 - y1 / 640.0) / h;
+                }
+                println!(
+                    "desc {:.3} {:.3} {:.3} {:.3} {:.3} {:.3} {:.3} {:.3} {:.3} {:.3}",
+                    d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9]
+                );
+            }
+        }
     }
     Ok(())
 }
 
-fn iou(a: &(f32, f32, f32, f32, f32), b: &(f32, f32, f32, f32, f32)) -> f32 {
+fn iou5(a: &(f32, f32, f32, f32, f32, [(f32, f32); 5]), b: &(f32, f32, f32, f32, f32, [(f32, f32); 5])) -> f32 {
     let x0 = a.0.max(b.0);
     let y0 = a.1.max(b.1);
     let x1 = a.2.min(b.2);

@@ -69,7 +69,7 @@ mod tests {
     use super::*;
 
     fn face(x: f32, y: f32, w: f32, h: f32) -> FaceBox {
-        FaceBox { x, y, w, h, score: 0.9 }
+        FaceBox { x, y, w, h, score: 0.9, kps: [(0.0, 0.0); 5] }
     }
 
     #[test]

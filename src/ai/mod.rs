@@ -16,6 +16,7 @@ pub mod iqa;
 pub mod pose;
 
 use anyhow::{bail, Result};
+use ort::session::Session;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -26,6 +27,46 @@ pub const MODELS_DIR: &str = "models";
 /// ort 的错误不含 Send+Sync（内含裸指针），包装成 anyhow::Error
 pub fn ort_err(e: impl std::fmt::Debug) -> anyhow::Error {
     anyhow::Error::msg(format!("onnxruntime: {e:?}"))
+}
+
+/// 统一的 session 构建：优化级别 / intra 线程数 / 实验性 DirectML。
+///
+/// `use_gpu` 只有在 `--features gpu` 构建下才生效；DirectML 注册失败
+/// （驱动/系统不支持）时回落 CPU 并不视为致命错误。
+pub fn build_session(model_file: &str, intra: usize, use_gpu: bool) -> Result<Session> {
+    #[cfg(feature = "gpu")]
+    if use_gpu {
+        use ort::ep::DirectML;
+        // with_execution_providers 消费 builder，失败时走下方 CPU 路径重建
+        match Session::builder()
+            .map_err(ort_err)?
+            .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)
+            .map_err(ort_err)?
+            .with_intra_threads(intra)
+            .map_err(ort_err)?
+            .with_execution_providers([DirectML::default().build()])
+        {
+            Ok(mut b) => {
+                eprintln!("[ai] DirectML GPU 推理已启用（实验性）");
+                return b
+                    .commit_from_file(format!("{MODELS_DIR}/{model_file}"))
+                    .map_err(ort_err);
+            }
+            Err(e) => {
+                eprintln!("[ai] 警告: DirectML 注册失败，回落 CPU: {e:?}");
+            }
+        }
+    }
+    #[cfg(not(feature = "gpu"))]
+    let _ = use_gpu;
+
+    let mut builder = Session::builder()
+        .map_err(ort_err)?
+        .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)
+        .map_err(ort_err)?
+        .with_intra_threads(intra)
+        .map_err(ort_err)?;
+    builder.commit_from_file(format!("{MODELS_DIR}/{model_file}")).map_err(ort_err)
 }
 
 /// 轻量 session 池：onnxruntime 的 run 需要 &mut self，

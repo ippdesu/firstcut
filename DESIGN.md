@@ -1,9 +1,9 @@
 # 照片初筛评分工具（Rust）— 设计与实现文档
 
-> 状态：**Phase 1 已完成并发布 v1.1**（GitHub: ippdesu/firstcut，tag v1.0 / v1.1）；M6/M7/M8 缺陷修复已合并 main（未另发 Release）
+> 状态：**Phase 1 已完成并发布 v1.1**（GitHub: ippdesu/firstcut，tag v1.0 / v1.1）；M6/M7/M8 缺陷修复 + M9 自适应连拍保留 + M-UI1 复核界面已实现（分支交付，未另发 Release）
 > 日期：2026 规划稿 / 2026 实施完成
 > 需求来源：索尼相机 JPG+ARW 连拍/风景/人像选片地狱，需要自动初步评分
-> 配套文档：`README.md`（用户手册）/ `release_notes.md`（版本说明）/ `REVIEW.md`（外部评审记录与处理状态）/ `M5_REVIEW.md`（M5 决策记录）/ `firstcut.toml`（配置模板）
+> 配套文档：`README.md`（用户手册）/ `release_notes.md`（版本说明）/ `REVIEW.md`（外部评审记录与处理状态）/ `M5_REVIEW.md`（M5 决策记录）/ `firstcut.toml`（配置模板）/ `P2_M0.md`（Phase 2 环境验证清单）
 
 ## 0. 目标（根据确认的需求）
 
@@ -26,13 +26,13 @@
 
 | 用途 | Crate/方案 | 说明（实际实现） |
 |---|---|---|
-| CLI | `clap` | 子命令：`scan`（建索引）/ `score`（分析+评分）/ `config-template`（生成配置模板）。**`report` / `download-models` 已规划但未实现**——CSV 由 `score` 直接产出；模型缺失时给出下载链接并自动降级。 |
+| CLI | `clap` | 子命令：`scan`（建索引）/ `score`（分析+评分）/ `config-template`（生成配置模板）/ `review`（本地 Web 复核界面，见 §12）。**`report` / `download-models` 已规划但未实现**——CSV 由 `score` 直接产出；模型缺失时给出下载链接并自动降级。 |
 | JPG 解码 | `jpeg-decoder`（快速路径）+ `image` 兜底 | JPEG 全解码后 **box 块平均降采样**到 ~1MP 分析尺寸（~50ms/张 33MP；jpeg-decoder 0.3 无 DCT 缩放，故全解码+块平均） |
 | EXIF | `kamadak-exif` | ISO、光圈、快门、拍摄时间（连拍聚类用）；多值 ASCII 字段取首个非空值 |
 | 像素处理 | `image` / 自写 | 灰度（BT.601 加权）、直方图、Sobel 梯度、3×3 box blur（未用 `imageproc`）；EXIF Orientation 1-8 在降采样后应用（5/7 为"先旋转后镜像"，见 §10 M8-3） |
-| AI 推理 | `ort` 2.0.0-rc.13（onnxruntime-rs，静态链接自包含，无需 DLL） | 跑 CLIPIQA + SCRFD + YOLOv8-pose；GPU（DirectML）暂未启用，CPU 池化收益不显著 |
+| AI 推理 | `ort` 2.0.0-rc.13（onnxruntime-rs，静态链接自包含，无需 DLL） | 跑 CLIPIQA + SCRFD + YOLOv8-pose；实验性 `--gpu`（DirectML，`--features gpu` 构建，实测 119 张 16.7s vs CPU 17.4s，无显著收益，不默认开启）；CPU 池化收益不显著 |
 | 美学评分 | **CLIPIQA+ ONNX**（[86Cao/IQA-ONNX-Models](https://huggingface.co/86Cao/IQA-ONNX-Models)） | 224×224、CLIP 归一化、`(x/255 - mean) / std`、sigmoid 输出 ×100 → 0-100 分；M5 决策从 MUSIQ 换到 CLIPIQA（区分度更高） |
-| 人脸检测 | **SCRFD 10g**（[RuteNL/SCRFD-face-detection-ONNX](https://huggingface.co/RuteNL/SCRFD-face-detection-ONNX)） | 640×640 输入、(x-127.5)/128 归一化、9 个输出张量（score/bbox × stride [8,16,32]、score 已 sigmoid）；阈值 0.3 + 贪心 NMS；M5 决策从 YuNet 换到 SCRFD（检出 23→75/119，M6 修 EXIF 方向后 109/119） |
+| 人脸检测 | **SCRFD 10g**（[RuteNL/SCRFD-face-detection-ONNX](https://huggingface.co/RuteNL/SCRFD-face-detection-ONNX)） | 640×640 输入、(x-127.5)/128 归一化、9 个输出张量（score/bbox/**kps** × stride [8,16,32]，布局 [N,dim] 行主序、score 已 sigmoid）；阈值 0.3 + 贪心 NMS；M5 决策从 YuNet 换到 SCRFD（检出 23→75/119，M6 修 EXIF 方向后 109/119）；M9 起解码 kps（5 关键点）做姿态描述子 |
 | 人体姿态 | **YOLOv8n-pose**（[Xenova/yolov8n-pose](https://huggingface.co/Xenova/yolov8n-pose)） | 640×640 输入、/255 归一化、输出 [1, 56, 8400]；SCRFD 漏检时用头部关键点定位主体区域 |
 | 并行 | `rayon` | JPG 解码 + 像素指标并行分块；AI 推理经 Mutex 串行（实测池化无收益）；上万张走分块并行 |
 | 缓存 | `rusqlite`（bundled） | 按 (path, size, mtime, CACHE_VERSION, 配置指纹) 缓存；命中跳过解码与推理 |
@@ -54,7 +54,10 @@
 3. **噪点**：暗部（<40）8×8 块标准差 **P15**（最平滑暗块，避开暗部场景纹理污染）+ ISO 容忍度曲线 `k = K0·(1 + 0.3·log10(iso/100))`，`K0=3.0`。
 4. **构图**：SCRFD 人脸框 → 三分法交点（4 点）距离（最大 0.47）+ 人脸高度占比（8%~30% 理想，<8% 线性递减至 0.5，>30% 视为怼脸降至 0.75）+ 多人降权（1→1.0、2-4→0.95、5+→0.85）；无人脸给中性 60 分（不惩罚风景/静物）。**只统计主体级人脸（高度 ≥ 4%）**：贴纸脸/背景路人不参与，避免误判。多人降权计数用 **5%** 门槛（4%~5% 的脸计构图分但不计合影人数）。
 5. **美学**：CLIPIQA+ 0-100 分（224×224、CLIP 归一化、sigmoid×100）；M5 从 MUSIQ 换入，分布区分度提升至 26-76 区间。
-6. **连拍去重**：按 `DateTimeOriginal` 时间戳聚类（间隔 ≤2s 为一组，`keep_k=2`）→ 组内 dHash 感知哈希（9×8 → 64 bit、汉明距离 ≤10 为同一子簇）→ 子簇内按总分排序保留 top-K 并标记"组内第 N 名 / 是否保留"。
+6. **连拍去重**（M2 + M9 自适应保留）：按 `DateTimeOriginal` 时间戳聚类（间隔 ≤2s 为一组）→ 组内 dHash 感知哈希（9×8 → 64 bit、汉明距离 ≤10 为同一子簇）→ **保留单元**内按总分排序保留 top-K（默认 3）并标记"组内第 N 名 / 是否保留"。
+   - **M9 自适应保留（默认开启，`dedup.adaptive_keep=false` 回退 M2 行为）**：dHash 子簇内再按 SCRFD 关键点姿态描述子聚类——5 个关键点（双眼/鼻/双嘴角）按人脸框归一化成 10 维向量（对位置/尺度不变），欧氏距离 > `pose_cluster_threshold`（默认 0.25，定标：棚拍同姿势 0.02~0.06 / 跨姿势 0.46~0.51 双峰）判为不同姿势，**每个姿势簇各自保留 top-K**。解决"30fps 连拍不同姿势被 dHash 判重只留 2 张"的问题。
+   - 无人脸/关键点退化的帧共享一个伪簇（保留行为与 M2 等价）；单组保留总量受 `burst_group_cap`（默认 20）上限，超出按总分截断。
+   - **永不删除/移动任何文件**：`burst_keep` 只是建议标记。
 
 **汇总权重（默认，M5 决策 A+修复）**：清晰 0.30 / 曝光 0.25（M5 从 0.20 提升）/ 噪点 0.15 / 构图 0.15 / 美学 0.15（和 = 1.0）。总分 0-100 + 5 个子分 + 人脸数全部进 CSV。
 
@@ -73,8 +76,10 @@ scan（读 EXIF 建索引，SQLite 增量）
   - 配置指纹（`config_fingerprint`）是 M6 修复的一个静默 bug：此前换 `--config` 后缓存仍然命中，用户改了权重/曲线却看到完全一样的结果。
   - 指纹**只覆盖影响缓存值的曲线参数**（`sharpness_k`/`noise_k0`/`exposure_*`）；权重与星级阈值在运行期合成总分/星级，改它们不会触发重算（M8 性能修正）。
   - `flush` 只写本次新增/更新的行（dirty set），不再每次重写全部行。
-- 实测吞吐：119 张 33MP（含 3 模型）约 18.4s（16 核）；增量重跑秒级。1 万张冷跑约 26 分钟。
+- 实测吞吐：119 张 33MP（含 3 模型）约 17.4s（16 核，~146ms/张）；**M9 实测 1447 张真实图库（含 1272 张连拍）冷跑 2m55s（~121ms/张）**；增量重跑秒级（1447 张全命中 2.06s）。1 万张冷跑约 20 分钟。
+- 缓存行含姿态描述子（M9，`pose_desc BLOB`，10×f32）；`CACHE_VERSION` 13。
 - 处理中不移动/删除任何文件，只写 XMP 侧车和 CSV（安全）。
+- CSV 含 `analysis_ok` 列（M8 遗留项，M9 落地）：解码失败/无配对 ARW 可过滤，运行结束 stderr 给失败清单。
 
 ## 5. XMP 输出约定
 
@@ -99,11 +104,12 @@ pic_process/
 │   ├── decode.rs            # JPEG box 降采样解码 + EXIF 方向 + 灰度/直方图
 │   ├── metrics/             # sharpness / exposure / noise / composition
 │   ├── ai/                  # iqa(CLIPIQA) / facedetect(SCRFD) / pose(YOLOv8)
-│   ├── dedup.rs             # 连拍分组 + dHash 聚类 + 排序
-│   ├── score.rs             # 分析调度 + 加权汇总 + 缓存接入
+│   ├── dedup.rs             # 连拍分组 + dHash 聚类 + M9 姿态聚类 + 排序
+│   ├── score.rs             # 分析调度 + 加权汇总 + 缓存接入 + 姿态描述子
 │   ├── output/              # csv.rs / xmp.rs
-│   ├── cache.rs             # SQLite 增量缓存（键含配置指纹）
-│   ├── config.rs            # 权重/曲线/星级/曝光 EV 容差 + 场景预设（--config 可配）
+│   ├── cache.rs             # SQLite 增量缓存（键含配置指纹，含 pose_desc）
+│   ├── config.rs            # 权重/曲线/星级/曝光 EV 容差 + [dedup] + 场景预设（--config 可配）
+│   ├── review/              # M-UI1：本地 Web 复核服务（axum + 内嵌前端）
 │   └── lib.rs
 ├── src/bin/                 # tune / gallery / debug_scrfd / debug_pose / debug_exposure / probe
 └── tests/
@@ -120,29 +126,31 @@ pic_process/
 - ✅ **M6 缺陷修复**（2026-07，见 §10 决策记录）：AI 预处理通道顺序 bug、EXIF 方向未处理、构图被贴纸脸/背景脸污染、曝光模型改为 EV 容差带 + 主体感知单向修正、缓存键缺配置指纹、场景预设落地
 - 🔄 **M7 交付与兼容**（2026-07，见 §10）：XMP 侧车命名改 Lightroom 约定、星级改批次内相对分档、配对键含目录、连拍排序用实际权重；**待办**：LR 真实导入验证、自适应连拍保留、ground truth 校准
 - ✅ **M8 评审修复**（2026-07，见 §10）：外部评审（GLM）13 项问题逐条核实并修复——配对回归（P0）、配置 fail-fast、EXIF 5/7 互换、清晰度兜底缝隙、指纹收窄、缓存 flush 收窄、文档批次修正、pose sigmoid 定案
-- 📋 **M9 计划：自适应连拍保留**（未开工，设计见 §7.1）
+- ✅ **M9 自适应连拍保留**（2026-09，见 §7.1 / §10）：SCRFD kps 解码 + 姿态描述子缓存化 + dHash 子簇内姿态聚类（每姿势簇保留 3 张、单组上限 20、默认启用可关闭）；阈值 0.25 经棚拍双峰定标；archive 119 张回归星级逐档一致（12/24/41/31/11）；搭车：`analysis_ok` 列、实验性 `--gpu`（DirectML，无显著收益）
+- ✅ **M-UI1 复核界面**（2026-09，见 §12）：`pic_process review <目录>` 本地 Web 界面——缩略图墙 + 筛选排序 + 1:1 原图灯箱 + 连拍组并排同步缩放对比；只读
+- 🔄 **M7 遗留待办**：LR 真实导入验证、ground truth 校准
 
-### 7.1 M9 设计草案：按姿态自适应保留连拍
+### 7.1 M9 自适应连拍保留（已实现）：按姿态自适应保留连拍
 
-**问题**：当前 `keep_k` 固定（默认 2），按 dHash 子簇保留。30fps 连拍时同一个人的**不同姿势/表情**会被 dHash 判为近似重复，只留 2 张 → 丢掉不同瞬间。
+**问题**：`keep_k` 固定、按 dHash 子簇保留。30fps 连拍时同一个人的**不同姿势/表情**会被 dHash 判为近似重复，只留 2 张 → 丢掉不同瞬间。
 
-**方案**（利用已有算力，几乎零额外成本）：
-1. SCRFD 模型是 `scrfd_10g_bnkps`，**5 个关键点（双眼/鼻/双嘴角）已在推理输出里**，目前只用了 score/bbox。提取相对人脸框归一化的 5 点（10 维）→ 对位置/尺度不变的**头部姿态+表情几何描述子**。
-2. 在 dHash 子簇内按描述子距离做**姿态聚类**：距离 > 阈值 → 不同姿态，各自成簇。
-3. 每个姿态簇保留 top-K（默认 2），**所有姿态簇都保留**；再加组内总量上限防止 90 帧连拍留几十张。
-4. 无人脸的帧退化为现有 dHash 行为（v1 不额外跑姿态模型）。
+**实现**（利用已有算力，零额外推理成本）：
+1. SCRFD `scrfd_10g_bnkps` 的 **5 个关键点（双眼/鼻/双嘴角）**在 M9 起参与解码（kps 张量 [N,10]，格中心 + offset×stride，与 bbox 同一距离约定；debug_scrfd 实测 40 点 100% 落框内自检）。按人脸框归一化成 10 维**姿态描述子**（`score::pose_descriptor`），对位置/尺度不变。
+2. 描述子进缓存（`pose_desc BLOB`，`CACHE_VERSION` 13）。
+3. dHash 子簇内**贪心种子姿态聚类**（与 dHash 聚类同风格、扫描顺序确定）：距离 > 0.25 → 新姿势簇；无描述子帧共享伪簇。
+4. 每个**姿势簇**各自保留 top-K（默认 3）；单组保留总量上限 20（超出按总分截断）；`adaptive_keep=false` 一键回退 M2 行为（逐字节一致）。
 
-**成本**：关键点已在输出中，只需把描述子存进缓存（`CACHE_VERSION` +1）。
+**定标**：棚拍 18 帧同主体连拍——同姿势两两距离 0.02~0.06、跨姿势 0.46~0.51，双峰清晰，0.25 居中（两侧余量 4×+）；舞台连拍（萤火虫）姿态连续变化时无真空带，0.25 给出合理"瞬间"粒度。
 
-**待定参数**：每个姿态簇保留几张（用户提 2~3）、单个连拍组总量上限（待定）。
+**规模实测**：真实图库 1447 张（88% 在连拍组）——姿态簇规模分布 1~9 张、组保留数 ≤ 20，行为符合预期；M9 只改 burst 列，五维分与星级与 M8 完全一致（回归断言）。
 
-> 当前状态（Phase 1 完成 + M6/M7/M8 修复）：`pic_process score <目录> [--xmp] [--config x.toml] [--cache <文件>] [--no-ai] [-k N]`，37 项单元测试 + 6 项集成测试全过；CLIPIQA 冷跑 ~155ms/张（含 SCRFD+姿态）。
+> 当前状态（Phase 1 + M6/M7/M8/M9 + M-UI1）：`pic_process score <目录> [--xmp] [--config x.toml] [--cache <文件>] [--no-ai] [-k N] [--gpu]`，42 项单元测试 + 6 项集成测试全过；冷跑 ~121-146ms/张（含 SCRFD+姿态，16 核）。
 
 ## 8. 风险与开放问题（当前状态）
 
 - **美学模型**：~~MUSIQ~~ → **已定案：CLIPIQA+ ONNX**（M5 切换，86Cao/IQA-ONNX-Models，224×224、CLIP 归一化、sigmoid×100，分布区分度 26-76 高于 MUSIQ 的 36-65；已下载至 `models/clipiqa_model.onnx{,.data}`）。
 - **人脸检测**：~~YuNet~~ → **已定案：SCRFD 10g**（M5 切换，RuteNL/SCRFD-face-detection-ONNX，640×640、9 输出解码、阈值 0.3 + 贪心 NMS；119 张真实照片检出 23→75，M6 修 EXIF 方向后 109/119）。
-- **onnxruntime Windows GPU**：DirectML provider 支持 OK；无 GPU 时自动回落 CPU。AI_POOL_SIZE=1（Mutex 串行）——实测池化无收益（AI 非瓶颈且每 session 线程减半变慢）。
+- **onnxruntime Windows GPU**：DirectML provider 支持 OK；无 GPU 时自动回落 CPU。AI_POOL_SIZE=1（Mutex 串行）——实测池化无收益（AI 非瓶颈且每 session 线程减半变慢）。**M9 实验性 `--gpu`（`--features gpu` 构建）实测：119 张 16.7s vs CPU 17.4s（~4%）——单张小批量 DML 吃不满 GPU，无显著收益，保持实验性、默认关闭**。
 - **权重校准**：默认权重 0.30/0.25/0.15/0.15/0.15（和=1.0，M5 决策 A：曝光 0.25 压欠曝虚高）；多场景用 `--config` 按需调整，内置 `presets/` 5 份（portrait/stage/highkey/sports/lowlight）。
 - **Lightroom 读 XMP 星级**：命名已改为 LR 约定（`<stem>.xmp`），但**仍缺一次真实导入验证**（用户在 LR 里导入目录，确认星级/子分显示）。Phase 1 唯一没被实测过的交付物。
 - **配对键（M7 已修）**：此前所有索引/配对/侧车去重都只用"文件名主干"，而索尼编号在 DSC09999 后回绕 → 上万张跨目录必然出现同名文件，会让分数/连拍/侧车互相覆盖。现改为「目录 + 主干」配对键。
@@ -256,7 +264,7 @@ pic_process/
 - [ ] 降噪强度按 ISO 分级，还是按 Phase 1 的噪点分分级？
 - [ ] 是否额外导出"高分片名单"（CSV/文本）给 LR 用？
 
-## 10. 决策记录（M6 / M7 / M8，2026-07）
+## 10. 决策记录（M6 / M7 / M8 / M9，2026-07 ~ 2026-09）
 
 > 原则：**默认值必须对任何场景站得住脚，不能是对某一批样片的拟合**；
 > 场景差异交给 `--config` / `presets/`，而不是塞进默认曲线。
@@ -278,8 +286,43 @@ pic_process/
 | M8-4 | pose 兜底只在 `faces == 0` 时触发，只有小脸时被跳过 | 条件改为 `sharpness_region.is_none()` | 与"SCRFD 漏检 → pose"的设计意图对齐 |
 | M8-5 | 配置指纹含权重/星级阈值，改权重触发全量重算 | 指纹只保留曲线参数 | 改权重是最高频调参动作，却不需要重算 |
 | M8-6 | pose 输出是否需 sigmoid 两处注释矛盾 | 实测 248 个置信度全在 (0,1) → **已 sigmoid**，只统一注释 | 换模型前需重新核验值域 |
+| M9-1 | 每个姿态簇保留几张 | **3 张**（`keep_k` 默认 2→3，CLI `-k` 同步） | 用户定；表情成功率低的连拍留足备选 |
+| M9-2 | 单组保留总量失控（90 帧连拍多姿势） | `burst_group_cap = 20`，超出按总分从高到低截断 | 用户定；截断只动 keep 标记，不动排名 |
+| M9-3 | 默认启用还是加开关 | **默认启用** + `dedup.adaptive_keep = false` 回退旧行为（逐字节一致） | 对日常使用零操作成本；旧行为可复现 |
+| M9-4 | 姿态聚类阈值怎么定 | 0.25（描述子欧氏距离），`pose_cluster_threshold` 可配 | 棚拍实测双峰（同姿势 0.02~0.06 / 跨姿势 0.46~0.51），0.25 居中余量 4×；舞台连续场景粒度合理 |
+| M9-5 | M9 会不会改变评分 | 不会：只改 burst 三列；archive 119 张回归星级逐档一致（12/24/41/31/11） | 描述子仅进去重，不参与五维分数 |
 
 ## 11. 交付方式
 
 Phase 1 已交付（v1.0/v1.1 已发布 Release）；Phase 2 规划经确认后再开工。
 每次改动必须同步更新 `README.md` / `DESIGN.md`，不允许文档与实现状态不一致。
+
+## 12. UI 规划（M-UI1 已实现，只读复核界面）
+
+> 需求来源：gallery 是按 119 张验证规模做的（base64 内嵌、单文件 HTML、每次全量重新解码），
+> 上万张时 HTML 达数百 MB 且无法交互对比；选片复核需要"缩略图看不清是否合焦时
+> 能随时开 100% 原图、连拍组内并排对比"。
+
+### 12.1 选型结论（2026-09 定案）
+
+**axum 本地服务 + 内嵌 vanilla JS 前端（浏览器即客户端）**。
+
+| 候选 | 结论 |
+|---|---|
+| **axum + 浏览器**（选定） | 纯 cargo、零 npm 工具链、单 exe 交付不变；图片密集体验是浏览器主场；HTML/JS 对 AI 协作开发最友好；HTTP API 将来可平移进 Tauri |
+| Tauri 2（Rust+WebView2） | 若将来要"双击即开的桌面壳"再包一层（前端资产可复用）；本轮为它引入 Node 工具链不值得 |
+| egui / Slint | 立即模式/声明式 GUI 做大图缩略图墙+自由缩放对比的开发成本高，弃 |
+| Dioxus | Rust 写 UI心智成本高，生态不如直接写 JS，弃 |
+
+### 12.2 M-UI1 已实现范围（只读）
+
+- **形态**：`pic_process review <目录> [--config x.toml] [--cache x.sqlite] [--port 8787]` → 本地服务（绑 127.0.0.1）+ 自动开浏览器。
+- **数据流**：不依赖 CSV——`scan_directory` + 按当前配置指纹过滤缓存行 → 内存快照；**星级/连拍信息在启动时用当前配置现算**（与 `score` 同一函数，保证逐张一致）；缓存未命中的照片显示"未评分"。
+- **API**：`GET /`（内嵌前端）、`GET /api/photos`（JSON 快照）、`GET /thumb?p=`（320px 缩略图，按需生成落盘 `<照片根>/.firstcut/thumbs/`，已存在按 size+mtime 跳过）、`GET /image?p=`（原图直读，100% 预览零预生成成本）。
+- **安全**：仅 127.0.0.1；所有 `p` 参数 canonicalize 后强制在扫描根目录内（越界 403）；扩展名白名单。
+- **前端**（无构建步骤）：缩略图墙（分页 500/页 + lazy）；筛选（星级/保留/五维下限/有人脸/文件名搜索）+ 排序，条件持久化 localStorage；**单图 1:1 灯箱**（滚轮缩放 + 拖拽平移 + 双击复位，`←/→` 同连拍组切换）；**连拍组并排对比**（2~4 窗格共享同一 transform，滚轮/拖拽同步缩放，检查合焦的眼睛）。
+
+### 12.3 后续里程碑
+
+- **M-UI2 操作台**：触发 scan/score 跑批 + 进度展示 + 配置编辑 + 在 UI 里改星级（写侧车，他人侧车保护沿用）。
+- **M-UI3 Phase 2 集成**：develop 编排（P2-M2）的可视化——开发名单、进度、结果对比。

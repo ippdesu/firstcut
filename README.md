@@ -4,25 +4,28 @@
 **五维评分**（清晰度 / 曝光 / 噪点 / 构图 / 美学），连拍去重排序，输出
 **CSV 报告**和 **XMP 星级侧车**。全程本地运行、照片不上传。
 
-> 当前状态：**v1.1 已发布**，并已合入 M6 缺陷修复（AI 预处理通道顺序、EXIF 方向、
-> 构图主体脸门槛、曝光 EV 容差带 + 主体感知、缓存配置指纹、场景预设）。
+> 当前状态：**v1.1 已发布**，并已合入 M6 缺陷修复 + M7 交付兼容 + M8 评审修复 +
+> M9 自适应连拍保留（每个姿势簇各自保留）+ M-UI1 本地复核界面（`review` 子命令）。
 > Phase 2 批量 RAW 开发规划中，详见 `DESIGN.md` §9。
 
 ## 构建
 
 ```bash
 cargo build --release
+# 可选：实验性 DirectML GPU 推理（score --gpu；实测无显著收益，见 DESIGN §8）
+cargo build --release --features gpu
 ```
 
 产物（`target/release/`，Windows 加 `.exe`）：
 
 | 二进制 | 用途 |
 |---|---|
-| `pic_process` | 主命令（`scan` / `score` / `config-template`） |
+| `pic_process` | 主命令（`scan` / `score` / `config-template` / `review`） |
+| `pic_process-review` | 本地 Web 复核界面（缩略图墙 / 1:1 原图 / 连拍对比） |
 | `pic_process-tune` | 调参工具：导出原始指标 CSV |
 | `pic_process-gallery` | HTML 联系表生成器（缩略图 + 分数） |
 | `pic_process-debug-pose` | 诊断工具：YOLOv8-pose 检测验证 |
-| `pic_process-debug-scrfd` | 诊断工具：SCRFD 检测验证 |
+| `pic_process-debug-scrfd` | 诊断工具：SCRFD 检测验证（含 kps/姿态描述子） |
 | `pic_process-debug-exposure` | 诊断工具：全图亮度 vs 主体脸亮度 |
 | `pic_process-probe` | 诊断工具：打印 ONNX 输入输出元数据 |
 
@@ -54,15 +57,19 @@ pic_process score <照片目录> -o report.csv
 # 评分 + 写 XMP 星级侧车（Lightroom 可读）
 pic_process score <照片目录> --xmp
 
+# 本地 Web 复核界面（缩略图墙 / 1:1 原图 / 连拍并排对比，浏览器打开）
+pic_process review <照片目录>
+
 # 增量重跑（SQLite 缓存，只处理新照片/变更照片）
 pic_process score <照片目录>            # 第二次几乎秒级
 
 # 其他选项
-pic_process score <目录> -k 1           # 连拍子簇只保留第 1 名
+pic_process score <目录> -k 2           # 每个保留单元（M9 默认为姿势簇）保留 2 张
 pic_process score <目录> --no-ai        # 跳过 AI 推理
 pic_process score <目录> --no-cache     # 禁用缓存
 pic_process score <目录> --cache x.db   # 指定缓存文件
 pic_process score <目录> --config x.toml # 自定义评分配置（多场景可存多份）
+pic_process score <目录> --gpu          # 实验性 DirectML（需 --features gpu 构建）
 
 # 生成评分配置模板
 pic_process config-template -o firstcut.toml
@@ -115,7 +122,8 @@ pic_process score <目录> --config stage.toml
 | `total_score` | 加权总分（0-100，跨批次可比） |
 | `stars` | 星级 1-5（默认按**本批次相对排名**，见下） |
 | `faces` | SCRFD 检测到的人脸数 |
-| `burst_group, burst_size, burst_rank, burst_keep` | 连拍去重：组号、**dHash 子簇内**张数、子簇内排名、是否建议保留（`burst_size` 是"几乎同一张"的子簇大小，不是整组张数） |
+| `analysis_ok` | 评分数据是否可用（解码失败/无配对 ARW 为 false，运行结束 stderr 也有失败清单） |
+| `burst_group, burst_size, burst_rank, burst_keep` | 连拍去重：组号、**保留单元内**张数、保留单元内排名、是否建议保留（`burst_keep` 只是建议标记，**工具永不删除/移动文件**） |
 
 **XMP 侧车**（`--xmp`）：写 `<stem>.xmp`（如 `DSC00001.xmp`），含
 `xmp:Rating`（1-5 星）+ `firstcut:` 命名空间（五维子分/人脸/连拍信息）。
@@ -170,13 +178,37 @@ pic_process score <目录> --config stage.toml
 > 注意：星级依赖"批次"——建议**整场照片一次跑完**。分批跑不同子目录会各自归一化，
 > 星级之间不可比。
 
-**连拍去重**：拍摄时间间隔 ≤2s 成组 → 组内按 dHash 汉明距离 ≤10 分**子簇**（近乎同一张）
-→ 子簇内按总分排序，`-k` 控制每子簇保留数（默认 2），`burst_keep=true|false` 标记建议保留。
-注意 `burst_size` 是子簇大小：30 张连拍若姿势各异可能分成多个小簇，各自都保留。
+**连拍去重（M9 自适应保留，默认开启）**：拍摄时间间隔 ≤2s 成组 → 组内按 dHash
+汉明距离 ≤10 分**子簇**（近乎同一张）→ 子簇内再按 **SCRFD 关键点姿态描述子**
+聚类（距离 > 0.25 = 不同姿势）→ **每个姿势簇各自保留 top-3**（`-k` 可调），
+单组保留总量受上限 20 约束（超出按总分截断）。
+解决"30fps 连拍不同姿势被 dHash 判为近似重复只留 2 张"的问题；
+无人脸的帧退化为 dHash 行为；`burst_keep=true|false` 只是建议保留标记。
+阈值/开关/上限都在 `[dedup]` 配置段（`adaptive_keep = false` 回退旧行为）。
 
-## 性能（16 核机器实测，119 张 33MP JPG）
+## 本地复核界面（review）
 
-- 冷缓存（含 AI）：约 **155ms/张**，119 张 18.4s（CLIPIQA + SCRFD + 姿态）
+```bash
+pic_process review <照片目录>            # 浏览器自动打开 http://127.0.0.1:8787
+pic_process review <目录> --port 9000 --config stage.toml
+```
+
+- **缩略图墙**：分页 + 懒加载，卡片显示星级/总分/连拍保留标记；筛选（星级、
+  保留/未保留、五维分数下限、有人脸、文件名搜索）与排序，条件自动记忆。
+- **1:1 原图灯箱**：点击卡片打开原图（按需直读原文件，不预生成），
+  滚轮缩放、拖拽平移、双击复位，`←/→` 在同一连拍组内切换——缩略图看不清
+  是否合焦时随时放大到 100%。
+- **连拍组并排对比**：灯箱内勾选同组 2~4 张，并排窗格**同步缩放平移**
+  （滚轮/拖拽作用于所有窗格），逐帧对比合焦位置。
+- 数据来源：扫描目录 + SQLite 缓存（星级/连拍与 `score` 同一逻辑在线计算），
+  **只读**——不会写任何文件（缩略图缓存目录 `.firstcut/thumbs/` 除外）。
+  未跑过 `score` 的照片显示为未评分。
+
+## 性能（16 核机器实测）
+
+- 119 张 33MP 冷缓存（含 AI）：约 **146ms/张**（CLIPIQA + SCRFD + 姿态）
+- **1447 张真实图库冷跑 2m55s（~121ms/张，88% 连拍）**；增量重跑 1447 张全命中 2.06s
+- 实验性 `--gpu`（DirectML）：119 张 16.7s vs CPU 17.4s——无显著收益，保持实验性
 - 纯像素冷缓存：约 **90ms/张**（`--no-ai`）
 - 增量重跑：秒级（SQLite 缓存，键 = `path` + `size` + `mtime` + `CACHE_VERSION` + 配置指纹）
 - 评分参数/`--config` 变更会自动使缓存失效（配置指纹参与缓存键），无需手动换缓存文件
@@ -185,21 +217,22 @@ pic_process score <目录> --config stage.toml
 
 ```
 src/
-├── main.rs        # CLI（scan / score / config-template）
+├── main.rs        # CLI（scan / score / config-template / review）
 ├── lib.rs         # 库入口（pub mod 各模块）
 ├── scan.rs        # 目录扫描 + EXIF + JPG/ARW 配对
 ├── decode.rs      # JPEG 解码（box 降采样）+ EXIF 方向 + 灰度/直方图
 ├── metrics/       # sharpness / exposure / noise / composition
-├── ai/            # CLIPIQA + SCRFD + YOLOv8-pose（ort 推理）
-├── dedup.rs       # 连拍分组 + dHash 聚类 + 排序
-├── cache.rs       # SQLite 增量缓存（键含配置指纹）
+├── ai/            # CLIPIQA + SCRFD（含 kps）+ YOLOv8-pose（ort 推理）
+├── dedup.rs       # 连拍分组 + dHash 聚类 + M9 姿态聚类 + 排序
+├── cache.rs       # SQLite 增量缓存（键含配置指纹，含姿态描述子）
+├── review/        # M-UI1 本地 Web 复核服务（axum + 内嵌前端）
 ├── output/        # csv / xmp 侧车
-├── config.rs      # 权重与曲线参数 + 场景预设（TOML 可配）
+├── config.rs      # 权重与曲线参数 + [dedup] + 场景预设（TOML 可配）
 └── bin/
     ├── tune.rs             # 原始指标导出（调参用）
     ├── gallery.rs          # HTML 联系表生成器
     ├── debug_pose.rs       # 诊断：YOLOv8-pose 检测
-    ├── debug_scrfd.rs      # 诊断：SCRFD 检测
+    ├── debug_scrfd.rs      # 诊断：SCRFD 检测 + kps 自检 + 姿态描述子
     ├── debug_exposure.rs   # 诊断：全图亮度 vs 主体脸亮度
     └── probe.rs            # 诊断：ONNX 模型元数据
 
@@ -210,12 +243,14 @@ presets/                  # 场景预设（编译进二进制，config-template 
 ## 测试
 
 ```bash
-cargo test --lib                    # 单元测试（37 项）
+cargo test --lib                    # 单元测试（42 项）
 cargo test --test integration_test  # 集成测试（6 项，需要 testpic/）
 ```
 
-- **单元测试** 37 项（`cargo test --lib`）：
-  - `dedup` 6 项（datetime 解析、闰年/平年、严格 dHash、连拍分组、dHash 距离切分、空时间无连拍）
+- **单元测试** 42 项（`cargo test --lib`）：
+  - `dedup` 11 项（datetime 解析、闰年/平年、严格 dHash、连拍分组、dHash 距离切分、
+    空时间无连拍、无描述子退化 M2、M9 姿态分簇各自保留、阈值种子聚类、
+    组上限截断、姿态距离值）
   - `metrics::composition` 4 项（无脸中性、三分法偏好、理想大小、微小人脸降分）
   - `metrics::exposure` 7 项（sRGB↔EV 换算、容差带内满分、带外单调衰减、
     两侧容差独立、主体感知单向修正、暗背景救回、剪裁惩罚）
@@ -226,6 +261,7 @@ cargo test --test integration_test  # 集成测试（6 项，需要 testpic/）
   - `scan` 6 项（配对键含目录、侧车命名保留大小写、同目录配对、
     跨目录配对、编号回绕不合并、歧义不配对）
   - `decode` 1 项（8 种 EXIF Orientation 像素变换）
+  - `review` 若干项（路径越界 403、缩略图缓存、快照/星级与 score 一致性）
 - **集成测试** 6 项（`tests/integration_test.rs`）：端到端 pipeline 验证（扫描/配置/dedup/总分/星级映射/模板）
   - 依赖 `testpic/` 真实照片目录（已 gitignore，私人照片不入库）
   - testpic 缺失时跳过依赖它的用例，其余纯逻辑用例始终执行

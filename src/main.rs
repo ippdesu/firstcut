@@ -33,8 +33,8 @@ enum Commands {
         /// 输出 CSV 路径（默认 report.csv）
         #[arg(short, long, default_value = "report.csv")]
         output: PathBuf,
-        /// 连拍子簇内保留前 K 张
-        #[arg(short, long, default_value_t = 2)]
+        /// 连拍保留单元（姿态簇/dHash 子簇）内保留前 K 张
+        #[arg(short, long, default_value_t = 3)]
         keep: usize,
         /// 跳过 AI 推理（无模型时快速预览）
         #[arg(long)]
@@ -51,6 +51,10 @@ enum Commands {
         /// 评分配置文件（TOML，可多场景存多份；缺省用内置默认）
         #[arg(long)]
         config: Option<PathBuf>,
+        /// 实验性：用 DirectML GPU 推理（需 cargo build --features gpu；
+        /// 失败自动回落 CPU）
+        #[arg(long)]
+        gpu: bool,
     },
     /// 输出默认评分配置模板（可存多份场景配置）
     ConfigTemplate {
@@ -90,7 +94,7 @@ fn main() -> Result<()> {
             std::fs::write(&output, text)?;
             eprintln!("[config] 已写出: {}", output.display());
         }
-        Commands::Score { dir, output, keep, no_ai, xmp, cache, no_cache, config } => {
+        Commands::Score { dir, output, keep, no_ai, xmp, cache, no_cache, config, gpu } => {
             // 0) 评分配置（默认或文件）
             //    显式传入的配置加载失败必须硬报错：静默回退默认值会让用户
             //    以为参数已生效（M6-4 同类问题的解析层版本）
@@ -104,6 +108,13 @@ fn main() -> Result<()> {
                 eprintln!("[score] 配置已加载: {}", config.as_ref().unwrap().display());
             }
 
+            // GPU 是实验性 opt-in：默认构建不含 DirectML，显式报错而不是静默忽略
+            if gpu && !cfg!(feature = "gpu") {
+                anyhow::bail!(
+                    "--gpu 需要启用 DirectML 构建：cargo build --release --features gpu"
+                );
+            }
+
             let mut entries = scan::scan_directory(&dir)?;
             eprintln!("[score] 发现 {} 个文件（JPG/ARW）", entries.len());
 
@@ -112,7 +123,7 @@ fn main() -> Result<()> {
                 eprintln!("[score] 跳过 AI 推理（--no-ai）");
                 AiEngine::none()
             } else {
-                match AiEngine::load() {
+                match AiEngine::load(gpu) {
                     Ok(e) => e,
                     Err(err) => {
                         eprintln!("[score] 警告: {err:#}");
@@ -156,8 +167,9 @@ fn main() -> Result<()> {
                 }
             }
 
-            // 3) 连拍去重（只针对有分析的 JPG）
-            let dedup_params = DedupParams { keep_k: keep, ..Default::default() };
+            // 3) 连拍去重（只针对有分析的 JPG）；
+            //    去重参数：CLI -k 覆盖配置的 keep_k，其余来自 [dedup]
+            let dedup_params = DedupParams { keep_k: keep, ..cfg.dedup };
             let burst_info =
                 run_burst_analysis(&mut entries, &outcome.results, &dedup_params, &cfg.weights);
 
@@ -181,6 +193,29 @@ fn main() -> Result<()> {
                 if let Some(info) = burst_info.get(&key) {
                     apply_burst(e, info);
                 }
+            }
+
+            // 5.5) 异常文件报告：analysis_ok 列 + stderr 摘要。
+            //      万张跑批时解码失败/无配对 ARW 只在日志里一笔带过会被忽略，
+            //      落成 CSV 列才可过滤、可统计。
+            for e in entries.iter_mut() {
+                e.analysis_ok = if e.total_score.is_empty() { "false" } else { "true" }.into();
+            }
+            let failed_jpgs: Vec<&str> = entries
+                .iter()
+                .filter(|e| !e.is_raw && e.total_score.is_empty())
+                .map(|e| e.path.as_str())
+                .collect();
+            let unmapped_arw = entries.iter().filter(|e| e.is_raw && e.total_score.is_empty()).count();
+            if !failed_jpgs.is_empty() {
+                eprintln!(
+                    "[score] 警告: {} 张 JPG 解码/分析失败: {}",
+                    failed_jpgs.len(),
+                    failed_jpgs.iter().take(10).cloned().collect::<Vec<_>>().join(", ")
+                );
+            }
+            if unmapped_arw > 0 {
+                eprintln!("[score] 警告: {unmapped_arw} 张 ARW 无同名 JPG 可映射分数（analysis_ok=false）");
             }
 
             // 6) 星级（批次内相对排名或绝对阈值，见 config.star_mode）
@@ -253,6 +288,8 @@ fn run_burst_analysis(
         jpg_idx.iter().map(|&i| entries[i].clone()).collect();
     let hashes: Vec<u64> =
         jpg_idx.iter().map(|&i| analyzed[entries[i].pair_id()].dhash).collect();
+    let descs: Vec<Option<[f32; 10]>> =
+        jpg_idx.iter().map(|&i| analyzed[entries[i].pair_id()].pose_desc).collect();
     let scores: Vec<f64> = jpg_idx
         .iter()
         .map(|&i| {
@@ -261,7 +298,7 @@ fn run_burst_analysis(
         })
         .collect();
 
-    let infos = dedup::analyze_bursts(&jpg_entries, &hashes, &scores, params);
+    let infos = dedup::analyze_bursts(&jpg_entries, &hashes, &scores, &descs, params);
     let mut map = HashMap::new();
     for (&idx, info) in jpg_idx.iter().zip(infos.iter()) {
         map.insert(entries[idx].pair_id().to_string(), info.clone());

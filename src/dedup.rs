@@ -1,10 +1,15 @@
-//! 连拍去重/最优帧选择（M2）
+//! 连拍去重/最优帧选择（M2/M9）
 //!
-//! 两步聚类：
+//! 三步聚类（M9 起自适应保留默认开启）：
 //! 1. 时间聚类：EXIF 拍摄时间间隔 ≤ 阈值（默认 2s）视为同一连拍组
 //! 2. 组内感知相似聚类：dHash 汉明距离 ≤ 阈值视为同一场景子簇
 //!    （长连拍中画面渐变时，避免首尾被错误归为同帧）
-//! 3. 子簇内按总分排序，top-K 标记保留
+//! 3. **保留单元**内按总分排序，top-K 标记保留：
+//!    - `adaptive_keep = true`（M9，默认）：在 dHash 子簇内再按 SCRFD 关键点
+//!      姿态描述子聚类（距离 > 阈值 = 不同姿势），每个**姿势簇**各自保留 top-K，
+//!      解决"30fps 连拍不同姿势被 dHash 判为近似重复"的问题；
+//!      单组保留总量受 `burst_group_cap` 上限约束（超出按总分截断）。
+//!    - `adaptive_keep = false`：保留单元退化为 dHash 子簇（M2 行为）。
 
 use crate::config::DedupParams;
 use crate::scan::PhotoEntry;
@@ -14,12 +19,27 @@ use crate::scan::PhotoEntry;
 pub struct BurstInfo {
     /// 连拍组号（0 = 非连拍）
     pub group: usize,
-    /// 组内照片数
+    /// 保留单元内张数（姿态簇或 dHash 子簇）
     pub size: usize,
-    /// 子簇内排名（1 = 最优）
+    /// 保留单元内排名（1 = 最优）
     pub rank: usize,
     /// 是否建议保留
     pub keep: bool,
+    /// M9 姿态簇号（组内从 1 起；0 = 未启用自适应保留或非连拍）。
+    /// 不同 dHash 子簇间簇号可能重复（同姿势出现在不同子簇是正常的）。
+    pub pose_cluster: usize,
+}
+
+/// 姿态描述子欧氏距离（10 维：5 个关键点 × (x,y)，已按人脸框归一化）
+pub fn pose_distance(a: &[f32; 10], b: &[f32; 10]) -> f64 {
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| {
+            let d = (*x - *y) as f64;
+            d * d
+        })
+        .sum::<f64>()
+        .sqrt()
 }
 
 /// 解析 EXIF 拍摄时间为 Unix 秒（无时区，相对比较用）
@@ -159,13 +179,19 @@ fn group_by_time(times: &[Option<i64>], gap_secs: f64) -> Vec<usize> {
     groups
 }
 
-/// 连拍分析：输入 JPG 条目（含分数与 dHash），输出每条目的 BurstInfo
+/// 连拍分析：输入 JPG 条目（含分数、dHash 与姿态描述子），输出每条目的 BurstInfo
+///
+/// `descs[i]` 为 `entries[i]` 的姿态描述子（无主体级人脸时 None）。
 pub fn analyze_bursts(
     entries: &[PhotoEntry],
     hashes: &[u64],
     scores: &[f64],
+    descs: &[Option<[f32; 10]>],
     params: &DedupParams,
 ) -> Vec<BurstInfo> {
+    assert_eq!(entries.len(), hashes.len(), "hashes 与 entries 长度不一致");
+    assert_eq!(entries.len(), scores.len(), "scores 与 entries 长度不一致");
+    assert_eq!(entries.len(), descs.len(), "descs 与 entries 长度不一致");
     let n = entries.len();
     let times: Vec<Option<i64>> = entries
         .iter()
@@ -174,7 +200,7 @@ pub fn analyze_bursts(
     let groups = group_by_time(&times, params.gap_secs);
 
     let mut infos = vec![
-        BurstInfo { group: 0, size: 0, rank: 0, keep: false };
+        BurstInfo { group: 0, size: 0, rank: 0, keep: false, pose_cluster: 0 };
         n
     ];
 
@@ -183,7 +209,8 @@ pub fn analyze_bursts(
         let members: Vec<usize> = (0..n).filter(|&i| groups[i] == gid).collect();
         if members.len() < 2 {
             for &i in &members {
-                infos[i] = BurstInfo { group: 0, size: 0, rank: 0, keep: false };
+                infos[i] =
+                    BurstInfo { group: 0, size: 0, rank: 0, keep: false, pose_cluster: 0 };
             }
             continue;
         }
@@ -203,30 +230,94 @@ pub fn analyze_bursts(
                 }
             }
         }
-        // 每个子簇内按总分排序定排名与保留
+        // 每个子簇内确定保留单元（姿态簇或子簇本身），排序定排名与保留
         for c in 1..=cid {
             let in_cluster: Vec<usize> = (0..members.len())
                 .filter(|&mi| cluster_of[mi] == c)
                 .map(|mi| members[mi])
                 .collect();
-            let mut order = in_cluster.clone();
-            order.sort_by(|&a, &b| {
-                scores[b]
-                    .partial_cmp(&scores[a])
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            let size = order.len();
-            for (rank, &idx) in order.iter().enumerate() {
-                infos[idx] = BurstInfo {
-                    group: gid,
-                    size,
-                    rank: rank + 1,
-                    keep: rank < params.keep_k,
-                };
+            if !params.adaptive_keep {
+                assign_rank_keep(&mut infos, &in_cluster, scores, gid, params.keep_k, 0);
+                continue;
+            }
+            // M9：dHash 子簇内按姿态描述子贪心种子聚类。
+            // 与 dHash 聚类同风格（对簇种子比较），扫描顺序确定，结果可复现。
+            let mut pose_seeds: Vec<[f32; 10]> = Vec::new();
+            let mut pose_of = vec![0usize; in_cluster.len()];
+            let mut no_desc: Vec<usize> = Vec::new();
+            for (mi, &idx) in in_cluster.iter().enumerate() {
+                match &descs[idx] {
+                    Some(d) => {
+                        let hit = pose_seeds
+                            .iter()
+                            .position(|s| pose_distance(s, d) <= params.pose_cluster_threshold);
+                        match hit {
+                            Some(ci) => pose_of[mi] = ci + 1,
+                            None => {
+                                pose_seeds.push(*d);
+                                pose_of[mi] = pose_seeds.len();
+                            }
+                        }
+                    }
+                    None => no_desc.push(mi),
+                }
+            }
+            // 无描述子的帧（无人脸/关键点退化）共享一个伪簇，编号接在后面：
+            // 它们已被 dHash 判为近似同帧，合并处理与 M2 行为等价
+            let pseudo_id = pose_seeds.len() + 1;
+            for &mi in &no_desc {
+                pose_of[mi] = pseudo_id;
+            }
+            for pc in 1..=pseudo_id {
+                let unit: Vec<usize> = (0..in_cluster.len())
+                    .filter(|&mi| pose_of[mi] == pc)
+                    .map(|mi| in_cluster[mi])
+                    .collect();
+                assign_rank_keep(&mut infos, &unit, scores, gid, params.keep_k, pc);
+            }
+        }
+        // M9：单组保留总量上限——超出部分按总分从低到高截断（排名不变）
+        if params.adaptive_keep && params.burst_group_cap > 0 {
+            let kept: Vec<usize> =
+                (0..n).filter(|&i| infos[i].group == gid && infos[i].keep).collect();
+            if kept.len() > params.burst_group_cap {
+                let mut by_score_asc = kept;
+                by_score_asc.sort_by(|&a, &b| {
+                    scores[a].partial_cmp(&scores[b]).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                let excess = by_score_asc.len() - params.burst_group_cap;
+                for &idx in by_score_asc.iter().take(excess) {
+                    infos[idx].keep = false;
+                }
             }
         }
     }
     infos
+}
+
+/// 给一个保留单元内的条目按总分降序定排名与保留标记
+fn assign_rank_keep(
+    infos: &mut [BurstInfo],
+    unit: &[usize],
+    scores: &[f64],
+    gid: usize,
+    keep_k: usize,
+    pose_cluster: usize,
+) {
+    let mut order = unit.to_vec();
+    order.sort_by(|&a, &b| {
+        scores[b].partial_cmp(&scores[a]).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let size = order.len();
+    for (rank, &idx) in order.iter().enumerate() {
+        infos[idx] = BurstInfo {
+            group: gid,
+            size,
+            rank: rank + 1,
+            keep: rank < keep_k,
+            pose_cluster,
+        };
+    }
 }
 
 #[cfg(test)]
@@ -257,6 +348,7 @@ mod tests {
             total_score: String::new(),
             stars: String::new(),
             faces: String::new(),
+            analysis_ok: String::new(),
             burst_group: String::new(),
             burst_size: String::new(),
             burst_rank: String::new(),
@@ -318,7 +410,9 @@ mod tests {
         // 相同 dHash（同一场景），分数 B > A > C
         let hashes = vec![0xAAAA_AAAA_AAAA_AAAAu64; 4];
         let scores = vec![50.0, 90.0, 70.0, 60.0];
-        let infos = analyze_bursts(&entries, &hashes, &scores, &DedupParams::default());
+        let descs = vec![None; 4];
+        let params = DedupParams { keep_k: 2, adaptive_keep: false, ..Default::default() };
+        let infos = analyze_bursts(&entries, &hashes, &scores, &descs, &params);
 
         assert_eq!(infos[0].group, infos[1].group);
         assert_eq!(infos[0].group, infos[2].group);
@@ -332,6 +426,8 @@ mod tests {
         assert!(infos[1].keep);
         assert!(infos[2].keep);
         assert!(!infos[0].keep);
+        // 自适应保留关闭：姿态簇号为 0
+        assert_eq!(infos[0].pose_cluster, 0);
     }
 
     #[test]
@@ -343,7 +439,9 @@ mod tests {
         ];
         let hashes = vec![0x0000_0000_0000_0000u64, 0xFFFF_FFFF_FFFF_FFFFu64];
         let scores = vec![70.0, 80.0];
-        let infos = analyze_bursts(&entries, &hashes, &scores, &DedupParams::default());
+        let descs = vec![None, None];
+        let params = DedupParams { adaptive_keep: false, ..Default::default() };
+        let infos = analyze_bursts(&entries, &hashes, &scores, &descs, &params);
         // 两个子簇，各自 rank=1 且 keep
         assert_eq!(infos[0].group, infos[1].group);
         assert_eq!(infos[0].rank, 1);
@@ -357,8 +455,136 @@ mod tests {
         let entries = vec![entry("A.JPG", ""), entry("B.JPG", "")];
         let hashes = vec![0xAAAA_AAAA_AAAA_AAAAu64; 2];
         let scores = vec![70.0, 80.0];
-        let infos = analyze_bursts(&entries, &hashes, &scores, &DedupParams::default());
+        let descs = vec![None, None];
+        let infos = analyze_bursts(&entries, &hashes, &scores, &descs, &DedupParams::default());
         assert_eq!(infos[0].group, 0);
         assert_eq!(infos[1].group, 0);
+    }
+
+    #[test]
+    fn no_desc_frames_behave_like_m2() {
+        // 自适应开启但全部无描述子 → 共享伪簇，保留行为与 M2 等价
+        let entries = vec![
+            entry("A.JPG", "2026:07:19 17:12:38"),
+            entry("B.JPG", "2026:07:19 17:12:39"),
+            entry("C.JPG", "2026:07:19 17:12:40"),
+        ];
+        let hashes = vec![0xAAAA_AAAA_AAAA_AAAAu64; 3];
+        let scores = vec![50.0, 90.0, 70.0];
+        let descs = vec![None, None, None];
+        let infos = analyze_bursts(&entries, &hashes, &scores, &descs, &DedupParams::default());
+        assert_eq!(infos[1].rank, 1);
+        assert_eq!(infos[2].rank, 2);
+        assert_eq!(infos[0].rank, 3);
+        assert!((infos[0].pose_cluster, infos[1].pose_cluster, infos[2].pose_cluster) == (1, 1, 1));
+        assert!(infos[0].keep && infos[1].keep && infos[2].keep);
+    }
+
+    // ---- M9 姿态聚类 ----
+
+    /// 合成描述子：10 维基向量，鼻子位（4,5）可偏移制造"不同姿势"
+    fn pose_desc(nose_dx: f32, nose_dy: f32) -> [f32; 10] {
+        let mut d = [0.5f32, 0.4, 0.3, 0.2, 0.5, 0.6, 0.4, 0.7, 0.6, 0.8];
+        d[4] += nose_dx;
+        d[5] += nose_dy;
+        d
+    }
+
+    #[test]
+    fn pose_distance_known_values() {
+        let a = pose_desc(0.0, 0.0);
+        assert_eq!(pose_distance(&a, &a), 0.0, "相同描述子距离为 0");
+        let b = pose_desc(0.4, 0.4);
+        // √(0.4² + 0.4²) ≈ 0.5657（f32 描述子，容差 1e-4）
+        assert!((pose_distance(&a, &b) - ((0.4f32 * 0.4 + 0.4 * 0.4) as f64).sqrt()).abs() < 1e-4);
+    }
+
+    #[test]
+    fn adaptive_clustering_keeps_each_pose() {
+        // 4 帧同一 dHash 子簇，两个姿势各 2 帧：
+        // 旧行为（单保留单元 keep_k=3）会丢掉第 4 名，M9 每个姿势簇各自保留
+        let entries = vec![
+            entry("A.JPG", "2026:07:19 17:12:38"),
+            entry("B.JPG", "2026:07:19 17:12:39"),
+            entry("C.JPG", "2026:07:19 17:12:39"),
+            entry("D.JPG", "2026:07:19 17:12:40"),
+        ];
+        let hashes = vec![0xAAAA_AAAA_AAAA_AAAAu64; 4];
+        let scores = vec![70.0, 90.0, 80.0, 60.0];
+        // A、B 同姿势；C、D 另一姿势（与前者距离 0.566 > 阈值 0.25）
+        let descs = vec![
+            Some(pose_desc(0.0, 0.0)),
+            Some(pose_desc(0.02, -0.02)),
+            Some(pose_desc(0.4, 0.4)),
+            Some(pose_desc(0.38, 0.42)),
+        ];
+        let infos = analyze_bursts(&entries, &hashes, &scores, &descs, &DedupParams::default());
+
+        // 姿态分簇：{A,B} 一簇，{C,D} 一簇
+        assert_eq!(infos[0].pose_cluster, infos[1].pose_cluster);
+        assert_eq!(infos[2].pose_cluster, infos[3].pose_cluster);
+        assert_ne!(infos[0].pose_cluster, infos[2].pose_cluster);
+        // 每个姿势簇内 top-3 全保留（簇内只有 2 张）→ 4 张全保留；
+        // 旧行为下 D(60) 是 4 名中最低分会被丢掉
+        assert!(infos.iter().all(|i| i.keep), "不同姿势都应保留: {infos:?}");
+        // 簇内排名：B(90) 在 {A,B} 第一，C(80) 在 {C,D} 第一
+        assert_eq!(infos[1].rank, 1);
+        assert_eq!(infos[0].rank, 2);
+        assert_eq!(infos[2].rank, 1);
+        assert_eq!(infos[3].rank, 2);
+        // 关闭自适应 → 回到旧行为：单保留单元 top-3，D 被丢
+        let params = DedupParams { adaptive_keep: false, ..Default::default() };
+        let old = analyze_bursts(&entries, &hashes, &scores, &descs, &params);
+        assert!(!old[3].keep, "旧行为应丢弃最低分");
+        assert!(old[0].keep && old[1].keep && old[2].keep);
+    }
+
+    #[test]
+    fn pose_threshold_groups_by_seed_distance() {
+        // 贪心种子聚类：与簇种子距离 ≤ 阈值入簇，否则新簇
+        // d1(种子) ← d2(0.17，入簇)；d3 距 d1 0.57 > 0.25 → 新簇
+        let entries = vec![
+            entry("A.JPG", "2026:07:19 17:12:38"),
+            entry("B.JPG", "2026:07:19 17:12:39"),
+            entry("C.JPG", "2026:07:19 17:12:40"),
+        ];
+        let hashes = vec![0xAAAA_AAAA_AAAA_AAAAu64; 3];
+        let scores = vec![70.0, 80.0, 90.0];
+        let descs = vec![
+            Some(pose_desc(0.0, 0.0)),
+            Some(pose_desc(0.12, 0.12)),
+            Some(pose_desc(0.4, 0.4)),
+        ];
+        let infos = analyze_bursts(&entries, &hashes, &scores, &descs, &DedupParams::default());
+        assert_eq!(infos[0].pose_cluster, infos[1].pose_cluster);
+        assert_ne!(infos[0].pose_cluster, infos[2].pose_cluster);
+    }
+
+    #[test]
+    fn group_cap_truncates_lowest_scores() {
+        // 同一姿势簇 5 帧（keep_k=3 → 3 张保留），组上限 2 → 再按总分截掉 1 张
+        let entries = vec![
+            entry("A.JPG", "2026:07:19 17:12:38"),
+            entry("B.JPG", "2026:07:19 17:12:39"),
+            entry("C.JPG", "2026:07:19 17:12:40"),
+            entry("D.JPG", "2026:07:19 17:12:41"),
+            entry("E.JPG", "2026:07:19 17:12:42"),
+        ];
+        let hashes = vec![0xAAAA_AAAA_AAAA_AAAAu64; 5];
+        let scores = vec![50.0, 90.0, 70.0, 60.0, 80.0];
+        let d = pose_desc(0.0, 0.0);
+        let descs = vec![Some(d), Some(d), Some(d), Some(d), Some(d)];
+        let params =
+            DedupParams { keep_k: 3, burst_group_cap: 2, ..Default::default() };
+        let infos = analyze_bursts(&entries, &hashes, &scores, &descs, &params);
+
+        // 排名不变：B(90) 1、E(80) 2、C(70) 3、D(60) 4、A(50) 5
+        assert_eq!(infos[1].rank, 1);
+        assert_eq!(infos[4].rank, 2);
+        assert_eq!(infos[2].rank, 3);
+        // 上限 2：只保留总分前 2，第 3 名被截断但排名保留
+        assert!(infos[1].keep && infos[4].keep);
+        assert!(!infos[2].keep && !infos[3].keep && !infos[0].keep);
+        assert_eq!(infos.iter().filter(|i| i.keep).count(), 2);
     }
 }

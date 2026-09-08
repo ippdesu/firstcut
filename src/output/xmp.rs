@@ -189,6 +189,7 @@ mod tests {
             total_score: "66.0".into(),
             stars: "4".into(),
             faces: "1".into(),
+            analysis_ok: "true".into(),
             burst_group: "3".into(),
             burst_size: "2".into(),
             burst_rank: "1".into(),

@@ -42,15 +42,8 @@ const CONF_THRESHOLD: f32 = 0.25;
 const NMS_IOU: f32 = 0.5;
 
 impl PoseDet {
-    pub fn load(intra_threads: usize) -> Result<Self> {
-        let builder = Session::builder().map_err(crate::ai::ort_err)?;
-        let session = builder
-            .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)
-            .map_err(crate::ai::ort_err)?
-            .with_intra_threads(intra_threads)
-            .map_err(crate::ai::ort_err)?
-            .commit_from_file(format!("{}/yolov8n_pose.onnx", crate::ai::MODELS_DIR))
-            .map_err(crate::ai::ort_err)?;
+    pub fn load(intra_threads: usize, use_gpu: bool) -> Result<Self> {
+        let session = crate::ai::build_session("yolov8n_pose.onnx", intra_threads, use_gpu)?;
         Ok(Self { session })
     }
 

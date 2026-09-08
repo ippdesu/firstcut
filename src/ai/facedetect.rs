@@ -2,9 +2,11 @@
 //!
 //! models/scrfd_10g_bnkps.onnx（RuteNL/SCRFD-face-detection-ONNX，hf-mirror 下载）：
 //! - 输入 1x3x640x640 RGB，(x-127.5)/128 归一化
-//! - 9 个输出：score/bbox/kps × stride [8,16,32]（score 已 sigmoid）
+//! - 9 个输出：score/bbox/kps × stride [8,16,32]（score 已 sigmoid），
+//!   布局均为 [N, dim] 行主序（score [N,1]、bbox [N,4]、kps [N,10]，probe 实测）
 //! - bbox 为 distance(l,t,r,b)×stride，从格中心 (gx*stride, gy*stride) 解码
 //!   （每格 num_anchors=2 共享中心；参考 insightface model_zoo/scrfd.py）
+//! - kps 同为格中心 + offset×stride（5 点 × xy，M9 起参与解码，做头部姿态描述子）
 //! - 阈值 0.3（小脸/远距人像场景；insightface 默认 0.5 但分析图仅 1024px）
 
 use anyhow::Result;
@@ -19,6 +21,9 @@ pub struct FaceBox {
     pub w: f32,
     pub h: f32,
     pub score: f32,
+    /// 5 个关键点（双眼/鼻/双嘴角），归一化图像坐标。
+    /// M9：按人脸框归一化后作为头部姿态/表情几何描述子（连拍聚类用）
+    pub kps: [(f32, f32); 5],
 }
 
 pub struct Scrfd {
@@ -38,15 +43,8 @@ const NMS_IOU: f32 = 0.3;
 
 impl Scrfd {
     /// 加载模型；`intra_threads` 为 ORT 内部线程数
-    pub fn load(intra_threads: usize) -> Result<Self> {
-        let builder = Session::builder().map_err(crate::ai::ort_err)?;
-        let session = builder
-            .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)
-            .map_err(crate::ai::ort_err)?
-            .with_intra_threads(intra_threads)
-            .map_err(crate::ai::ort_err)?
-            .commit_from_file(format!("{}/scrfd_10g_bnkps.onnx", crate::ai::MODELS_DIR))
-            .map_err(crate::ai::ort_err)?;
+    pub fn load(intra_threads: usize, use_gpu: bool) -> Result<Self> {
+        let session = crate::ai::build_session("scrfd_10g_bnkps.onnx", intra_threads, use_gpu)?;
         Ok(Self { session })
     }
 
@@ -84,7 +82,8 @@ impl Scrfd {
 
             let (_, scores) = out[si].try_extract_tensor::<f32>().map_err(crate::ai::ort_err)?;
             let (_, bbox) = out[si + 3].try_extract_tensor::<f32>().map_err(crate::ai::ort_err)?;
-            if scores.len() < n || bbox.len() < n * 4 {
+            let (_, kps) = out[si + 6].try_extract_tensor::<f32>().map_err(crate::ai::ort_err)?;
+            if scores.len() < n || bbox.len() < n * 4 || kps.len() < n * 10 {
                 anyhow::bail!("SCRFD 输出尺寸异常 (stride={stride})");
             }
 
@@ -106,12 +105,21 @@ impl Scrfd {
                 let y1 = (cy - t).clamp(0.0, INPUT_SIZE as f32);
                 let x2 = (cx + r).clamp(0.0, INPUT_SIZE as f32);
                 let y2 = (cy + b).clamp(0.0, INPUT_SIZE as f32);
+                // kps：格中心 + offset×stride，与 bbox 同一距离约定
+                let k10 = i * 10;
+                let mut kps_arr = [(0.0f32, 0.0f32); 5];
+                for (j, p) in kps_arr.iter_mut().enumerate() {
+                    let px = cx + kps[k10 + j * 2] * stride as f32;
+                    let py = cy + kps[k10 + j * 2 + 1] * stride as f32;
+                    *p = (px / INPUT_SIZE as f32, py / INPUT_SIZE as f32);
+                }
                 dets.push(FaceBox {
                     x: x1 / INPUT_SIZE as f32,
                     y: y1 / INPUT_SIZE as f32,
                     w: (x2 - x1) / INPUT_SIZE as f32,
                     h: (y2 - y1) / INPUT_SIZE as f32,
                     score: s,
+                    kps: kps_arr,
                 });
             }
         }

@@ -17,15 +17,8 @@ const MEAN: [f32; 3] = [0.48145466, 0.4578275, 0.40821073];
 const STD: [f32; 3] = [0.26862954, 0.26130258, 0.27577711];
 
 impl ClipIqa {
-    pub fn load(intra_threads: usize) -> Result<Self> {
-        let builder = Session::builder().map_err(crate::ai::ort_err)?;
-        let session = builder
-            .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)
-            .map_err(crate::ai::ort_err)?
-            .with_intra_threads(intra_threads)
-            .map_err(crate::ai::ort_err)?
-            .commit_from_file(format!("{}/clipiqa_model.onnx", crate::ai::MODELS_DIR))
-            .map_err(crate::ai::ort_err)?;
+    pub fn load(intra_threads: usize, use_gpu: bool) -> Result<Self> {
+        let session = crate::ai::build_session("clipiqa_model.onnx", intra_threads, use_gpu)?;
         Ok(Self { session })
     }
 

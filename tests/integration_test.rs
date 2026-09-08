@@ -108,13 +108,15 @@ fn test_dedup_integration_with_scores() {
         },
     ];
 
-    // 相同 dHash（同一场景）
+    // 相同 dHash（同一场景）；无姿态描述子（伪簇，行为与 M2 一致）
     let hashes = vec![0xAAAA_AAAA_AAAA_AAAAu64; 5];
     // 分数：B > C > A > E（D 不在连拍组）
     let scores: Vec<f64> = vec![70.0, 90.0, 80.0, 65.0, 60.0];
+    let descs: Vec<Option<[f32; 10]>> = vec![None; 5];
 
-    let params = DedupParams { keep_k: 2, ..Default::default() };
-    let infos = dedup::analyze_bursts(&entries, &hashes, &scores, &params);
+    // keep_k=2 + 关闭自适应保留：锁定 M2 语义回归
+    let params = DedupParams { keep_k: 2, adaptive_keep: false, ..Default::default() };
+    let infos = dedup::analyze_bursts(&entries, &hashes, &scores, &descs, &params);
 
     // 验证连拍分组：A、B、C、E 应属于同一组（时间间隔 ≤ 2s），D 应单独成组（后被单成员退化为 0）
     let burst_group_id = infos[0].group;

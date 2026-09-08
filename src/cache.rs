@@ -12,7 +12,9 @@ use anyhow::{Context, Result};
 use crate::score::{AnalysisResult, PixelScores};
 
 /// 缓存分析版本：评分参数（k 值/权重/模型）变化时递增
-pub const CACHE_VERSION: i64 = 12;
+///
+/// 13 = M9：缓存行增加姿态描述子（SCRFD 关键点），旧行全部失效重建
+pub const CACHE_VERSION: i64 = 13;
 
 /// 照片分析缓存
 pub struct ScoreCache {
@@ -66,20 +68,23 @@ impl ScoreCache {
                 aesthetic REAL NOT NULL,
                 dhash INTEGER NOT NULL,
                 faces INTEGER NOT NULL,
-                cfg_hash INTEGER NOT NULL DEFAULT 0
+                cfg_hash INTEGER NOT NULL DEFAULT 0,
+                pose_desc BLOB
             );",
         )?;
-        // 旧库迁移：早期版本没有 cfg_hash 列（补列失败说明已存在，忽略）
+        // 旧库迁移：缺列就补（失败说明已存在，忽略）
         let _ = conn.execute(
             "ALTER TABLE photo_cache ADD COLUMN cfg_hash INTEGER NOT NULL DEFAULT 0",
             [],
         );
+        let _ = conn.execute("ALTER TABLE photo_cache ADD COLUMN pose_desc BLOB", []);
 
         let rows = {
             let mut stmt = conn.prepare(
-                "SELECT path, size, mtime, version, sharpness, exposure, noise, composition, aesthetic, dhash, faces, cfg_hash FROM photo_cache",
+                "SELECT path, size, mtime, version, sharpness, exposure, noise, composition, aesthetic, dhash, faces, cfg_hash, pose_desc FROM photo_cache",
             )?;
             let iter = stmt.query_map([], |r| {
+                let pose_desc: Option<Vec<u8>> = r.get(12)?;
                 Ok((
                     r.get::<_, String>(0)?,
                     CacheRow {
@@ -96,6 +101,7 @@ impl ScoreCache {
                             },
                             dhash: r.get::<_, i64>(9)? as u64,
                             faces: r.get(10)?,
+                            pose_desc: pose_desc.as_deref().and_then(blob_to_desc),
                         },
                         cfg_hash: r.get(11)?,
                     },
@@ -144,10 +150,11 @@ impl ScoreCache {
         for path in &self.dirty {
             let Some(row) = self.rows.get(path) else { continue };
             let s = row.result.scores;
+            let pose_desc = row.result.pose_desc.map(desc_to_blob);
             tx.execute(
                 "INSERT OR REPLACE INTO photo_cache
-                    (path, size, mtime, version, sharpness, exposure, noise, composition, aesthetic, dhash, faces, cfg_hash)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                    (path, size, mtime, version, sharpness, exposure, noise, composition, aesthetic, dhash, faces, cfg_hash, pose_desc)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 rusqlite::params![
                     path,
                     row.size,
@@ -161,6 +168,7 @@ impl ScoreCache {
                     row.result.dhash as i64,
                     row.result.faces as i64,
                     row.cfg_hash,
+                    pose_desc,
                 ],
             )?;
         }
@@ -185,4 +193,25 @@ pub fn file_fingerprint(path: &Path) -> Option<(u64, i64)> {
         .ok()?
         .as_nanos() as i64;
     Some((meta.len(), mtime))
+}
+
+/// 姿态描述子 → BLOB（10 × f32 小端，40 字节）
+fn desc_to_blob(d: [f32; 10]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(40);
+    for v in d {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    out
+}
+
+/// BLOB → 姿态描述子；长度不符（损坏行）按 None 处理
+fn blob_to_desc(bytes: &[u8]) -> Option<[f32; 10]> {
+    if bytes.len() != 40 {
+        return None;
+    }
+    let mut d = [0.0f32; 10];
+    for (i, v) in d.iter_mut().enumerate() {
+        *v = f32::from_le_bytes([bytes[i * 4], bytes[i * 4 + 1], bytes[i * 4 + 2], bytes[i * 4 + 3]]);
+    }
+    Some(d)
 }

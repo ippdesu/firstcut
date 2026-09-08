@@ -102,7 +102,7 @@ impl Default for MetricParams {
     }
 }
 
-/// 连拍去重参数（M2）
+/// 连拍去重参数（M2/M9）
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DedupParams {
@@ -110,8 +110,19 @@ pub struct DedupParams {
     pub gap_secs: f64,
     /// dHash 汉明距离阈值：≤ 此值视为同一场景子簇
     pub dhash_threshold: u32,
-    /// 每个子簇保留前 K 张
+    /// 每个**保留单元**（M9 启用时为姿态簇，否则为 dHash 子簇）内保留前 K 张
     pub keep_k: usize,
+    /// M9：按 SCRFD 关键点姿态描述子自适应保留（在 dHash 子簇内再按姿势分簇，
+    /// 每个姿势簇各自保留 keep_k 张；false 回退为按 dHash 子簇保留）
+    pub adaptive_keep: bool,
+    /// M9：姿态聚类阈值——描述子（关键点按人脸框归一化的 10 维向量）
+    /// 欧氏距离 > 此值判为不同姿势。定标实测（M9，棚拍 18 帧同主体连拍）：
+    /// 同姿势两两距离 0.02~0.06、跨姿势 0.46~0.51，双峰清晰，0.25 居中；
+    /// 舞台（萤火虫）连拍姿态连续变化时无真空带，0.25 给出"瞬间"粒度。
+    pub pose_cluster_threshold: f64,
+    /// M9：单个连拍组的保留总量上限（姿态簇多时防止 90 帧连拍留几十张；
+    /// 超出按总分从高到低截断）
+    pub burst_group_cap: usize,
 }
 
 impl Default for DedupParams {
@@ -119,7 +130,11 @@ impl Default for DedupParams {
         DedupParams {
             gap_secs: 2.0,
             dhash_threshold: 10,
-            keep_k: 2,
+            // M9 决策：姿态簇内保留 3 张（用户定；表情成功率低的连拍留足备选）
+            keep_k: 3,
+            adaptive_keep: true,
+            pose_cluster_threshold: 0.25,
+            burst_group_cap: 20,
         }
     }
 }
@@ -130,6 +145,7 @@ impl Default for DedupParams {
 pub struct ScoreConfig {
     pub weights: ScoreWeights,
     pub metric: MetricParams,
+    pub dedup: DedupParams,
 }
 
 impl Default for ScoreConfig {
@@ -137,6 +153,7 @@ impl Default for ScoreConfig {
         ScoreConfig {
             weights: ScoreWeights::default(),
             metric: MetricParams::default(),
+            dedup: DedupParams::default(),
         }
     }
 }
@@ -289,7 +306,24 @@ pub fn config_template() -> String {
          rating_5 = {}\n\
          rating_4 = {}\n\
          rating_3 = {}\n\
-         rating_2 = {}\n",
+         rating_2 = {}\n\
+         \n\
+         # [dedup] 连拍去重（M9；只写想改的字段）\n\
+         # [dedup]\n\
+         # 时间间隔阈值（秒）：≤ 此值视为同一连拍组\n\
+         # gap_secs = {}\n\
+         # dHash 汉明距离阈值：≤ 此值视为同一场景子簇\n\
+         # dhash_threshold = {}\n\
+         # 每个保留单元内保留几张（M9 启用时保留单元 = 姿态簇）\n\
+         # keep_k = {}\n\
+         # M9 自适应保留：按头部姿态描述子在 dHash 子簇内再分姿势簇，\n\
+         #   每个姿势簇各自保留 keep_k 张；false 回退旧行为（按 dHash 子簇保留）\n\
+         # adaptive_keep = {}\n\
+         # 姿态聚类阈值（欧氏距离，> 此值判为不同姿势）：调小分簇更细、\n\
+         #   保留更多；调大更宽容、接近旧行为\n\
+         # pose_cluster_threshold = {}\n\
+         # 单个连拍组保留总量上限（超出按总分截断），防止长连拍留几十张\n\
+         # burst_group_cap = {}\n",
         c.weights.sharpness,
         c.weights.exposure,
         c.weights.noise,
@@ -312,6 +346,12 @@ pub fn config_template() -> String {
         c.metric.rating_4,
         c.metric.rating_3,
         c.metric.rating_2,
+        c.dedup.gap_secs,
+        c.dedup.dhash_threshold,
+        c.dedup.keep_k,
+        c.dedup.adaptive_keep,
+        c.dedup.pose_cluster_threshold,
+        c.dedup.burst_group_cap,
     )
 }
 

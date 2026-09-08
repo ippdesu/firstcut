@@ -55,7 +55,7 @@ fn main() -> Result<()> {
         eprintln!("用法: pic_process-debug-exposure <JPG路径> ...");
         std::process::exit(2);
     }
-    let mut scrfd = Scrfd::load(4)?;
+    let mut scrfd = Scrfd::load(4, false)?;
 
     for path in &paths {
         let Some(img) = decode::load_analysis_image(std::path::Path::new(path))? else {

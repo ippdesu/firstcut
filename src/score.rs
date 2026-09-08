@@ -32,21 +32,28 @@ pub struct AiEngine {
 const AI_POOL_SIZE: usize = 1;
 
 impl AiEngine {
-    /// 加载全部 AI 模型；模型缺失时返回错误（含下载指引）
-    pub fn load() -> anyhow::Result<Self> {
+    /// 加载全部 AI 模型；模型缺失时返回错误（含下载指引）。
+    /// `use_gpu`：实验性 DirectML（仅 `--features gpu` 构建生效）。
+    pub fn load(use_gpu: bool) -> anyhow::Result<Self> {
         ai::ensure_models()?;
         let intra = std::thread::available_parallelism()
             .map(|n| (n.get() / AI_POOL_SIZE).max(1))
             .unwrap_or(1);
         Ok(AiEngine {
             iqa: Some(SessionPool::new(
-                (0..AI_POOL_SIZE).map(|_| ClipIqa::load(intra)).collect::<anyhow::Result<_>>()?,
+                (0..AI_POOL_SIZE)
+                    .map(|_| ClipIqa::load(intra, use_gpu))
+                    .collect::<anyhow::Result<_>>()?,
             )),
             face: Some(SessionPool::new(
-                (0..AI_POOL_SIZE).map(|_| Scrfd::load(intra)).collect::<anyhow::Result<_>>()?,
+                (0..AI_POOL_SIZE)
+                    .map(|_| Scrfd::load(intra, use_gpu))
+                    .collect::<anyhow::Result<_>>()?,
             )),
             pose: Some(SessionPool::new(
-                (0..AI_POOL_SIZE).map(|_| PoseDet::load(intra)).collect::<anyhow::Result<_>>()?,
+                (0..AI_POOL_SIZE)
+                    .map(|_| PoseDet::load(intra, use_gpu))
+                    .collect::<anyhow::Result<_>>()?,
             )),
         })
     }
@@ -73,6 +80,9 @@ pub struct AnalysisResult {
     pub scores: PixelScores,
     pub dhash: u64,
     pub faces: usize,
+    /// M9 头部姿态描述子：最大主体级人脸的 5 个 SCRFD 关键点按人脸框归一化
+    /// （对位置/尺度不变），连拍组内聚类"不同姿势"用。None = 无主体级人脸。
+    pub pose_desc: Option<[f32; 10]>,
 }
 
 /// 加权总分（0-100，1 位小数）
@@ -83,6 +93,24 @@ pub fn total_score(s: &PixelScores, w: &ScoreWeights) -> f64 {
         + s.composition * w.composition
         + s.aesthetic * w.aesthetic;
     (total * 10.0).round() / 10.0
+}
+
+/// M9 头部姿态描述子：把 SCRFD 的 5 个关键点按人脸框归一化（10 维）。
+///
+/// 各分量 = (关键点坐标 − 人脸框左上) / 人脸框宽高，因此对照片中的
+/// 位置与尺度不变——同一张脸转动头部/变化表情时关键点相对框的位置
+/// 会移动，这正是连拍内区分"不同姿势"需要的几何量。
+/// 框退化（宽或高为 0）时返回 None。
+pub fn pose_descriptor(f: &crate::ai::facedetect::FaceBox) -> Option<[f32; 10]> {
+    if f.w <= 1e-4 || f.h <= 1e-4 {
+        return None;
+    }
+    let mut desc = [0.0f32; 10];
+    for (j, p) in f.kps.iter().enumerate() {
+        desc[j * 2] = (p.0 - f.x) / f.w;
+        desc[j * 2 + 1] = (p.1 - f.y) / f.h;
+    }
+    Some(desc)
 }
 
 /// 分析结果 + 缓存统计
@@ -196,6 +224,8 @@ pub fn analyze_one(
     // 用最亮者避免个别阴影中的脸压低整张照片；
     // 且 exposure_score 内部还会把它夹在"全图 ~ 中灰"之间，保证只做单向修正。
     let mut subject_luma: Option<f64> = None;
+    // M9：最大主体级人脸（连拍姿态描述子的来源）
+    let mut subject_face: Option<crate::ai::facedetect::FaceBox> = None;
 
     if let Some(m) = &ai.iqa {
         aesthetic = m.acquire().score(&img.rgb, img.width, img.height).unwrap_or(60.0);
@@ -234,6 +264,7 @@ pub fn analyze_one(
                         &img.luma, img.width, img.height, cx, cy, half_w, half_h,
                     );
                     sharpness_region = Some(metrics::sharpness::region_sharpness_score(reblur));
+                    subject_face = Some(*biggest);
                 }
             }
             Err(err) => {
@@ -305,5 +336,6 @@ pub fn analyze_one(
         },
         dhash,
         faces,
+        pose_desc: subject_face.as_ref().and_then(pose_descriptor),
     }))
 }

@@ -35,6 +35,11 @@ path = "src/bin/probe.rs"
 name = "pic_process-debug-exposure"
 path = "src/bin/debug_exposure.rs"
 
+[features]
+# 实验性 DirectML GPU 推理（score --gpu）。默认关闭：
+# 不改变"主二进制静态链接、单文件免 DLL"的交付承诺。
+gpu = ["ort/directml"]
+
 [dependencies]
 anyhow = "1"
 base64 = "0.23"
