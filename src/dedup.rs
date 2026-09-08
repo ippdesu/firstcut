@@ -353,6 +353,7 @@ mod tests {
             burst_size: String::new(),
             burst_rank: String::new(),
             burst_keep: String::new(),
+            burst_pose: String::new(),
         }
     }
 

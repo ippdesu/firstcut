@@ -5,8 +5,8 @@
 >
 > **当前状态**：
 > - 第 1 轮（GLM → DSH，2026-09-08）**13 项全部核实为真、全部已修复**（main `b477c96`，测试 26 → 37 单元 + 6 集成）。
-> - 第 2 轮（DSH → GLM，2026-09-09）**M9 / M-UI1 验收：6 项遗漏待 GLM 修复**（M9/UI 主体实现无功能性错误）。
-> - 当前测试基线：**46 单元 + 6 集成**全过。
+> - 第 2 轮（DSH → GLM，2026-09-09）**M9 / M-UI1 验收：6 项遗漏 → 全部已修复**（分支 `fix/v2-review-acceptance`，M9/UI 主体实现无功能性错误）。
+> - 当前测试基线：**47 单元 + 6 集成**全过。
 
 ## 追加新一轮评审的格式
 
@@ -25,12 +25,12 @@
 
 | 编号 | 问题 | 核实 | 状态 |
 |---|---|---|---|
-| V2-1 | `pic_process review` 子命令**不存在**（文档/注释 7 处声称有） | ✅ 成立：实测 `error: unrecognized subcommand 'review'` | ⏳ 待修 |
-| V2-2 | `[dedup] keep_k` 是**死配置**（被 CLI 默认值覆盖），且与 review 行为不一致 | ✅ 成立：keep_k=1 与 3 结果完全相同 | ⏳ 待修 |
-| V2-3 | M9 的 `pose_cluster` **没进 CSV**，只能在 review 界面看到 | ✅ 成立：CSV 表头无该列 | ⏳ 待修 |
-| V2-4 | `release_notes.md` 测试数 42，实际 46 | ✅ 成立 | ⏳ 待修 |
-| V2-5 | `.firstcut/`（缩略图缓存）未加入 `.gitignore` | ✅ 成立 | ⏳ 待修 |
-| V2-6 | `resolve_under` 用子串判断 `..`，误伤合法文件名 | ✅ 成立：`sub/a..b.jpg` 被 403 | ⏳ 待修 |
+| V2-1 | `pic_process review` 子命令**不存在**（文档/注释 7 处声称有） | ✅ 成立：实测 `error: unrecognized subcommand 'review'` | ✅ 已修：`main.rs` 加 `Review` 子命令委托 `review::serve`；独立 `pic_process-review` 二进制移除（单一入口）；实测 `pic_process review scale_test --no-browser` 起服务、API 200 |
+| V2-2 | `[dedup] keep_k` 是**死配置**（被 CLI 默认值覆盖），且与 review 行为不一致 | ✅ 成立：keep_k=1 与 3 结果完全相同 | ✅ 已修：`-k` 改 `Option<usize>`，抽 `config::effective_dedup`（score 与 review 共用）；实测 testpic 默认 17 张保留 / 配置 keep_k=1 → 11 / `-k 1` → 11（配置生效且与 CLI 一致）；单测三断言 |
+| V2-3 | M9 的 `pose_cluster` **没进 CSV**，只能在 review 界面看到 | ✅ 成立：CSV 表头无该列 | ✅ 已修：`PhotoEntry` 加 `burst_pose` 列，`apply_burst` 填充；实测表头含该列 |
+| V2-4 | `release_notes.md` 测试数 42，实际 46 | ✅ 成立 | ✅ 已修：与最终基线 47 对齐（本轮新增 1 项单测） |
+| V2-5 | `.firstcut/`（缩略图缓存）未加入 `.gitignore` | ✅ 成立 | ✅ 已修：加 `.firstcut/`（不带根锚定——照片根可能在仓库任意子目录）；`/review/` 根锚定确认不会误伤 `src/review/` |
+| V2-6 | `resolve_under` 用子串判断 `..`，误伤合法文件名 | ✅ 成立：`sub/a..b.jpg` 被 403 | ✅ 已修：改按 `Path::components()` 判断（`ParentDir`/`Prefix` 段拒绝、`has_root()` 拒绝），canonicalize 包含判断保留为最后安全网；单测覆盖 `a..b.jpg` 放行、`..` 段/盘符/UNC/根锚定全部拒绝 |
 
 **验收通过、无需改动的项**：M9 姿态描述子与聚类（含组上限、开关回退、无描述子伪簇）、SCRFD kps 解码（格中心 + offset×stride，与 insightface 一致）、缓存 BLOB 迁移与 CACHE_VERSION 13、`analysis_ok` 列与失败清单、`--gpu`（`--features gpu` 实测可构建，默认构建显式报错）、review 快照与 score CSV 逐张一致（实测 16/16 无差异）、路径越界防护（3 类攻击全部 403）、JPG 白名单、前端过滤 ARW、46 单元 + 6 集成测试全过。
 
@@ -84,8 +84,13 @@
 
 - `/image` 每次返回原图（实测单张 19MB）且无缓存头，灯箱反复打开会重复传输；
   本地服务影响不大，可考虑 `Cache-Control: max-age` 或用分析级解码图。
+  → **已修**：`/thumb`、`/image` 加 `Cache-Control: private, max-age=3600`。
 - review 快照 JSON 未暴露 `analysis_ok`，前端只能把"未评分"和"解码失败"都显示为无分数。
+  → **不修**（有因）：缓存只存成功分析的结果，解码失败本就不入缓存，
+  review 在数据层面无法区分"未跑过"与"跑过但失败"；前端统一显示"未评分"是当前数据模型下的诚实表达。
+  若要区分，需把失败记录也写进缓存（新表），价值低，暂不做。
 - `P2_M0.md` 已在 `DESIGN.md:6` 登记为配套文档，但未在 README 的相关文档列表出现。
+  → **已修**：README 相关文档列表已补。
 
 
 

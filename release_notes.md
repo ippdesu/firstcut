@@ -27,6 +27,9 @@
 - **`score --gpu`**（需 `cargo build --release --features gpu`）：DirectML 推理。
   实测 119 张 16.7s vs CPU 17.4s——无显著收益，保持实验性、默认构建不含。
 - CSV 新增 `analysis_ok` 列（解码失败/无配对 ARW 可过滤），运行结束 stderr 输出失败清单。
+- CSV 新增 `burst_pose` 列（M9 姿态簇号，此前只能在 review 界面查看）。
+- **`pic_process review` 子命令**：复核界面从独立二进制并入主命令（`pic_process-review` 不再单独发布）。
+- `[dedup] keep_k` 配置真实生效（此前被 CLI `-k` 默认值覆盖成死配置）；`-k` 缺省时走配置，`review` 与 `score` 同配置结果一致。
 
 **🐛 缺陷修复**
 - **AI 预处理通道布局**：三模型输入通道错乱（已在 v1.1 修复）
@@ -51,7 +54,7 @@
 - **场景预设**：`config-template --preset portrait|stage|highkey|sports|lowlight`。
 - CSV 新增 `stars` 列。
 
-**🧪 测试**：42 单元测试 + 6 集成测试全过（含 EXIF 8 种方向、配对四种布局、配置校验、指纹收窄、M9 姿态聚类/组上限/开关回退）。
+**🧪 测试**：47 单元测试 + 6 集成测试全过（含 EXIF 8 种方向、配对四种布局、配置校验、指纹收窄、M9 姿态聚类/组上限/开关回退、-k 与 [dedup] 合成、复核路径安全）。
 
 ---
 

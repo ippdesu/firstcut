@@ -21,7 +21,6 @@ cargo build --release --features gpu
 | 二进制 | 用途 |
 |---|---|
 | `pic_process` | 主命令（`scan` / `score` / `config-template` / `review`） |
-| `pic_process-review` | 本地 Web 复核界面（缩略图墙 / 1:1 原图 / 连拍对比） |
 | `pic_process-tune` | 调参工具：导出原始指标 CSV |
 | `pic_process-gallery` | HTML 联系表生成器（缩略图 + 分数） |
 | `pic_process-debug-pose` | 诊断工具：YOLOv8-pose 检测验证 |
@@ -123,7 +122,7 @@ pic_process score <目录> --config stage.toml
 | `stars` | 星级 1-5（默认按**本批次相对排名**，见下） |
 | `faces` | SCRFD 检测到的人脸数 |
 | `analysis_ok` | 评分数据是否可用（解码失败/无配对 ARW 为 false，运行结束 stderr 也有失败清单） |
-| `burst_group, burst_size, burst_rank, burst_keep` | 连拍去重：组号、**保留单元内**张数、保留单元内排名、是否建议保留（`burst_keep` 只是建议标记，**工具永不删除/移动文件**） |
+| `burst_group, burst_size, burst_rank, burst_keep, burst_pose` | 连拍去重：组号、**保留单元内**张数、保留单元内排名、是否建议保留、M9 姿态簇号（`burst_keep` 只是建议标记，**工具永不删除/移动文件**） |
 
 **XMP 侧车**（`--xmp`）：写 `<stem>.xmp`（如 `DSC00001.xmp`），含
 `xmp:Rating`（1-5 星）+ `firstcut:` 命名空间（五维子分/人脸/连拍信息）。
@@ -243,11 +242,11 @@ presets/                  # 场景预设（编译进二进制，config-template 
 ## 测试
 
 ```bash
-cargo test --lib                    # 单元测试（46 项）
+cargo test --lib                    # 单元测试（47 项）
 cargo test --test integration_test  # 集成测试（6 项，需要 testpic/）
 ```
 
-- **单元测试** 46 项（`cargo test --lib`）：
+- **单元测试** 47 项（`cargo test --lib`）：
   - `dedup` 11 项（datetime 解析、闰年/平年、严格 dHash、连拍分组、dHash 距离切分、
     空时间无连拍、无描述子退化 M2、M9 姿态分簇各自保留、阈值种子聚类、
     组上限截断、姿态距离值）
@@ -256,8 +255,8 @@ cargo test --test integration_test  # 集成测试（6 项，需要 testpic/）
     两侧容差独立、主体感知单向修正、暗背景救回、剪裁惩罚）
   - `output::xmp` 5 项（绝对阈值分档、XMP 关键字段、相对分档百分位、
     同分并列同星、absolute 模式）
-  - `config` 7 项（预设可加载、未知预设名、未知字段拒绝、star_mode 校验、
-    百分位递增校验、权重和校验、指纹只覆盖缓存输入）
+  - `config` 8 项（预设可加载、未知预设名、未知字段拒绝、star_mode 校验、
+    百分位递增校验、权重和校验、指纹只覆盖缓存输入、-k 与 [dedup] 合成）
   - `scan` 6 项（配对键含目录、侧车命名保留大小写、同目录配对、
     跨目录配对、编号回绕不合并、歧义不配对）
   - `decode` 1 项（8 种 EXIF Orientation 像素变换）
@@ -271,6 +270,7 @@ cargo test --test integration_test  # 集成测试（6 项，需要 testpic/）
 - [`DESIGN.md`](DESIGN.md) — 设计文档（技术选型、评分引擎、Phase 2 规划）
 - [`release_notes.md`](release_notes.md) — 版本说明
 - [`REVIEW.md`](REVIEW.md) — 外部评审记录与处理状态（长期累积，每轮评审追加）
+- [`P2_M0.md`](P2_M0.md) — Phase 2 环境验证清单（darktable / neural restore / lensfun 实测）
 - [`M5_REVIEW.md`](M5_REVIEW.md) — M5 调参决策历史（已落地，存档备查）
 
 ## Phase 2（规划中，未实现）

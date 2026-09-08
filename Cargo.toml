@@ -12,10 +12,6 @@ name = "pic_process"
 path = "src/main.rs"
 
 [[bin]]
-name = "pic_process-review"
-path = "src/bin/review.rs"
-
-[[bin]]
 name = "pic_process-tune"
 path = "src/bin/tune.rs"
 

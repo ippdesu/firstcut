@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use pic_process::cache::ScoreCache;
 use pic_process::config::{DedupParams, ScoreConfig, ScoreWeights};
@@ -34,8 +34,9 @@ enum Commands {
         #[arg(short, long, default_value = "report.csv")]
         output: PathBuf,
         /// 连拍保留单元（姿态簇/dHash 子簇）内保留前 K 张
-        #[arg(short, long, default_value_t = 3)]
-        keep: usize,
+        /// （缺省用 `[dedup] keep_k` 配置，默认 3）
+        #[arg(short, long)]
+        keep: Option<usize>,
         /// 跳过 AI 推理（无模型时快速预览）
         #[arg(long)]
         no_ai: bool,
@@ -64,6 +65,23 @@ enum Commands {
         /// 输出内置场景预设而非通用模板（portrait/stage/highkey/sports/lowlight）
         #[arg(long, value_name = "名称")]
         preset: Option<String>,
+    },
+    /// 本地 Web 复核界面（缩略图墙 / 1:1 原图 / 连拍对比，浏览器打开）
+    Review {
+        /// 已用 score 评分过的照片目录
+        dir: PathBuf,
+        /// 评分配置（与 score 相同的 TOML；影响总分/星级/连拍划分）
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// 增量缓存文件（应与 score 用的同一份）
+        #[arg(long, default_value = "pic_process_cache.sqlite")]
+        cache: PathBuf,
+        /// 监听端口（仅绑定 127.0.0.1）
+        #[arg(long, default_value_t = 8787)]
+        port: u16,
+        /// 不自动打开浏览器
+        #[arg(long)]
+        no_browser: bool,
     },
 }
 
@@ -168,8 +186,9 @@ fn main() -> Result<()> {
             }
 
             // 3) 连拍去重（只针对有分析的 JPG）；
-            //    去重参数：CLI -k 覆盖配置的 keep_k，其余来自 [dedup]
-            let dedup_params = DedupParams { keep_k: keep, ..cfg.dedup };
+            //    去重参数：CLI -k（显式给出时）覆盖配置的 keep_k，其余来自 [dedup]。
+            //    review 界面走同一合成函数，同配置下两处结果一致
+            let dedup_params = pic_process::config::effective_dedup(keep, &cfg);
             let burst_info =
                 run_burst_analysis(&mut entries, &outcome.results, &dedup_params, &cfg.weights);
 
@@ -263,6 +282,20 @@ fn main() -> Result<()> {
             pic_process::output::csv::write_csv(&output, &entries)?;
             eprintln!("[score] CSV 已写出: {}", output.display());
         }
+        Commands::Review { dir, config, cache, port, no_browser } => {
+            // 与 score 相同的 fail-fast 配置加载
+            let cfg = match &config {
+                Some(path) => pic_process::config::load_config(path).map_err(|err| {
+                    anyhow::anyhow!("配置加载失败: {}\n{err:#}", path.display())
+                })?,
+                None => ScoreConfig::default(),
+            };
+            if config.is_some() {
+                eprintln!("[review] 配置已加载: {}", config.as_ref().unwrap().display());
+            }
+            pic_process::review::serve(&dir, &cfg, &cache, port, !no_browser)
+                .with_context(|| "复核服务启动失败")?;
+        }
     }
     Ok(())
 }
@@ -304,6 +337,7 @@ fn apply_burst(e: &mut scan::PhotoEntry, info: &BurstInfo) {
     e.burst_size = if info.size == 0 { String::new() } else { info.size.to_string() };
     e.burst_rank = if info.rank == 0 { String::new() } else { info.rank.to_string() };
     e.burst_keep = if info.size == 0 { String::new() } else { info.keep.to_string() };
+    e.burst_pose = if info.size == 0 { String::new() } else { info.pose_cluster.to_string() };
 }
 
 fn fmt(v: f64) -> String {

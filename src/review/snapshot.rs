@@ -97,8 +97,8 @@ pub fn build_snapshot(root: &Path, cfg: &ScoreConfig, cache_path: &Path) -> anyh
         .collect();
     let ratings = output::xmp::assign_ratings(&rated, &cfg.metric);
 
-    // 连拍：与 score 同一函数（含 M9 姿态聚类）
-    let dedup_params = cfg.dedup;
+    // 连拍：与 score 同一函数 + 同一参数合成（V2-2，保证两处逐张一致）
+    let dedup_params = crate::config::effective_dedup(None, cfg);
     let burst_map = score::analyze_photo_bursts(&entries, &analyzed, &dedup_params, &cfg.weights);
 
     let mut photos: Vec<PhotoJson> = entries
@@ -152,15 +152,30 @@ fn rel_path(root: &Path, p: &Path) -> String {
         .unwrap_or_else(|_| p.display().to_string().replace('\\', "/"))
 }
 
-/// 从快照根目录解析 `p` 参数：越界（`..`、盘符、根外）一律拒绝。
+/// 从快照根目录解析 `p` 参数：越界（`..` 段、盘符/UNC/根锚定、根外）一律拒绝。
 ///
+/// 按路径**段**判断而不是子串——文件名含 `..` 的合法照片（如 `a..b.jpg`）
+/// 不能被误伤（V2-6）。canonicalize 后的包含判断是最后一道安全网。
 /// 返回可用于读文件的真实路径；canonicalize 要求文件存在。
 pub fn resolve_under(root: &Path, p: &str) -> Option<PathBuf> {
     let p = p.trim();
-    if p.is_empty() || p.contains("..") || p.contains(':') || p.starts_with('/') {
+    if p.is_empty() {
         return None;
     }
-    let full = root.join(p);
+    let rel = Path::new(p);
+    if rel.has_root() {
+        // 覆盖 /xxx、C:/xxx、\\server\share 等一切根锚定形态
+        return None;
+    }
+    for comp in rel.components() {
+        match comp {
+            std::path::Component::ParentDir => return None,
+            // Windows 盘符前缀（如 C:foo 不带根也指向别的卷的当前目录）
+            std::path::Component::Prefix(_) => return None,
+            _ => {}
+        }
+    }
+    let full = root.join(rel);
     let canonical = full.canonicalize().ok()?;
     let root_canonical = root.canonicalize().ok()?;
     if canonical.starts_with(&root_canonical) { Some(canonical) } else { None }
@@ -176,17 +191,22 @@ mod tests {
         let sub = dir.join("sub");
         std::fs::create_dir_all(&sub).unwrap();
         std::fs::write(sub.join("a.jpg"), b"x").unwrap();
+        // 文件名含 .. 的合法照片不能被误伤（V2-6）
+        std::fs::write(sub.join("a..b.jpg"), b"x").unwrap();
 
         // 存在的合法路径
         let ok = resolve_under(&dir, "sub/a.jpg").map(|p| p.display().to_string());
         assert!(ok.is_some(), "根内路径应可解析");
+        let dots = resolve_under(&dir, "sub/a..b.jpg").map(|p| p.display().to_string());
+        assert!(dots.is_some(), "文件名含 .. 是合法的，不应 403");
 
         // 越界、绝对路径、盘符、空串
         assert!(resolve_under(&dir, "../outside.jpg").is_none());
-        assert!(resolve_under(&dir, "C:/Windows/win.ini").is_none());
-        assert!(resolve_under(&dir, "/etc/passwd").is_none());
+        assert!(resolve_under(&dir, "sub/../a.jpg").is_none(), ".. 段一律拒绝");
+        assert!(resolve_under(&dir, "C:/Windows/win.ini").is_none(), "盘符绝对路径拒绝");
+        assert!(resolve_under(&dir, "\\\\server\\share\\x.jpg").is_none(), "UNC 拒绝");
+        assert!(resolve_under(&dir, "/etc/passwd").is_none(), "根锚定拒绝");
         assert!(resolve_under(&dir, "").is_none());
-        assert!(resolve_under(&dir, "sub/../a.jpg").is_none(), "含 .. 一律拒绝");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

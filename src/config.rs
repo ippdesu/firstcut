@@ -103,7 +103,7 @@ impl Default for MetricParams {
 }
 
 /// 连拍去重参数（M2/M9）
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DedupParams {
     /// 时间聚类间隔阈值（秒）：间隔 ≤ 此值视为同一连拍组
@@ -155,6 +155,17 @@ impl Default for ScoreConfig {
             metric: MetricParams::default(),
             dedup: DedupParams::default(),
         }
+    }
+}
+
+/// CLI `-k` 与 `[dedup]` 配置的合成：`-k` **显式给出**时才覆盖 `keep_k`，
+/// 其余参数一律来自配置。`score` 与 `review` 都走这里——
+/// 此前 `-k` 带 CLI 默认值会把配置里的 keep_k 静默覆盖成死配置
+/// （V2-2，M6-4 同类："配置写了但不生效"）。
+pub fn effective_dedup(keep: Option<usize>, cfg: &ScoreConfig) -> DedupParams {
+    match keep {
+        Some(k) => DedupParams { keep_k: k, ..cfg.dedup },
+        None => cfg.dedup,
     }
 }
 
@@ -450,8 +461,7 @@ mod tests {
     /// 配置指纹只覆盖影响缓存值的曲线参数：
     /// 改权重/星级阈值不应触发全量重算，改曲线参数必须触发
     #[test]
-    fn fingerprint_covers_only_cached_inputs() {
-        let base = ScoreConfig::default();
+    fn fingerprint_covers_only_cached_inputs() {        let base = ScoreConfig::default();
         let fp = config_fingerprint(&base);
 
         let mut w = ScoreConfig::default();
@@ -470,5 +480,26 @@ mod tests {
         let mut e = ScoreConfig::default();
         e.metric.exposure_target = 130.0;
         assert_ne!(config_fingerprint(&e), fp, "改曝光目标应改变指纹");
+    }
+
+    /// -k 与 [dedup] 的合成：显式 -k 覆盖 keep_k，缺省用配置（V2-2 死配置修复）
+    #[test]
+    fn effective_dedup_merges_cli_and_config() {
+        let mut cfg = ScoreConfig::default();
+        cfg.dedup.keep_k = 1;
+        cfg.dedup.burst_group_cap = 7;
+
+        // 缺省 -k：完全用配置（保持 cap 等其余字段）
+        let d = effective_dedup(None, &cfg);
+        assert_eq!(d.keep_k, 1, "配置的 keep_k 必须生效（不再被 CLI 默认值覆盖）");
+        assert_eq!(d.burst_group_cap, 7);
+
+        // 显式 -k：只覆盖 keep_k
+        let d = effective_dedup(Some(5), &cfg);
+        assert_eq!(d.keep_k, 5);
+        assert_eq!(d.burst_group_cap, 7, "其余字段仍来自配置");
+
+        // review 路径（直接用配置）与 score 缺省路径结果一致
+        assert_eq!(effective_dedup(None, &cfg), cfg.dedup);
     }
 }

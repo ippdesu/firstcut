@@ -129,7 +129,16 @@ fn resolve_jpeg(state: &AppState, p: &str) -> std::result::Result<PathBuf, Respo
 }
 
 fn jpeg_response(bytes: Vec<u8>) -> Response {
-    (AppendHeaders([(header::CONTENT_TYPE, "image/jpeg")]), bytes).into_response()
+    // 缩略图/原图内容只随文件变化；本地服务给 1h 缓存，
+    // 灯箱反复开关不再重复传输几十 MB 原图（DSH 第 2 轮附带观察）
+    (
+        AppendHeaders([
+            (header::CONTENT_TYPE, "image/jpeg"),
+            (header::CACHE_CONTROL, "private, max-age=3600"),
+        ]),
+        bytes,
+    )
+        .into_response()
 }
 
 fn internal_error(err: anyhow::Error) -> Response {

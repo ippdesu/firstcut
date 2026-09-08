@@ -48,12 +48,14 @@ pub struct PhotoEntry {
     // ---- 连拍去重字段（score 子命令填充）----
     /// 连拍组号（0 = 非连拍）
     pub burst_group: String,
-    /// 组内照片数
+    /// 保留单元内张数
     pub burst_size: String,
-    /// 子簇内排名（1 = 最优）
+    /// 保留单元内排名（1 = 最优）
     pub burst_rank: String,
     /// 是否建议保留（true/false）
     pub burst_keep: String,
+    /// M9 姿态簇号（组内从 1 起；0 = 未启用自适应保留；非连拍为空）
+    pub burst_pose: String,
 }
 
 /// 是否为支持的照片文件扩展名

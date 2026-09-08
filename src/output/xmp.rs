@@ -194,6 +194,7 @@ mod tests {
             burst_size: "2".into(),
             burst_rank: "1".into(),
             burst_keep: "true".into(),
+            burst_pose: "1".into(),
         }
     }
 
