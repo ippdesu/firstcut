@@ -48,7 +48,16 @@ exposure_ev_hi = 2
 #   主体脸区域均值，把判定亮度往中灰方向拉（夹在「全图 ~ 中灰」之间，
 #   不越过中灰），再按此权重混合。设为 0 则只看全图（适合无主体人脸的题材）。
 exposure_subject_blend = 0.5
-# 星级分档：总分 ≥ 阈值得对应星数（XMP xmp:Rating，Lightroom 可读）
+# 星级分档：
+#   mode = 「relative」（默认）按**本次批次的相对排名**给星，保证每批都有区分度；
+#   mode = 「absolute」用下面的总分阈值（跨批次可比，但实测一批照片容易全落在 4~5 星）。
+# relative 模式的百分位分界（0 = 最好；同分并列取平均位次，不会被拆开）
+star_mode = "relative"
+star_five_pct = 10
+star_four_pct = 30
+star_three_pct = 65
+star_two_pct = 90
+# absolute 模式的总分阈值（总分 ≥ 阈值得对应星数）
 rating_5 = 75
 rating_4 = 60
 rating_3 = 45

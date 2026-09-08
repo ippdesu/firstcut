@@ -4,9 +4,9 @@ use pic_process::cache::ScoreCache;
 use pic_process::config::{DedupParams, ScoreConfig, ScoreWeights};
 use pic_process::dedup::{self, BurstInfo};
 use pic_process::output;
-use pic_process::scan::{self, stem_of};
+use pic_process::scan::{self};
 use pic_process::score::{self, AiEngine, AnalysisResult};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -160,38 +160,58 @@ fn main() -> Result<()> {
 
             // 3) 连拍去重（只针对有分析的 JPG）
             let dedup_params = DedupParams { keep_k: keep, ..Default::default() };
-            let burst_info = run_burst_analysis(&mut entries, &outcome.results, &dedup_params);
+            let burst_info =
+                run_burst_analysis(&mut entries, &outcome.results, &dedup_params, &cfg.weights);
 
             // 4) 回填 JPG 分数 + 连拍信息
-            let by_stem: HashMap<String, AnalysisResult> = outcome.results;
+            let by_key: HashMap<String, AnalysisResult> = outcome.results;
             for e in entries.iter_mut().filter(|e| !e.is_raw) {
-                let stem = stem_of(&e.filename);
-                if let Some(r) = by_stem.get(&stem) {
+                let key = e.pair_key();
+                if let Some(r) = by_key.get(&key) {
                     apply_scores(e, &r.scores, r.faces, &cfg);
                 }
-                if let Some(info) = burst_info.get(&stem) {
+                if let Some(info) = burst_info.get(&key) {
                     apply_burst(e, info);
                 }
             }
-            // 5) JPG 结果映射到同名 ARW
+            // 5) JPG 结果映射到同名 ARW（同一目录下同名才算配对）
             for e in entries.iter_mut().filter(|e| e.is_raw) {
-                let stem = stem_of(&e.filename);
-                if let Some(r) = by_stem.get(&stem) {
+                let key = e.pair_key();
+                if let Some(r) = by_key.get(&key) {
                     apply_scores(e, &r.scores, r.faces, &cfg);
                 }
-                if let Some(info) = burst_info.get(&stem) {
+                if let Some(info) = burst_info.get(&key) {
                     apply_burst(e, info);
                 }
             }
 
-            // 6) XMP 星级侧车（可选）
+            // 6) 星级（批次内相对排名或绝对阈值，见 config.star_mode）
+            //    同一配对键的 JPG/ARW 共用同一星级
+            let rated: Vec<(String, f64)> = by_key
+                .iter()
+                .map(|(k, r)| (k.clone(), score::total_score(&r.scores, &cfg.weights)))
+                .collect();
+            let ratings = output::xmp::assign_ratings(&rated, &cfg.metric);
+            for e in entries.iter_mut() {
+                if let Some(st) = ratings.get(&e.pair_key()) {
+                    e.stars = st.to_string();
+                }
+            }
+
+            // 7) XMP 星级侧车（可选；同一配对键只写一次，JPG/ARW 共用）
             if xmp {
                 let mut written = 0usize;
                 let mut skipped = 0usize;
+                let mut seen: HashSet<String> = HashSet::new();
                 for e in &entries {
-                    if let Some(r) = by_stem.get(&stem_of(&e.filename)) {
+                    let key = e.pair_key();
+                    if !seen.insert(key.clone()) {
+                        continue;
+                    }
+                    if let Some(r) = by_key.get(&key) {
                         let total = score::total_score(&r.scores, &cfg.weights);
-                        match output::xmp::write_sidecar(e, &r.scores, total, &cfg.metric) {
+                        let rating = *ratings.get(&key).unwrap_or(&3);
+                        match output::xmp::write_sidecar(e, &r.scores, total, rating) {
                             Ok(true) => written += 1,
                             Ok(false) => skipped += 1,
                             Err(err) => eprintln!("[xmp] 写入失败 {}: {err:#}", e.path),
@@ -208,17 +228,18 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// 对 JPG 条目做连拍分析，返回 stem -> BurstInfo
+/// 对 JPG 条目做连拍分析，返回 配对键 -> BurstInfo
 fn run_burst_analysis(
     entries: &mut [scan::PhotoEntry],
     analyzed: &HashMap<String, AnalysisResult>,
     params: &DedupParams,
+    weights: &ScoreWeights,
 ) -> HashMap<String, BurstInfo> {
     // 取有分析的 JPG（保持扫描顺序）
     let jpg_idx: Vec<usize> = entries
         .iter()
         .enumerate()
-        .filter(|(_, e)| !e.is_raw && analyzed.contains_key(&stem_of(&e.filename)))
+        .filter(|(_, e)| !e.is_raw && analyzed.contains_key(&e.pair_key()))
         .map(|(i, _)| i)
         .collect();
     if jpg_idx.len() < 2 {
@@ -226,22 +247,20 @@ fn run_burst_analysis(
     }
     let jpg_entries: Vec<scan::PhotoEntry> =
         jpg_idx.iter().map(|&i| entries[i].clone()).collect();
-    let hashes: Vec<u64> = jpg_idx
-        .iter()
-        .map(|&i| analyzed[&stem_of(&entries[i].filename)].dhash)
-        .collect();
+    let hashes: Vec<u64> =
+        jpg_idx.iter().map(|&i| analyzed[&entries[i].pair_key()].dhash).collect();
     let scores: Vec<f64> = jpg_idx
         .iter()
         .map(|&i| {
-            let s = analyzed[&stem_of(&entries[i].filename)].scores;
-            score::total_score(&s, &ScoreWeights::default())
+            let s = analyzed[&entries[i].pair_key()].scores;
+            score::total_score(&s, weights)
         })
         .collect();
 
     let infos = dedup::analyze_bursts(&jpg_entries, &hashes, &scores, params);
     let mut map = HashMap::new();
     for (&idx, info) in jpg_idx.iter().zip(infos.iter()) {
-        map.insert(stem_of(&entries[idx].filename), info.clone());
+        map.insert(entries[idx].pair_key(), info.clone());
     }
     let burst_groups = infos.iter().filter(|i| i.group != 0).count();
     eprintln!(

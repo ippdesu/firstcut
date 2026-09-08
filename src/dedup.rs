@@ -254,6 +254,7 @@ mod tests {
             composition_score: String::new(),
             aesthetic_score: String::new(),
             total_score: String::new(),
+            stars: String::new(),
             faces: String::new(),
             burst_group: String::new(),
             burst_size: String::new(),

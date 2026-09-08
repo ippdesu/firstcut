@@ -33,7 +33,7 @@ impl Default for ScoreWeights {
 }
 
 /// 指标曲线参数 + 星级分档 + 曝光目标
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct MetricParams {
     /// 清晰度饱和常数：归一化清晰度 = k 时得 ~63 分
@@ -52,7 +52,17 @@ pub struct MetricParams {
     pub exposure_ev_hi: f64,
     /// 主体脸亮度在曝光判定中的权重（0 = 只看全图，1 = 只看主体脸）
     pub exposure_subject_blend: f64,
-    /// 星级分档阈值（总分 ≥ 各档位得对应星数）
+    /// 星级分档模式："relative"（批次内相对排名，默认）或 "absolute"（总分阈值）
+    pub star_mode: String,
+    /// relative 模式：5 星分界（批次内百分位，0 = 最好）
+    pub star_five_pct: f64,
+    /// relative 模式：4 星分界
+    pub star_four_pct: f64,
+    /// relative 模式：3 星分界
+    pub star_three_pct: f64,
+    /// relative 模式：2 星分界（其余为 1 星）
+    pub star_two_pct: f64,
+    /// absolute 模式：总分 ≥ 各档位得对应星数
     pub rating_5: f64,
     pub rating_4: f64,
     pub rating_3: f64,
@@ -77,6 +87,13 @@ impl Default for MetricParams {
             exposure_ev_lo: 4.0,
             exposure_ev_hi: 2.0,
             exposure_subject_blend: 0.5,
+            // M7 决策：星级默认按批次内相对排名（分数绝对值仍写进 CSV/XMP，
+            // 但星级保证每批都有区分度——实测绝对阈值下 119 张全落在 4~5 星）
+            star_mode: "relative".to_string(),
+            star_five_pct: 10.0,
+            star_four_pct: 30.0,
+            star_three_pct: 65.0,
+            star_two_pct: 90.0,
             rating_5: 75.0,
             rating_4: 60.0,
             rating_3: 45.0,
@@ -108,7 +125,7 @@ impl Default for DedupParams {
 }
 
 /// 完整评分配置
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct ScoreConfig {
     pub weights: ScoreWeights,
@@ -246,7 +263,16 @@ pub fn config_template() -> String {
          #   主体脸区域均值，把判定亮度往中灰方向拉（夹在「全图 ~ 中灰」之间，\n\
          #   不越过中灰），再按此权重混合。设为 0 则只看全图（适合无主体人脸的题材）。\n\
          exposure_subject_blend = {}\n\
-         # 星级分档：总分 ≥ 阈值得对应星数（XMP xmp:Rating，Lightroom 可读）\n\
+         # 星级分档：\n\
+         #   mode = 「relative」（默认）按**本次批次的相对排名**给星，保证每批都有区分度；\n\
+         #   mode = 「absolute」用下面的总分阈值（跨批次可比，但实测一批照片容易全落在 4~5 星）。\n\
+         # relative 模式的百分位分界（0 = 最好；同分并列取平均位次，不会被拆开）\n\
+         star_mode = \"{}\"\n\
+         star_five_pct = {}\n\
+         star_four_pct = {}\n\
+         star_three_pct = {}\n\
+         star_two_pct = {}\n\
+         # absolute 模式的总分阈值（总分 ≥ 阈值得对应星数）\n\
          rating_5 = {}\n\
          rating_4 = {}\n\
          rating_3 = {}\n\
@@ -264,6 +290,11 @@ pub fn config_template() -> String {
         c.metric.exposure_ev_lo,
         c.metric.exposure_ev_hi,
         c.metric.exposure_subject_blend,
+        c.metric.star_mode,
+        c.metric.star_five_pct,
+        c.metric.star_four_pct,
+        c.metric.star_three_pct,
+        c.metric.star_two_pct,
         c.metric.rating_5,
         c.metric.rating_4,
         c.metric.rating_3,

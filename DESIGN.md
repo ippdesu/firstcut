@@ -75,10 +75,11 @@ scan（读 EXIF 建索引，SQLite 增量）
 
 ## 5. XMP 输出约定
 
-- 为每张照片写侧车 `<stem>.<原扩展名>.xmp`（`DSC00001.ARW.xmp`、`DSC00001.JPG.xmp`），含 `xmp:Rating`（1-5 星，默认分档 75/60/45/30，可配）+ `firstcut:` 命名空间（5 维子分/人脸/连拍信息）。
+- 为每张照片写侧车 `<stem>.xmp`（`DSC00001.xmp`），含 `xmp:Rating`（1-5 星）+ `firstcut:` 命名空间（5 维子分/人脸/连拍信息）。同一 stem 的 JPG/ARW 共用一个侧车。
+- **命名兼容性（M7 已解决）**：`<stem>.xmp` 是 **Lightroom/ACR** 的约定，**darktable 也读**该格式（它自己的 `<stem>.<ext>.xmp` 也认，见 [darktable 文档](https://docs.darktable.org/usermanual/4.2/en/overview/sidecar-files/sidecar-import/)）→ 一份侧车两边通用。此前写成 `<stem>.<ext>.xmp`，Lightroom 读不到。
 - 他人侧车（无 firstcut 命名空间，如 LR 写的调色参数）**不覆盖**，只提示跳过。
-- ⚠️ **命名兼容性（未解决）**：`<stem>.<扩展名>.xmp` 是 **darktable** 的约定；**Lightroom/ACR 读的是 `<stem>.xmp`**（不带扩展名）。按 [darktable 官方文档](https://docs.darktable.org/usermanual/4.2/en/overview/sidecar-files/sidecar-import/)，darktable 两种都会读、Lightroom 只读后者 → **当前输出 Lightroom 读不到星级**。待决策：改 `<stem>.xmp` / 双写 / 加 `--xmp-naming` 开关。
-- CSV 每行：文件、拍摄时间、相机、ISO/光圈/快门、5 维子分、总分、人脸数、连拍组号、组内排名、建议操作。
+- **星级（M7）**：默认 `star_mode = "relative"`，按本次批次内百分位给星（10/30/65/90）。绝对阈值模式保留（`rating_5..2`）。理由见 §10。
+- CSV 每行：文件、拍摄时间、相机、ISO/光圈/快门、5 维子分、总分、**星级**、人脸数、连拍组号、组内排名、建议操作。
 
 ## 6. 项目结构
 
@@ -114,8 +115,9 @@ pic_process/
 - ✅ **M4 输出完善**：XMP 星级侧车（`<名>.<原扩展名>.xmp`，xmp:Rating + firstcut 子分，他人侧车保护）+ SQLite 增量缓存（size+mtime+版本键，二次运行 16/16 命中 0.78s；M6 追加配置指纹）
 - ✅ **M5 调参与验证**：性能优化（21.5s→10.6s/119张）、噪点 P15 修复、浅景深清晰度误判修复（主体感知三层链路：SCRFD 人脸区域 reblur → YOLOv8-pose 头部区域 → 50 中性下限）、人脸漏检换 SCRFD（检出 23→75/119）、gallery 联系表；**用户决策落地**：A=多场景配置文件（--config/config-template，权重+曲线+星级+曝光目标可配）、B=星级放宽 75/60/45/30、C=换 CLIPIQA（美学分布 26-76，区分度提升）
 - ✅ **M6 缺陷修复**（2026-07，见 §10 决策记录）：AI 预处理通道顺序 bug、EXIF 方向未处理、构图被贴纸脸/背景脸污染、曝光模型改为 EV 容差带 + 主体感知单向修正、缓存键缺配置指纹、场景预设落地
+- 🔄 **M7 交付与兼容**（2026-07，见 §10）：XMP 侧车命名改 Lightroom 约定、星级改批次内相对分档、配对键含目录、连拍排序用实际权重；**待办**：LR 真实导入验证、自适应连拍保留、ground truth 校准
 
-> 当前状态（Phase 1 完成 + M6 修复）：`pic_process score <目录> [--xmp] [--config x.toml] [--cache <文件>] [--no-ai] [-k N]`，21 项单元测试 + 6 项集成测试全过；CLIPIQA 冷跑 ~155ms/张（含 SCRFD+姿态）。
+> 当前状态（Phase 1 完成 + M6/M7 修复）：`pic_process score <目录> [--xmp] [--config x.toml] [--cache <文件>] [--no-ai] [-k N]`，26 项单元测试 + 6 项集成测试全过；CLIPIQA 冷跑 ~155ms/张（含 SCRFD+姿态）。
 
 ## 8. 风险与开放问题（当前状态）
 
@@ -123,7 +125,8 @@ pic_process/
 - **人脸检测**：~~YuNet~~ → **已定案：SCRFD 10g**（M5 切换，RuteNL/SCRFD-face-detection-ONNX，640×640、9 输出解码、阈值 0.3 + 贪心 NMS；119 张真实照片检出 23→75，M6 修 EXIF 方向后 109/119）。
 - **onnxruntime Windows GPU**：DirectML provider 支持 OK；无 GPU 时自动回落 CPU。AI_POOL_SIZE=1（Mutex 串行）——实测池化无收益（AI 非瓶颈且每 session 线程减半变慢）。
 - **权重校准**：默认权重 0.30/0.25/0.15/0.15/0.15（和=1.0，M5 决策 A：曝光 0.25 压欠曝虚高）；多场景用 `--config` 按需调整，内置 `presets/` 5 份（portrait/stage/highkey/sports/lowlight）。
-- **Lightroom 读 XMP 星级**：**实测缺口**。侧车命名当前是 darktable 约定（`<stem>.<ext>.xmp`），而 Lightroom 读 `<stem>.xmp`，因此现在 Lightroom 很可能读不到星级。要么改命名/双写，要么明确以 darktable 为侧车消费方。需要一次真实导入验证。
+- **Lightroom 读 XMP 星级**：命名已改为 LR 约定（`<stem>.xmp`），但**仍缺一次真实导入验证**（用户在 LR 里导入目录，确认星级/子分显示）。Phase 1 唯一没被实测过的交付物。
+- **配对键（M7 已修）**：此前所有索引/配对/侧车去重都只用"文件名主干"，而索尼编号在 DSC09999 后回绕 → 上万张跨目录必然出现同名文件，会让分数/连拍/侧车互相覆盖。现改为「目录 + 主干」配对键。
 - **遮挡脸/超大脸漏检**（未解决）：口罩/头盔遮挡时 SCRFD 置信度会掉到 0.2 附近，超大人脸特写也会漏检（PORTRAIT_TEST 0.117）。当前对评分的影响已通过"主体感知单向修正 + 构图只计主体脸"降级处理，未换模型。
 
 ## 9. Phase 2（远期）：批量 RAW 开发，替代 Lightroom 手动流程
@@ -206,6 +209,10 @@ pic_process/
 | M6-3 | 场景差异怎么落地 | 内置 **5 份场景预设**（`config-template --preset`），预设只调权重与 EV 容差 | 回应"不同场景要搞配置"的要求，避免把场景特例写进默认值 |
 | M6-4 | 换 `--config` 后结果不变 | 缓存键加入**配置指纹** | 此前是静默 bug：缓存命中直接返回旧的五维分数，用户会以为配置没生效 |
 | M6-5 | 如何验证曲线不是"拟合样片" | 单元测试断言 **sRGB↔EV 换算、容差带内满分、带外单调、两侧独立、单向修正** | 测试输入是合成码值而非真实照片，结论与样本集无关 |
+| M7-1 | 侧车命名 LR 读不到（实际是 darktable 约定） | 改为 `<stem>.xmp` | 该格式 LR/ACR 与 darktable **都能读**；一份侧车两边通用（用户确认最终用 LR） |
+| M7-2 | 绝对星级阈值失去区分度（119 张全落 4~5 星） | 默认改为**批次内相对分档**（10/30/65/90 百分位），绝对模式保留 | 各维度为防误杀都带中性地板，绝对分数下限被抬高；用户确认"批次内保持标准即可"。总分仍写 CSV，跨批次比较看分数 |
+| M7-3 | 同名文件跨目录互相覆盖 | 配对/索引键改为「目录 + 主干」 | 索尼编号 9999 回绕，上万张场景必然重名；实测两目录同名文件分数现已独立 |
+| M7-4 | 连拍排序用默认权重而非 `--config` 权重 | 传入实际权重 | 配置与结果不一致属静默 bug |
 
 ## 11. 交付方式
 

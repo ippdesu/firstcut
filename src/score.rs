@@ -15,7 +15,7 @@ use crate::config::{MetricParams, ScoreConfig, ScoreWeights};
 use crate::decode;
 use crate::dedup;
 use crate::metrics;
-use crate::scan::{PhotoEntry, stem_of};
+use crate::scan::PhotoEntry;
 
 /// AI 推理引擎（CLIPIQA + SCRFD + YOLOv8-pose 多 session 池，进程内共享）
 ///
@@ -128,7 +128,7 @@ pub fn analyze_jpgs(
                             && row.cfg_hash == cfg_hash
                         {
                             hits.fetch_add(1, Ordering::Relaxed);
-                            return Some((stem_of(&e.filename), row.result, None));
+                            return Some((e.pair_key(), row.result, None));
                         }
                     }
                 }
@@ -136,7 +136,7 @@ pub fn analyze_jpgs(
             let result = analyze_one(e, &cfg.metric, ai).ok().flatten()?;
             let row = crate::cache::file_fingerprint(Path::new(&e.path))
                 .map(|(size, mtime)| (e.path.clone(), size, mtime, result));
-            Some((stem_of(&e.filename), result, row))
+            Some((e.pair_key(), result, row))
         })
         .fold(
             || (HashMap::new(), Vec::new()),

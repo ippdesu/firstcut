@@ -107,20 +107,18 @@ pic_process score <目录> --config stage.toml
 | `camera_make, camera_model, lens_model` | 相机/镜头 |
 | `iso, f_number, shutter_speed, focal_length` | 曝光参数 |
 | `sharpness_score, exposure_score, noise_score, composition_score, aesthetic_score` | 五维子分（0-100） |
-| `total_score` | 加权总分（0-100） |
+| `total_score` | 加权总分（0-100，跨批次可比） |
+| `stars` | 星级 1-5（默认按**本批次相对排名**，见下） |
 | `faces` | SCRFD 检测到的人脸数 |
 | `burst_group, burst_size, burst_rank, burst_keep` | 连拍去重：组号、组内张数、组内排名、是否建议保留 |
 
-**XMP 侧车**（`--xmp`）：写 `<stem>.<原扩展名>.xmp`（如 `DSC00001.ARW.xmp`），
-含 `xmp:Rating`（1-5 星）+ `firstcut:` 命名空间（五维子分/人脸/连拍信息）。
+**XMP 侧车**（`--xmp`）：写 `<stem>.xmp`（如 `DSC00001.xmp`），含
+`xmp:Rating`（1-5 星）+ `firstcut:` 命名空间（五维子分/人脸/连拍信息）。
+同一 stem 的 JPG/ARW 共用一个侧车（分数本来就映射自 JPG）。
 **已有其他软件写的侧车不会被覆盖**（只提示跳过）。
 
-> ⚠️ **命名兼容性（重要）**：`<stem>.<扩展名>.xmp` 是 **darktable** 的约定。
-> Lightroom / Camera Raw 读的是 `<stem>.xmp`（不带扩展名）——按
-> [darktable 官方文档](https://docs.darktable.org/usermanual/4.2/en/overview/sidecar-files/sidecar-import/)，
-> darktable 两种都会读，Lightroom 只读后者。
-> 所以**当前输出 Lightroom 读不到星级**，需改用 `<stem>.xmp` 或双写；
-> 该决策待定（见 `DESIGN.md` §8）。
+> 命名兼容性：`<stem>.xmp` 是 **Lightroom / Camera Raw** 的约定，**darktable 也读**
+> 这种格式（它自己的 `<stem>.<扩展名>.xmp` 也认）。所以一份侧车两边都能用。
 
 ## 评分维度（默认权重，总和 1.0）
 
@@ -148,7 +146,24 @@ pic_process score <目录> --config stage.toml
    亮度，把判定值往中灰方向拉（最多拉到中灰，不会越过）。所以暗色/亮色误检框
    不会把正常照片打下去，同时暗背景/亮背景场景能被救回。
 
-**星级分档**（默认，可配置）：≥75→5★ / ≥60→4★ / ≥45→3★ / ≥30→2★ / 其余 1★
+**星级分档**：默认 `star_mode = "relative"`，按**本次批次内的相对排名**给星：
+
+| 星级 | 批次内百分位（0 = 最好） |
+|---|---|
+| 5★ | 前 10% |
+| 4★ | 10%~30% |
+| 3★ | 30%~65% |
+| 2★ | 65%~90% |
+| 1★ | 后 10% |
+
+为什么不用绝对阈值：各维度为了防止误杀都带中性地板（清晰度 50 保底、构图无主体
+60、曝光容差带），实测一批 119 张按绝对阈值全部落在 4~5 星，星级就失去了筛选作用。
+**总分仍原样写进 CSV/XMP**，跨批次比较看分数而不是星级。
+同分并列取平均位次，不会被拆成不同星级。
+想要绝对阈值就设 `star_mode = "absolute"`（阈值 `rating_5..2`，默认 75/60/45/30）。
+
+> 注意：星级依赖"批次"——建议**整场照片一次跑完**。分批跑不同子目录会各自归一化，
+> 星级之间不可比。
 
 **连拍去重**：拍摄时间间隔 ≤2s 成组 → dHash 汉明距离 ≤10 分簇 → 簇内按总分
 排序，`-k` 控制每簇保留数（默认 2），`burst_keep=true|false` 标记建议保留。
@@ -189,17 +204,19 @@ presets/                  # 场景预设（编译进二进制，config-template 
 ## 测试
 
 ```bash
-cargo test --lib                    # 单元测试（21 项）
+cargo test --lib                    # 单元测试（26 项）
 cargo test --test integration_test  # 集成测试（6 项，需要 testpic/）
 ```
 
-- **单元测试** 21 项（`cargo test --lib`）：
+- **单元测试** 26 项（`cargo test --lib`）：
   - `dedup` 6 项（datetime 解析、闰年/平年、严格 dHash、连拍分组、dHash 距离切分、空时间无连拍）
   - `metrics::composition` 4 项（无脸中性、三分法偏好、理想大小、微小人脸降分）
   - `metrics::exposure` 7 项（sRGB↔EV 换算、容差带内满分、带外单调衰减、
     两侧容差独立、主体感知单向修正、暗背景救回、剪裁惩罚）
-  - `output::xmp` 2 项（星级分档边界、XMP 关键字段）
+  - `output::xmp` 5 项（绝对阈值分档、XMP 关键字段、相对分档百分位、
+    同分并列同星、absolute 模式）
   - `config` 2 项（全部场景预设可加载且参数自洽、未知预设名返回 None）
+  - `scan` 2 项（配对键含目录、侧车命名保留大小写）
 - **集成测试** 6 项（`tests/integration_test.rs`）：端到端 pipeline 验证（扫描/配置/dedup/总分/星级映射/模板）
   - 依赖 `testpic/` 真实照片目录（已 gitignore，私人照片不入库）
   - 跑前需先准备好照片目录；纯克隆仓库运行该集成测试会 panic（`#[ignore]` 改造见 Phase 2 TODO）

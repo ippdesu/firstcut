@@ -33,6 +33,8 @@ pub struct PhotoEntry {
     pub composition_score: String,
     pub aesthetic_score: String,
     pub total_score: String,
+    /// 星级（1-5；relative 模式为批次内相对排名，absolute 模式为总分阈值）
+    pub stars: String,
     /// 检测到的人脸数
     pub faces: String,
     // ---- 连拍去重字段（score 子命令填充）----
@@ -72,6 +74,37 @@ pub fn stem_of(name: &str) -> String {
     }
 }
 
+/// 去掉扩展名、**保留原始大小写**的文件名（用于侧车命名）
+///
+/// 侧车文件名必须与原文件同名（如 `DSC00001.xmp`），不能小写化：
+/// 在大小写敏感的文件系统上 `dsc00001.xmp` 会被 Lightroom 视为不存在。
+pub fn stem_raw_of(name: &str) -> String {
+    match name.rfind('.') {
+        Some(idx) => name[..idx].to_string(),
+        None => name.to_string(),
+    }
+}
+
+/// 配对/索引键：所在目录 + 文件主干（均小写）
+///
+/// **不能只用文件名主干**：索尼文件名编号在 DSC09999 后回绕到 DSC00001，
+/// 上万张照片里不同目录必然出现同名文件；只按主干索引会让它们的
+/// 分数、连拍分组、XMP 侧车互相覆盖（后扫描的覆盖先扫描的）。
+pub fn pair_key(path: &Path, filename: &str) -> String {
+    let dir = path
+        .parent()
+        .map(|p| p.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    format!("{dir}|{}", stem_of(filename))
+}
+
+impl PhotoEntry {
+    /// 本条目用于配对/索引的键（目录 + 主干）
+    pub fn pair_key(&self) -> String {
+        pair_key(Path::new(&self.path), &self.filename)
+    }
+}
+
 /// 递归扫描目录，返回排序后的照片索引
 pub fn scan_directory(dir: &Path) -> Result<Vec<PhotoEntry>> {
     let mut files: Vec<PathBuf> = Vec::new();
@@ -86,17 +119,18 @@ pub fn scan_directory(dir: &Path) -> Result<Vec<PhotoEntry>> {
     }
     files.sort();
 
-    // 构建 stem -> 扩展名集合，用于 JPG/ARW 配对判断
+    // 构建 配对键 -> 扩展名集合，用于 JPG/ARW 配对判断
+    // （键含目录：不同目录下的同名文件不得互相配对）
     let mut stem_exts: HashMap<String, HashSet<String>> = HashMap::new();
     for p in &files {
         let name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
         stem_exts
-            .entry(stem_of(&name))
+            .entry(pair_key(p, &name))
             .or_default()
             .insert(extension_of(&name));
     }
-    let has_pair = |stem: &str, ext: &str| -> bool {
-        let Some(exts) = stem_exts.get(stem) else { return false };
+    let has_pair = |key: &str, ext: &str| -> bool {
+        let Some(exts) = stem_exts.get(key) else { return false };
         let is_jpg = exts.iter().any(|e| matches!(e.as_str(), "jpg" | "jpeg"));
         let is_arw = exts.contains("arw");
         match ext {
@@ -112,8 +146,8 @@ pub fn scan_directory(dir: &Path) -> Result<Vec<PhotoEntry>> {
             let name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
             let ext = extension_of(&name);
             let is_raw = is_raw_file(&name);
-            let stem = stem_of(&name);
-            let paired = has_pair(&stem, &ext);
+            let key = pair_key(p, &name);
+            let paired = has_pair(&key, &ext);
             let exif = read_exif(p);
             PhotoEntry {
                 path: p.display().to_string(),
@@ -163,4 +197,27 @@ fn read_exif(path: &Path) -> PhotoEntry {
     entry.shutter_speed = field(exif::Tag::ExposureTime, exif::In::PRIMARY);
     entry.focal_length = field(exif::Tag::FocalLength, exif::In::PRIMARY);
     entry
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 配对/索引键必须含目录：索尼编号在 9999 处回绕，不同目录会有同名文件
+    #[test]
+    fn pair_key_separates_directories() {
+        let a = pair_key(Path::new("roll1/DSC00001.JPG"), "DSC00001.JPG");
+        let b = pair_key(Path::new("roll2/DSC00001.JPG"), "DSC00001.JPG");
+        assert_ne!(a, b, "不同目录的同名文件不能共用键");
+        // 同一目录下大小写/扩展名不同仍视为同一张（JPG 与 ARW 配对）
+        assert_eq!(a, pair_key(Path::new("ROLL1/dsc00001.ARW"), "dsc00001.ARW"));
+    }
+
+    /// 侧车命名保留原始大小写
+    #[test]
+    fn stem_raw_keeps_case() {
+        assert_eq!(stem_raw_of("DSC00001.ARW"), "DSC00001");
+        assert_eq!(stem_of("DSC00001.ARW"), "dsc00001");
+        assert_eq!(stem_raw_of("noext"), "noext");
+    }
 }
