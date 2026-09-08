@@ -3,8 +3,10 @@
 > **本文件是长期评审记录**：每轮外部评审（GLM / 其他）的工单与处理状态都追加在这里，
 > 不再单开文件。原始工单保持原样，处理结论统一记在下面的「处理状态」表。
 >
-> **当前状态**：第 1 轮（GLM，2026-09-08）**13 项全部核实为真、全部已修复**，
-> 合入 main @ `b477c96`。测试 26 → **37 单元 + 6 集成**全过。
+> **当前状态**：
+> - 第 1 轮（GLM → DSH，2026-09-08）**13 项全部核实为真、全部已修复**（main `b477c96`，测试 26 → 37 单元 + 6 集成）。
+> - 第 2 轮（DSH → GLM，2026-09-09）**M9 / M-UI1 验收：6 项遗漏待 GLM 修复**（M9/UI 主体实现无功能性错误）。
+> - 当前测试基线：**46 单元 + 6 集成**全过。
 
 ## 追加新一轮评审的格式
 
@@ -13,6 +15,79 @@
 2. 在本文件末尾新增一节 `## 第 N 轮原始工单（<来源>，<日期>）`，原样保留对方工单。
 3. 暂不实施/待拍板的项写进该轮的「附」小节，不要静默丢弃。
 4. 同步更新 `README.md` / `DESIGN.md`（见 `DESIGN.md` §11 的交付纪律）。
+
+## 处理状态（第 2 轮 · DSH 验收 GLM 的 M9 / M-UI1 改动 · 2026-09-09）
+
+> 验收对象：`m9-adaptive-burst`（c2ed648）+ `ui-m1`（e5cf35c），已合并进 main。
+> 验收方式：通读 diff + 实机复现（cargo test / `--features gpu` 构建 / 起 review 服务实测 API 与越界防护 / 配置对照实验）。
+> **结论：M9 与 UI 主体实现扎实、测试充分，未发现功能性错误；但有 6 项遗漏/不一致需要修。**
+> **本轮由 DSH 提出，待 GLM 修复**（用户指示：DSH 只列问题，不改代码）。
+
+| 编号 | 问题 | 核实 | 状态 |
+|---|---|---|---|
+| V2-1 | `pic_process review` 子命令**不存在**（文档/注释 7 处声称有） | ✅ 成立：实测 `error: unrecognized subcommand 'review'` | ⏳ 待修 |
+| V2-2 | `[dedup] keep_k` 是**死配置**（被 CLI 默认值覆盖），且与 review 行为不一致 | ✅ 成立：keep_k=1 与 3 结果完全相同 | ⏳ 待修 |
+| V2-3 | M9 的 `pose_cluster` **没进 CSV**，只能在 review 界面看到 | ✅ 成立：CSV 表头无该列 | ⏳ 待修 |
+| V2-4 | `release_notes.md` 测试数 42，实际 46 | ✅ 成立 | ⏳ 待修 |
+| V2-5 | `.firstcut/`（缩略图缓存）未加入 `.gitignore` | ✅ 成立 | ⏳ 待修 |
+| V2-6 | `resolve_under` 用子串判断 `..`，误伤合法文件名 | ✅ 成立：`sub/a..b.jpg` 被 403 | ⏳ 待修 |
+
+**验收通过、无需改动的项**：M9 姿态描述子与聚类（含组上限、开关回退、无描述子伪簇）、SCRFD kps 解码（格中心 + offset×stride，与 insightface 一致）、缓存 BLOB 迁移与 CACHE_VERSION 13、`analysis_ok` 列与失败清单、`--gpu`（`--features gpu` 实测可构建，默认构建显式报错）、review 快照与 score CSV 逐张一致（实测 16/16 无差异）、路径越界防护（3 类攻击全部 403）、JPG 白名单、前端过滤 ARW、46 单元 + 6 集成测试全过。
+
+### 第 2 轮工单明细（待 GLM 实施）
+
+**V2-1【P1】`pic_process review` 子命令不存在**
+- 位置：`README.md:23,61,192-193`、`release_notes.md:21`、`DESIGN.md:29,130,319`、`src/bin/review.rs:1`
+- 现象：全部文档与注释都写 `pic_process review <目录>`，但 `src/main.rs` 的 `Commands` 只有
+  `Scan` / `Score` / `ConfigTemplate`；实测 `pic_process review testpic` →
+  `error: unrecognized subcommand 'review'`。界面实际只能通过独立二进制 `pic_process-review` 启动。
+- 建议：二选一并保持一致——(a) 在 `main.rs` 加 `Review` 变体，委托 `review::serve`（推荐，
+  与 7 处文档一致）；(b) 若坚持独立二进制，把 7 处文档/注释改为 `pic_process-review`。
+- 验收：`pic_process review testpic --no-browser` 能起服务；文档与实现逐处一致。
+
+**V2-2【P1】`[dedup] keep_k` 死配置 + 与 review 行为不一致**
+- 位置：`src/main.rs:37-38`（`#[arg(short, long, default_value_t = 3)] keep: usize`）、
+  `src/main.rs:172`（`DedupParams { keep_k: keep, ..cfg.dedup }`）、
+  `src/review/snapshot.rs:101`（`let dedup_params = cfg.dedup;`）
+- 现象：`-k` 有默认值 → `keep` 恒为 Some，`[dedup] keep_k` 永远被覆盖。
+  实测同一目录：配置 `keep_k = 1` 与 `keep_k = 3` 输出**完全相同**（保留 17 张）。
+  而 `review` 直接取 `cfg.dedup`，**会**遵守配置 → 同配置下两个命令连拍结果不一致。
+  这正是 M6-4/M8-2 反复出现的"配置静默失效"同类问题，且模板里还宣传了该字段。
+- 建议：`keep: Option<usize>`（去掉 default_value_t），`keep.unwrap_or(cfg.dedup.keep_k)`。
+- 验收：新增单元/集成断言——配置 `keep_k = 1` 时 `score` 的保留数与 `-k 1` 一致、
+  与默认 3 不同；`score` 与 `review` 在同一配置下连拍列逐张一致。
+
+**V2-3【P2】M9 的 `pose_cluster` 没进 CSV**
+- 位置：`src/dedup.rs:30`（`BurstInfo.pose_cluster`）vs `src/scan.rs:48-57`（`PhotoEntry` 无该字段）
+- 现象：M9 的招牌能力（按姿势分簇保留）只出现在 review 界面的 JSON 里，
+  `report.csv` 看不到每张照片属于哪个姿势簇，无法在表格里复核/筛选。
+- 建议：`PhotoEntry` 加 `pose_cluster: String`，`apply_burst` 填 `info.pose_cluster`。
+- 验收：CSV 新增列且与 review 快照 `burst.pose_cluster` 一致；README 输出说明同步。
+
+**V2-4【P3】`release_notes.md` 测试数过期**
+- 位置：`release_notes.md:54`（"42 单元测试"）；实际 `cargo test --lib` = **46**
+  （UI commit 又加了 4 项；README 已写 46，两处不一致）。
+- 验收：与 `README.md:246-250` 数字一致。
+
+**V2-5【P3】`.firstcut/` 未进 `.gitignore`**
+- 现象：`review` 会在**照片根目录**写 `.firstcut/thumbs/`；若照片目录位于仓库内会被 git 跟踪。
+- 建议：`.gitignore` 追加 `/.firstcut/`（并确认 `review/` 那条不会误伤 `src/review/`）。
+
+**V2-6【P3】`resolve_under` 误伤合法文件名**
+- 位置：`src/review/snapshot.rs:160`（`p.contains("..")`）
+- 现象：按子串判断，文件名含 `..` 的正常照片（如 `a..b.jpg`）会被 403。
+- 建议：改为按**路径段**判断——`Path::new(p).components()` 中出现 `Component::ParentDir` 才拒绝；
+  同时用 `rel.is_absolute()` 替代 `starts_with('/')`（Windows 反斜杠绝对路径）。
+- 验收：现有越界用例仍 403；新增 `sub/a..b.jpg` 用例应 200。
+
+### 第 2 轮附带观察（不要求修，供参考）
+
+- `/image` 每次返回原图（实测单张 19MB）且无缓存头，灯箱反复打开会重复传输；
+  本地服务影响不大，可考虑 `Cache-Control: max-age` 或用分析级解码图。
+- review 快照 JSON 未暴露 `analysis_ok`，前端只能把"未评分"和"解码失败"都显示为无分数。
+- `P2_M0.md` 已在 `DESIGN.md:6` 登记为配套文档，但未在 README 的相关文档列表出现。
+
+
 
 ## 处理状态（第 1 轮 · GLM · 2026-09-08）
 
