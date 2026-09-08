@@ -4,8 +4,9 @@
 **五维评分**（清晰度 / 曝光 / 噪点 / 构图 / 美学），连拍去重排序，输出
 **CSV 报告**和 **Lightroom 兼容的 XMP 星级侧车**。全程本地运行、照片不上传。
 
-> 当前状态：**v1.0 已发布**（Phase 1 完整交付：M0 扫描 → M1 像素指标 → M2 连拍去重
-> → M3 AI 评分 → M4 XMP+缓存 → M5 调参验证）。Phase 2 批量 RAW 开发规划中，详见 `DESIGN.md` §9。
+> 当前状态：**v1.1 已发布**，并已合入 M6 缺陷修复（AI 预处理通道顺序、EXIF 方向、
+> 构图主体脸门槛、曝光 EV 容差带 + 主体感知、缓存配置指纹、场景预设）。
+> Phase 2 批量 RAW 开发规划中，详见 `DESIGN.md` §9。
 
 ## 构建
 
@@ -22,6 +23,7 @@ cargo build --release
 | `pic_process-gallery` | HTML 联系表生成器（缩略图 + 分数） |
 | `pic_process-debug-pose` | 诊断工具：YOLOv8-pose 检测验证 |
 | `pic_process-debug-scrfd` | 诊断工具：SCRFD 检测验证 |
+| `pic_process-debug-exposure` | 诊断工具：全图亮度 vs 主体脸亮度 |
 | `pic_process-probe` | 诊断工具：打印 ONNX 输入输出元数据 |
 
 > `pic_process.exe` 主二进制已静态链接 onnxruntime，单文件免 DLL；
@@ -62,8 +64,11 @@ pic_process score <目录> --no-cache     # 禁用缓存
 pic_process score <目录> --cache x.db   # 指定缓存文件
 pic_process score <目录> --config x.toml # 自定义评分配置（多场景可存多份）
 
-# 生成评分配置模板（人像/打鸟/夜景各存一份）
-pic_process config-template -o portrait.toml
+# 生成评分配置模板
+pic_process config-template -o firstcut.toml
+
+# 生成内置场景预设（portrait / stage / highkey / sports / lowlight）
+pic_process config-template --preset stage -o stage.toml
 
 # 辅助工具
 pic_process-gallery report.csv -o gallery.html   # HTML 联系表（缩略图+分数）
@@ -72,9 +77,24 @@ pic_process-tune <目录> -o metrics.csv           # 原始指标（调参用）
 
 ## 多场景配置
 
-不同拍摄场景用不同权重：人像（构图/美学权重高）、打鸟（清晰度权重高）、
-夜景（曝光权重低 + 曝光目标亮度调低）。`config-template` 生成模板后按需修改，
-`--config` 加载；**换配置时建议换缓存文件名**（`--cache night.sqlite`）。
+不同拍摄场景用不同权重与曝光容差。内置 5 个场景预设，可直接生成后微调：
+
+```bash
+pic_process config-template --preset stage -o stage.toml
+pic_process score <目录> --config stage.toml
+```
+
+| 预设 | 适用场景 | 主要差异 |
+|---|---|---|
+| `portrait` | 人像 / 漫展 / 棚拍 | 等同于内置默认值 |
+| `stage` | 舞台演出 / 暗厅 / live | 曝光权重 0.20、暗侧容差放宽到 -2 档、构图权重 0.20 |
+| `highkey` | 白背景 / 白裙 / 雪景 | 目标亮度 150、亮侧容差放宽到 +3 档 |
+| `sports` | 运动 / 打鸟 / 飞机 | 清晰度权重 0.45 且判定更严格、构图权重 0.05、关闭主体感知曝光 |
+| `lowlight` | 夜景 / 暗光室内 | 目标亮度 110、暗侧容差 -5 档、噪点更宽容、美学权重 0.20 |
+
+`config-template`（不带 `--preset`）输出的是带完整中文注释的通用模板，
+只写想改的字段即可。**换了 `--config` 无需换缓存文件**：配置指纹已并入缓存键，
+配置变化会自动重算（见下）。
 
 ## 输出说明
 
@@ -100,12 +120,26 @@ pic_process-tune <目录> -o metrics.csv           # 原始指标（调参用）
 | 维度 | 权重 | 方法 |
 |---|---|---|
 | 清晰度 | 0.30 | 主体感知三层链路：SCRFD 人脸区域 reblur P80 → 人脸漏检时 YOLOv8-pose 头部关键点区域 reblur → 都无则 50 分中性下限（大光圈浅景深照片不会被误判） |
-| 曝光 | 0.25 | 过曝/欠曝像素比例（4× 惩罚）+ 平均亮度偏离 `exposure_target`（默认 128，可配）的高斯衰减 |
+| 曝光 | 0.25 | 过曝/欠曝像素比例（4× 惩罚）+ 判定亮度偏离理想值的 **EV 容差带**（默认 ±1 档内满分，-4 档 / +2 档降为 0）；判定亮度在有主体级人脸时用主体脸亮度做单向修正 |
 | 噪点 | 0.15 | 暗部 8×8 块标准差 P15（最平滑暗块）+ ISO 容忍度曲线 `k = 3.0·(1+0.3·log10(iso/100))` |
 | 构图 | 0.15 | SCRFD 人脸（无人脸时 YOLOv8-pose 人体框）：三分法位置 + 主体大小（2~30% 理想）+ 多人降权；无主体中性 60 |
 | 美学 | 0.15 | CLIPIQA+（CLIP 底座，sigmoid 输出 ×100 → 0-100 分） |
 
-> 加载 `--config` 时，权重和需在 1.0±0.05 范围内；总和偏差超 5% 会被拒绝加载。
+> 加载 `--config` 时，权重和需在 1.0±0.05 范围内；曝光容差带必须严格嵌套
+> （`exposure_ev_lo > exposure_ev_full_lo`），否则拒绝加载。
+
+### 曝光为什么用 EV 容差带
+
+用"平均亮度偏离中灰多少"打分，会把两类**合法**场景误判成曝光失误：
+舞台黑幕布（全图均值被拉低）、白裙白背景（全图均值被拉高）。所以：
+
+1. **容差带按曝光档位（EV）定义**，而不是按码值。±1 EV 对应码值 92~176，
+   是 AE 的正常波动范围；超出后线性衰减，暗侧到 -4 EV、亮侧到 +2 EV 降为 0
+   （亮侧更陡：高光溢出在 JPG 里不可恢复，暗部在 RAW 里通常还能救）。
+2. **两侧容差独立**：舞台要放宽暗侧但不能放宽亮侧，雪景反之。
+3. **主体感知做单向修正**：有主体级人脸（高度 ≥ 4%）时，取最亮的一张主体脸
+   亮度，把判定值往中灰方向拉（最多拉到中灰，不会越过）。所以暗色/亮色误检框
+   不会把正常照片打下去，同时暗背景/亮背景场景能被救回。
 
 **星级分档**（默认，可配置）：≥75→5★ / ≥60→4★ / ≥45→3★ / ≥30→2★ / 其余 1★
 
@@ -116,8 +150,8 @@ pic_process-tune <目录> -o metrics.csv           # 原始指标（调参用）
 
 - 冷缓存（含 AI）：约 **155ms/张**，119 张 18.4s（CLIPIQA + SCRFD + 姿态）
 - 纯像素冷缓存：约 **90ms/张**（`--no-ai`）
-- 增量重跑：秒级（SQLite 缓存，键 = `path` + `size` + `mtime` + `CACHE_VERSION`）
-- 评分参数变更自动使缓存失效（`CACHE_VERSION` 提升）；换 --config 建议换 --cache 文件名
+- 增量重跑：秒级（SQLite 缓存，键 = `path` + `size` + `mtime` + `CACHE_VERSION` + 配置指纹）
+- 评分参数/`--config` 变更会自动使缓存失效（配置指纹参与缓存键），无需手动换缓存文件
 
 ## 目录结构
 
@@ -126,33 +160,40 @@ src/
 ├── main.rs        # CLI（scan / score / config-template）
 ├── lib.rs         # 库入口（pub mod 各模块）
 ├── scan.rs        # 目录扫描 + EXIF + JPG/ARW 配对
-├── decode.rs      # JPEG 解码（box 降采样）+ 灰度/直方图
+├── decode.rs      # JPEG 解码（box 降采样）+ EXIF 方向 + 灰度/直方图
 ├── metrics/       # sharpness / exposure / noise / composition
 ├── ai/            # CLIPIQA + SCRFD + YOLOv8-pose（ort 推理）
 ├── dedup.rs       # 连拍分组 + dHash 聚类 + 排序
-├── cache.rs       # SQLite 增量缓存
+├── cache.rs       # SQLite 增量缓存（键含配置指纹）
 ├── output/        # csv / xmp 侧车
-├── config.rs      # 权重与曲线参数（TOML 可配）
+├── config.rs      # 权重与曲线参数 + 场景预设（TOML 可配）
 └── bin/
-    ├── tune.rs          # 原始指标导出（调参用）
-    ├── gallery.rs       # HTML 联系表生成器
-    ├── debug_pose.rs    # 诊断：YOLOv8-pose 检测
-    ├── debug_scrfd.rs   # 诊断：SCRFD 检测
-    └── probe.rs         # 诊断：ONNX 模型元数据
+    ├── tune.rs             # 原始指标导出（调参用）
+    ├── gallery.rs          # HTML 联系表生成器
+    ├── debug_pose.rs       # 诊断：YOLOv8-pose 检测
+    ├── debug_scrfd.rs      # 诊断：SCRFD 检测
+    ├── debug_exposure.rs   # 诊断：全图亮度 vs 主体脸亮度
+    └── probe.rs            # 诊断：ONNX 模型元数据
+
+presets/                  # 场景预设（编译进二进制，config-template --preset 输出）
+├── portrait.toml  stage.toml  highkey.toml  sports.toml  lowlight.toml
 ```
 
 ## 测试
 
 ```bash
-cargo test --lib           # 单元测试（12 项）
-cargo test --test integration_test  # 集成测试（5 项，需要 testpic/）
+cargo test --lib                    # 单元测试（21 项）
+cargo test --test integration_test  # 集成测试（6 项，需要 testpic/）
 ```
 
-- **单元测试** 12 项（`cargo test --lib`）：
+- **单元测试** 21 项（`cargo test --lib`）：
   - `dedup` 6 项（datetime 解析、闰年/平年、严格 dHash、连拍分组、dHash 距离切分、空时间无连拍）
   - `metrics::composition` 4 项（无脸中性、三分法偏好、理想大小、微小人脸降分）
+  - `metrics::exposure` 7 项（sRGB↔EV 换算、容差带内满分、带外单调衰减、
+    两侧容差独立、主体感知单向修正、暗背景救回、剪裁惩罚）
   - `output::xmp` 2 项（星级分档边界、XMP 关键字段）
-- **集成测试** 5 项（`tests/integration_test.rs`）：端到端 pipeline 验证（扫描/配置/dedup/总分/星级映射/模板）
+  - `config` 2 项（全部场景预设可加载且参数自洽、未知预设名返回 None）
+- **集成测试** 6 项（`tests/integration_test.rs`）：端到端 pipeline 验证（扫描/配置/dedup/总分/星级映射/模板）
   - 依赖 `testpic/` 真实照片目录（已 gitignore，私人照片不入库）
   - 跑前需先准备好照片目录；纯克隆仓库运行该集成测试会 panic（`#[ignore]` 改造见 Phase 2 TODO）
 

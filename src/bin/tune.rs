@@ -2,7 +2,8 @@
 //!
 //! 用法: pic_process-tune <目录> [-o metrics.csv]
 //! 输出列: filename, iso, width, height, tenengrad_var, luma_var,
-//!         norm_sharp, edge_ratio, dark_noise, over_pct, under_pct, mean_luma
+//!         norm_sharp, edge_ratio, reblur_p90, dark_noise, over_pct, under_pct,
+//!         mean_luma, mean_trunc, p50, p75, p85, p90, p95
 
 use std::path::{Path, PathBuf};
 
@@ -21,6 +22,23 @@ struct Args {
     output: PathBuf,
 }
 
+/// 直方图分位数（0-255）
+fn percentile(hist: &[u64], q: f64) -> f64 {
+    let total: u64 = hist.iter().sum();
+    if total == 0 {
+        return 0.0;
+    }
+    let need = (total as f64 * q).ceil() as u64;
+    let mut acc = 0u64;
+    for (v, c) in hist.iter().enumerate() {
+        acc += c;
+        if acc >= need {
+            return v as f64;
+        }
+    }
+    255.0
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
     let entries = scan::scan_directory(&args.dir)?;
@@ -30,6 +48,7 @@ fn main() -> Result<()> {
     wtr.write_record([
         "filename", "iso", "width", "height", "tenengrad_var", "luma_var",
         "norm_sharp", "edge_ratio", "reblur_p90", "dark_noise", "over_pct", "under_pct", "mean_luma",
+        "mean_trunc", "p50", "p75", "p85", "p90", "p95",
     ])?;
 
     let rows: Vec<Vec<String>> = jpgs
@@ -57,6 +76,12 @@ fn main() -> Result<()> {
                 format!("{:.4}", stats.over_ratio),
                 format!("{:.4}", stats.under_ratio),
                 format!("{:.1}", stats.mean),
+                format!("{:.1}", stats.mean_trunc),
+                format!("{:.0}", percentile(&img.histogram, 0.50)),
+                format!("{:.0}", percentile(&img.histogram, 0.75)),
+                format!("{:.0}", percentile(&img.histogram, 0.85)),
+                format!("{:.0}", percentile(&img.histogram, 0.90)),
+                format!("{:.0}", percentile(&img.histogram, 0.95)),
             ])
         })
         .collect();
@@ -86,6 +111,10 @@ fn main() -> Result<()> {
         eprintln!("[tune] reblur_p90     min/med/max: {:?}", stat(8));
         eprintln!("[tune] dark_noise     min/med/max: {:?}", stat(9));
         eprintln!("[tune] mean_luma      min/med/max: {:?}", stat(12));
+        eprintln!("[tune] mean_trunc     min/med/max: {:?}", stat(13));
+        eprintln!("[tune] p75            min/med/max: {:?}", stat(15));
+        eprintln!("[tune] p85            min/med/max: {:?}", stat(16));
+        eprintln!("[tune] p90            min/med/max: {:?}", stat(17));
     }
     Ok(())
 }

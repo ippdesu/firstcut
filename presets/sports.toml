@@ -1,0 +1,36 @@
+﻿# ============================================================
+# firstcut 场景预设：运动 / 打鸟 / 飞机 / 野生动物
+# 用法: pic_process score <目录> --config presets/sports.toml
+# 生成: pic_process config-template --preset sports > sports.toml
+# ============================================================
+#
+# 适用：快速运动、长焦追焦、连拍选片。
+# 要点：主要废片是对焦失败/运动模糊 → 清晰度权重最高且判定更严格；
+#       没有稳定人脸主体，构图分不可靠 → 权重压到最低；
+#       曝光与噪点容忍度按现场光线自行微调。
+
+[weights]
+sharpness = 0.45      # 决定成败：对焦是否咬住
+exposure = 0.20
+noise = 0.15
+composition = 0.05    # 无主体检测，分数不可靠，几乎不计
+aesthetic = 0.15
+
+[metric]
+# 比默认更严格（k 越小越严格）：轻微失焦也要拉开分差
+sharpness_k = 500000.0
+# 高 ISO 是常态，容忍度放宽
+noise_k0 = 4.0
+
+# 无主体人脸，关闭主体感知曝光
+exposure_target = 128.0
+exposure_ev_full_lo = 1.5
+exposure_ev_full_hi = 1.0
+exposure_ev_lo = 3.0
+exposure_ev_hi = 2.0
+exposure_subject_blend = 0.0
+
+rating_5 = 75.0
+rating_4 = 60.0
+rating_3 = 45.0
+rating_2 = 30.0

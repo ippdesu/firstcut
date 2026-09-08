@@ -1,7 +1,8 @@
 //! SQLite 增量缓存（M4）
 //!
-//! 按 (文件大小, mtime, 分析版本) 缓存像素分析 + AI 结果；
+//! 按 (文件大小, mtime, 分析版本, 配置指纹) 缓存像素分析 + AI 结果；
 //! 命中则跳过解码与推理，重跑只处理新照片。
+//! 配置指纹用于让 `--config` 改动后自动失效旧分数（否则改配置看不到变化）。
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -11,13 +12,15 @@ use anyhow::{Context, Result};
 use crate::score::{AnalysisResult, PixelScores};
 
 /// 缓存分析版本：评分参数（k 值/权重/模型）变化时递增
-pub const CACHE_VERSION: i64 = 8;
+pub const CACHE_VERSION: i64 = 10;
 
 /// 照片分析缓存
 pub struct ScoreCache {
     conn: rusqlite::Connection,
     /// 预加载的 (path -> 缓存行)
     rows: HashMap<String, CacheRow>,
+    /// 本次运行的评分配置指纹（参与缓存键）
+    cfg_hash: i64,
 }
 
 /// 单条缓存行（公开；供并行分析段只读快照使用）
@@ -26,12 +29,14 @@ pub struct CacheRow {
     pub size: i64,
     pub mtime: i64,
     pub version: i64,
+    /// 生成该行时使用的评分配置指纹
+    pub cfg_hash: i64,
     pub result: AnalysisResult,
 }
 
 impl ScoreCache {
-    /// 打开（或创建）缓存库；失败时返回 Err 由调用方决定降级
-    pub fn open(path: &Path) -> Result<Self> {
+    /// 打开（或创建）缓存库；`cfg_hash` 为本次运行的评分配置指纹
+    pub fn open(path: &Path, cfg_hash: i64) -> Result<Self> {
         let conn = rusqlite::Connection::open(path)
             .with_context(|| format!("打开缓存库失败: {}", path.display()))?;
         conn.execute_batch(
@@ -46,13 +51,19 @@ impl ScoreCache {
                 composition REAL NOT NULL,
                 aesthetic REAL NOT NULL,
                 dhash INTEGER NOT NULL,
-                faces INTEGER NOT NULL
+                faces INTEGER NOT NULL,
+                cfg_hash INTEGER NOT NULL DEFAULT 0
             );",
         )?;
+        // 旧库迁移：早期版本没有 cfg_hash 列（补列失败说明已存在，忽略）
+        let _ = conn.execute(
+            "ALTER TABLE photo_cache ADD COLUMN cfg_hash INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
 
         let rows = {
             let mut stmt = conn.prepare(
-                "SELECT path, size, mtime, version, sharpness, exposure, noise, composition, aesthetic, dhash, faces FROM photo_cache",
+                "SELECT path, size, mtime, version, sharpness, exposure, noise, composition, aesthetic, dhash, faces, cfg_hash FROM photo_cache",
             )?;
             let iter = stmt.query_map([], |r| {
                 Ok((
@@ -72,6 +83,7 @@ impl ScoreCache {
                             dhash: r.get::<_, i64>(9)? as u64,
                             faces: r.get(10)?,
                         },
+                        cfg_hash: r.get(11)?,
                     },
                 ))
             })?;
@@ -82,7 +94,7 @@ impl ScoreCache {
             }
             rows
         };
-        Ok(ScoreCache { conn, rows })
+        Ok(ScoreCache { conn, rows, cfg_hash })
     }
 
     /// 只读快照（供 rayon 并行段使用；Connection 非 Sync 不能跨线程）
@@ -90,10 +102,14 @@ impl ScoreCache {
         &self.rows
     }
 
-    /// 查询缓存：文件未变（大小+mtime+版本一致）返回 Some
+    /// 查询缓存：文件未变且配置指纹一致时返回 Some
     pub fn get(&self, path: &str, size: u64, mtime: i64) -> Option<AnalysisResult> {
         let row = self.rows.get(path)?;
-        if row.size == size as i64 && row.mtime == mtime && row.version == CACHE_VERSION {
+        if row.size == size as i64
+            && row.mtime == mtime
+            && row.version == CACHE_VERSION
+            && row.cfg_hash == self.cfg_hash
+        {
             Some(row.result)
         } else {
             None
@@ -108,6 +124,7 @@ impl ScoreCache {
                 size: size as i64,
                 mtime,
                 version: CACHE_VERSION,
+                cfg_hash: self.cfg_hash,
                 result: *result,
             },
         );
@@ -121,8 +138,8 @@ impl ScoreCache {
             let s = row.result.scores;
             tx.execute(
                 "INSERT OR REPLACE INTO photo_cache
-                    (path, size, mtime, version, sharpness, exposure, noise, composition, aesthetic, dhash, faces)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                    (path, size, mtime, version, sharpness, exposure, noise, composition, aesthetic, dhash, faces, cfg_hash)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 rusqlite::params![
                     path,
                     row.size,
@@ -135,6 +152,7 @@ impl ScoreCache {
                     s.aesthetic,
                     row.result.dhash as i64,
                     row.result.faces as i64,
+                    row.cfg_hash,
                 ],
             )?;
         }

@@ -1,0 +1,33 @@
+﻿# ============================================================
+# firstcut 场景预设：高调 / 白背景 / 白裙 / 雪景 / 逆光白场
+# 用法: pic_process score <目录> --config presets/highkey.toml
+# 生成: pic_process config-template --preset highkey > highkey.toml
+# ============================================================
+#
+# 适用：白背景棚拍、白裙+白毛毯、雪景、正午海边。
+# 要点：整幅画面天然偏亮（大片白色拉高全图均值），用默认 ±1 EV 会把
+#       正常的高调照片判成"过曝"。这里把目标亮度上移并放宽亮侧容差。
+
+[weights]
+sharpness = 0.30
+exposure = 0.25
+noise = 0.15
+composition = 0.15
+aesthetic = 0.15
+
+[metric]
+sharpness_k = 800000.0
+noise_k0 = 3.0
+
+# 高调场景的中灰落在更亮的位置；亮侧允许到 +3 EV
+exposure_target = 150.0
+exposure_ev_full_lo = 1.5
+exposure_ev_full_hi = 1.5
+exposure_ev_lo = 3.5
+exposure_ev_hi = 3.0
+exposure_subject_blend = 0.5
+
+rating_5 = 75.0
+rating_4 = 60.0
+rating_3 = 45.0
+rating_2 = 30.0

@@ -1,0 +1,34 @@
+﻿# ============================================================
+# firstcut 场景预设：夜景 / 暗光室内 / 弱光人像
+# 用法: pic_process score <目录> --config presets/lowlight.toml
+# 生成: pic_process config-template --preset lowlight > lowlight.toml
+# ============================================================
+#
+# 适用：夜景、演唱会、暗光室内手持。
+# 要点：整幅画面本来就暗，且高 ISO 噪点不可避免 —— 曝光和噪点都要宽容，
+#       真正区分好坏的是"主体有没有合焦、有没有被手持抖动糊掉"。
+
+[weights]
+sharpness = 0.35      # 弱光下糊片概率最高
+exposure = 0.15       # 暗调是场景决定的，少扣分
+noise = 0.15
+composition = 0.15
+aesthetic = 0.20      # 氛围感/光线美感占比更高
+
+[metric]
+sharpness_k = 800000.0
+# 高 ISO 噪点更宽容
+noise_k0 = 5.0
+
+# 中灰下移到 110；暗侧允许到 -5 EV（夜景主体常比中灰低很多）
+exposure_target = 110.0
+exposure_ev_full_lo = 1.5
+exposure_ev_full_hi = 1.0
+exposure_ev_lo = 5.0
+exposure_ev_hi = 2.0
+exposure_subject_blend = 0.5
+
+rating_5 = 75.0
+rating_4 = 60.0
+rating_3 = 45.0
+rating_2 = 30.0

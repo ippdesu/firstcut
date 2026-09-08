@@ -107,6 +107,8 @@ pub fn analyze_jpgs(
     let counter = AtomicUsize::new(0);
     let hits = AtomicUsize::new(0);
     let total = entries.iter().filter(|e| !e.is_raw).count().max(1);
+    // 配置指纹参与缓存键：改了 --config 必须重算，否则会静默返回旧分数
+    let cfg_hash = crate::config::config_fingerprint(cfg);
 
     let (results, new_rows): (HashMap<String, AnalysisResult>, Vec<(String, u64, i64, AnalysisResult)>) = entries
         .par_iter()
@@ -123,6 +125,7 @@ pub fn analyze_jpgs(
                         if row.size == size as i64
                             && row.mtime == mtime
                             && row.version == crate::cache::CACHE_VERSION
+                            && row.cfg_hash == cfg_hash
                         {
                             hits.fetch_add(1, Ordering::Relaxed);
                             return Some((stem_of(&e.filename), row.result, None));
@@ -179,7 +182,6 @@ pub fn analyze_one(
     let sharpness = metrics::sharpness::sharpness_score(norm, p.sharpness_k);
 
     let stats = metrics::exposure::exposure_stats(&img);
-    let exposure = metrics::exposure::exposure_score(&stats, p.exposure_target);
 
     let iso = e.iso.parse::<u32>().unwrap_or(100);
     let noise_metric = metrics::noise::dark_noise_metric(&img);
@@ -193,6 +195,11 @@ pub fn analyze_one(
     let mut faces = 0usize;
     // 清晰度：全局分 + 主体（人脸）区域分取高者
     let mut sharpness_region: Option<f64> = None;
+    // 曝光：主体级人脸区域的平均亮度（None 表示无主体脸，回退全图）。
+    // 取所有主体级人脸中的**最亮**一张：暗侧的脸往往是背光/遮挡，
+    // 用最亮者避免个别阴影中的脸压低整张照片；
+    // 且 exposure_score 内部还会把它夹在"全图 ~ 中灰"之间，保证只做单向修正。
+    let mut subject_luma: Option<f64> = None;
 
     if let Some(m) = &ai.iqa {
         aesthetic = m.acquire().score(&img.rgb, img.width, img.height).unwrap_or(60.0);
@@ -202,12 +209,29 @@ pub fn analyze_one(
             Ok(boxes) => {
                 faces = boxes.len();
                 composition = metrics::composition::composition_score(&boxes);
-                // 最大人脸 → 主体区域锐度（大光圈浅景深照片的正确语义）
-                if let Some(biggest) = boxes.iter().max_by(|a, b| {
-                    (a.w * a.h).partial_cmp(&(b.w * b.h)).unwrap_or(std::cmp::Ordering::Equal)
-                }) {
+                for f in boxes.iter().filter(|f| f.h >= 0.04) {
+                    let mean = metrics::exposure::region_mean_luma(
+                        &img.luma,
+                        img.width,
+                        img.height,
+                        (f.x + f.w / 2.0) as f64,
+                        (f.y + f.h / 2.0) as f64,
+                        f.w as f64 / 2.0,
+                        f.h as f64 / 2.0,
+                    );
+                    subject_luma = Some(subject_luma.map_or(mean, |m: f64| m.max(mean)));
+                }
+                // 最大主体级人脸（≥4% 高度）→ 主体区域锐度
+                if let Some(biggest) = boxes
+                    .iter()
+                    .filter(|f| f.h >= 0.04)
+                    .max_by(|a, b| {
+                        (a.w * a.h).partial_cmp(&(b.w * b.h)).unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                {
                     let cx = (biggest.x + biggest.w / 2.0) as f64;
                     let cy = (biggest.y + biggest.h / 2.0) as f64;
+                    // 清晰度：主体区域（1.5× 框）reblur
                     let half_w = (biggest.w as f64 * 1.5).clamp(0.05, 0.5);
                     let half_h = (biggest.h as f64 * 1.5).clamp(0.05, 0.5);
                     let reblur = metrics::sharpness::reblur_mean_region(
@@ -257,6 +281,18 @@ pub fn analyze_one(
         // 宁可漏判真糊，不可误杀清晰照片；真糊由人工在 gallery 复核）
         _ => sharpness.max(50.0),
     };
+
+    // 曝光：EV 容差带 + 主体感知（有主体脸时混入脸区域亮度，
+    // 修正舞台黑幕布 / 白裙白背景两类"全图均值不代表主体"的误判）
+    let exposure_curve = metrics::exposure::ExposureCurve {
+        target: p.exposure_target,
+        ev_full_lo: p.exposure_ev_full_lo,
+        ev_full_hi: p.exposure_ev_full_hi,
+        ev_lo: p.exposure_ev_lo,
+        ev_hi: p.exposure_ev_hi,
+        subject_blend: p.exposure_subject_blend,
+    };
+    let exposure = metrics::exposure::exposure_score(&stats, subject_luma, &exposure_curve);
 
     Ok(Some(AnalysisResult {
         scores: PixelScores {

@@ -57,6 +57,9 @@ enum Commands {
         /// 输出路径（默认 firstcut.toml）
         #[arg(short, long, default_value = "firstcut.toml")]
         output: PathBuf,
+        /// 输出内置场景预设而非通用模板（portrait/stage/highkey/sports/lowlight）
+        #[arg(long, value_name = "名称")]
+        preset: Option<String>,
     },
 }
 
@@ -69,9 +72,23 @@ fn main() -> Result<()> {
             pic_process::output::csv::write_csv(&output, &entries)?;
             eprintln!("[scan] CSV 已写出: {}", output.display());
         }
-        Commands::ConfigTemplate { output } => {
-            std::fs::write(&output, pic_process::config::config_template())?;
-            eprintln!("[config] 模板已写出: {}", output.display());
+        Commands::ConfigTemplate { output, preset } => {
+            let text = match &preset {
+                Some(name) => match pic_process::config::preset(name) {
+                    Some(t) => t.to_string(),
+                    None => {
+                        let names: Vec<&str> =
+                            pic_process::config::PRESETS.iter().map(|(n, _)| *n).collect();
+                        anyhow::bail!(
+                            "未知场景预设 {name:?}；可用: {}",
+                            names.join(", ")
+                        );
+                    }
+                },
+                None => pic_process::config::config_template(),
+            };
+            std::fs::write(&output, text)?;
+            eprintln!("[config] 已写出: {}", output.display());
         }
         Commands::Score { dir, output, keep, no_ai, xmp, cache, no_cache, config } => {
             // 0) 评分配置（默认或文件）
@@ -111,7 +128,7 @@ fn main() -> Result<()> {
             let mut cache = if no_cache {
                 None
             } else {
-                match ScoreCache::open(&cache) {
+                match ScoreCache::open(&cache, pic_process::config::config_fingerprint(&cfg)) {
                     Ok(c) => {
                         eprintln!("[score] 缓存: {} 条（{}）", c.len(), cache.display());
                         Some(c)

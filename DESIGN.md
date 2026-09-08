@@ -45,9 +45,13 @@
 
 1. **清晰度/合焦**：下采样 1024px → Tenengrad（Sobel 梯度方差）÷ 亮度方差归一化（消除场景纹理差异），饱和曲线映射（k=800k，实测范围 12 万~172 万）。
    - **M5 主体感知三层兜底**：SCRFD 人脸命中 → 人脸区域 1.5× 框内 reblur P80（避开皮肤平滑区，捕眼睛/发丝锐边）；SCRFD 漏检 → YOLOv8-pose 头部关键点扩展 1.4×1.6× 区域 reblur P80；都无 → 50 分中性下限（大光圈浅景深照片不误判，真糊由人工 gallery 复核）。
-2. **曝光**：直方图过曝（≥250）与欠曝（≤5）像素比例（4× 系数惩罚）+ 平均亮度偏离 `exposure_target`（默认 128，可配）的高斯衰减。
+2. **曝光**：直方图过曝（≥250）与欠曝（≤5）像素比例（4× 系数惩罚）+ 判定亮度偏离理想值的 **EV 容差带**。
+   - **M6 决策：从"码值高斯"改为"EV 容差带"**。旧做法（平均亮度偏离 `exposure_target=128` 的高斯衰减）会把两类**合法**场景判成曝光失误：舞台黑幕布把全图均值拉到 40 以下、白裙白背景把全图均值推到 200 以上。
+   - 容差带按曝光档位定义：±1 EV（码值 92~176）内满分（AE 正常波动范围），超出后线性衰减，暗侧到 -4 EV、亮侧到 +2 EV 降为 0。**两侧独立**（`ev_full_lo/hi`、`ev_lo/hi`）：舞台放宽暗侧但不放宽亮侧，雪景反之。亮侧更陡是因为高光溢出在 JPG 里不可恢复，暗部在 RAW 里通常还能救。
+   - **主体感知单向修正**：有主体级人脸（高度 ≥ 4%）时取最亮的一张主体脸区域均值，把判定值往中灰方向拉（夹在"全图 ~ 中灰"之间，不越过中灰）。所以暗色/亮色误检框不会把正常照片打下去，同时暗背景/亮背景场景能被救回。
+   - 全图侧仍用**截尾均值**（排除最暗 25% 像素）作为基准。
 3. **噪点**：暗部（<40）8×8 块标准差 **P15**（最平滑暗块，避开暗部场景纹理污染）+ ISO 容忍度曲线 `k = K0·(1 + 0.3·log10(iso/100))`，`K0=3.0`。
-4. **构图**：SCRFD 人脸框 → 三分法交点（4 点）距离（最大 0.47）+ 人脸高度占比（2~30% 理想）+ 多人降权（1→1.0、2-4→0.95、5+→0.85）；无人脸给中性 60 分（不惩罚风景/静物）。
+4. **构图**：SCRFD 人脸框 → 三分法交点（4 点）距离（最大 0.47）+ 人脸高度占比（2~30% 理想）+ 多人降权（1→1.0、2-4→0.95、5+→0.85）；无人脸给中性 60 分（不惩罚风景/静物）。**只统计主体级人脸（高度 ≥ 4%）**：贴纸脸/背景路人不参与，避免误判。
 5. **美学**：CLIPIQA+ 0-100 分（224×224、CLIP 归一化、sigmoid×100）；M5 从 MUSIQ 换入，分布区分度提升至 26-76 区间。
 6. **连拍去重**：按 `DateTimeOriginal` 时间戳聚类（间隔 ≤2s 为一组，`keep_k=2`）→ 组内 dHash 感知哈希（9×8 → 64 bit、汉明距离 ≤10 为同一子簇）→ 子簇内按总分排序保留 top-K 并标记"组内第 N 名 / 是否保留"。
 
@@ -64,7 +68,8 @@ scan（读 EXIF 建索引，SQLite 增量）
   → output（XMP 星级 + CSV）
 ```
 
-- 缓存命中即跳过（SQLite，键 = path+size+mtime+版本号），重跑只处理新照片。
+- 缓存命中即跳过（SQLite，键 = path+size+mtime+CACHE_VERSION+**配置指纹**），重跑只处理新照片。
+  - 配置指纹（`config_fingerprint`）是 M6 修复的一个静默 bug：此前换 `--config` 后缓存仍然命中，用户改了权重/曲线却看到完全一样的结果。现在配置变化自动重算。
 - 实测吞吐：119 张 33MP（含 3 模型）约 18.4s（16 核）；增量重跑秒级。1 万张冷跑约 26 分钟。
 - 处理中不移动/删除任何文件，只写 XMP 侧车和 CSV（安全）。
 
@@ -79,21 +84,23 @@ scan（读 EXIF 建索引，SQLite 增量）
 ```
 pic_process/
 ├── Cargo.toml
-├── firstcut.toml            # 评分配置模板（config-template 生成）
+├── firstcut.toml            # 通用评分配置模板（config-template 生成）
+├── presets/                 # 场景预设（编译进二进制，config-template --preset 输出）
+│   ├── portrait.toml  stage.toml  highkey.toml  sports.toml  lowlight.toml
 ├── models/                  # 首次下载的 ONNX 模型（gitignore）
 ├── src/
-│   ├── main.rs              # clap CLI（scan / score / config-template）
+│   ├── main.rs              # clap CLI（scan / score / config-template [--preset]）
 │   ├── scan.rs              # 扫描 + EXIF + JPG/ARW 配对
-│   ├── decode.rs            # JPEG box 降采样解码 + 灰度/直方图
+│   ├── decode.rs            # JPEG box 降采样解码 + EXIF 方向 + 灰度/直方图
 │   ├── metrics/             # sharpness / exposure / noise / composition
 │   ├── ai/                  # iqa(CLIPIQA) / facedetect(SCRFD) / pose(YOLOv8)
 │   ├── dedup.rs             # 连拍分组 + dHash 聚类 + 排序
 │   ├── score.rs             # 分析调度 + 加权汇总 + 缓存接入
 │   ├── output/              # csv.rs / xmp.rs
-│   ├── cache.rs             # SQLite 增量缓存
-│   ├── config.rs            # 权重/曲线/星级/曝光目标（--config 可配）
+│   ├── cache.rs             # SQLite 增量缓存（键含配置指纹）
+│   ├── config.rs            # 权重/曲线/星级/曝光 EV 容差 + 场景预设（--config 可配）
 │   └── lib.rs
-├── src/bin/                 # tune（调参）/ gallery（联系表）/ debug_scrfd / debug_pose / probe
+├── src/bin/                 # tune / gallery / debug_scrfd / debug_pose / debug_exposure / probe
 └── tests/
 ```
 
@@ -105,16 +112,18 @@ pic_process/
 - ✅ **M3 AI 接入**：CLIPIQA 美学 + SCRFD 人脸检测 + 构图维度，5 维评分（后期从 MUSIQ/YuNet 升级，见 M5）
 - ✅ **M4 输出完善**：XMP 星级侧车（`<名>.<原扩展名>.xmp`，xmp:Rating + firstcut 子分，他人侧车保护）+ SQLite 增量缓存（size+mtime+版本键，二次运行 16/16 命中 0.78s）
 - ✅ **M5 调参与验证**：性能优化（21.5s→10.6s/119张）、噪点 P15 修复、浅景深清晰度误判修复（主体感知三层链路：SCRFD 人脸区域 reblur → YOLOv8-pose 头部区域 → 50 中性下限）、人脸漏检换 SCRFD（检出 23→75/119）、gallery 联系表；**用户决策落地**：A=多场景配置文件（--config/config-template，权重+曲线+星级+曝光目标可配）、B=星级放宽 75/60/45/30、C=换 CLIPIQA（美学分布 26-76，区分度提升）
+- ✅ **M6 缺陷修复**（2026-07，见 §10 决策记录）：AI 预处理通道顺序 bug、EXIF 方向未处理、构图被贴纸脸/背景脸污染、曝光模型改为 EV 容差带 + 主体感知单向修正、缓存键缺配置指纹、场景预设落地
 
-> 当前状态（Phase 1 完成）：`pic_process score <目录> [--xmp] [--config x.toml] [--cache <文件>] [--no-ai] [-k N]`，12 项单元测试全过；5 星 24/119、4 星 74、3 星 21（新分档）；CLIPIQA 冷跑 ~155ms/张（含 SCRFD+姿态）。
+> 当前状态（Phase 1 完成 + M6 修复）：`pic_process score <目录> [--xmp] [--config x.toml] [--cache <文件>] [--no-ai] [-k N]`，21 项单元测试 + 6 项集成测试全过；CLIPIQA 冷跑 ~155ms/张（含 SCRFD+姿态）。
 
 ## 8. 风险与开放问题（当前状态）
 
 - **美学模型**：~~MUSIQ~~ → **已定案：CLIPIQA+ ONNX**（M5 切换，86Cao/IQA-ONNX-Models，224×224、CLIP 归一化、sigmoid×100，分布区分度 26-76 高于 MUSIQ 的 36-65；已下载至 `models/clipiqa_model.onnx{,.data}`）。
 - **人脸检测**：~~YuNet~~ → **已定案：SCRFD 10g**（M5 切换，RuteNL/SCRFD-face-detection-ONNX，640×640、9 输出解码、阈值 0.3 + 贪心 NMS；119 张真实照片检出 23→75）。
 - **onnxruntime Windows GPU**：DirectML provider 支持 OK；无 GPU 时自动回落 CPU。AI_POOL_SIZE=1（Mutex 串行）——实测池化无收益（AI 非瓶颈且每 session 线程减半变慢）。
-- **权重校准**：默认权重 0.30/0.25/0.15/0.15/0.15（和=1.0，M5 决策 A：曝光 0.25 压欠曝虚高）；多场景用 `--config` 按需调整（人像/打鸟/夜景/飞机各存一份）。
+- **权重校准**：默认权重 0.30/0.25/0.15/0.15/0.15（和=1.0，M5 决策 A：曝光 0.25 压欠曝虚高）；多场景用 `--config` 按需调整，内置 `presets/` 5 份（portrait/stage/highkey/sports/lowlight）。
 - **Lightroom 读 XMP 星级**：侧车命名与 `xmp:Rating` 均按 LR 约定；建议 v1.0 后用 Lightroom 实测验证一次（可并入 Phase 2 环境验证）。
+- **遮挡脸/超大脸漏检**（未解决）：口罩/头盔遮挡时 SCRFD 置信度会掉到 0.2 附近，超大人脸特写也会漏检（PORTRAIT_TEST 0.117）。当前对评分的影响已通过"主体感知单向修正 + 构图只计主体脸"降级处理，未换模型。
 
 ## 9. Phase 2（远期）：批量 RAW 开发，替代 Lightroom 手动流程
 
@@ -184,6 +193,20 @@ pic_process/
 - **P2-M3**：联动 Phase 1 —— 曝光补偿值写入侧车、按评分阈值决定开发名单
 - **P2-M4**：实测调优 —— 你的镜头跑一轮，调 lensfun 覆盖、降噪强度分级、输出验证
 
-## 10. 交付方式
+## 10. 决策记录（M6，2026-07）
 
-本规划经确认后生效；**确认前不写任何代码**。确认"开始做"后进入 M0。
+> 原则：**默认值必须对任何场景站得住脚，不能是对某一批样片的拟合**；
+> 场景差异交给 `--config` / `presets/`，而不是塞进默认曲线。
+
+| # | 问题 | 决策 | 依据 |
+|---|---|---|---|
+| M6-1 | 曝光用"偏离中灰多少码值"判定，舞台黑幕布/白裙白背景被误判 | 改为 **EV 容差带**（±1 档满分，-4/+2 档归零，两侧独立） | ±1 EV 由 sRGB 传输函数算出恰好是码值 92~176，是 AE 的正常波动范围；容差带只惩罚真正越界的曝光 |
+| M6-2 | 主体脸亮度参与曝光会不会过度依赖人脸检测 | 只做**单向修正**（夹在"全图 ~ 中灰"之间） | 暗色/亮色误检框无法压低或反向推高分数；误检代价可控 |
+| M6-3 | 场景差异怎么落地 | 内置 **5 份场景预设**（`config-template --preset`），预设只调权重与 EV 容差 | 回应"不同场景要搞配置"的要求，避免把场景特例写进默认值 |
+| M6-4 | 换 `--config` 后结果不变 | 缓存键加入**配置指纹** | 此前是静默 bug：缓存命中直接返回旧的五维分数，用户会以为配置没生效 |
+| M6-5 | 如何验证曲线不是"拟合样片" | 单元测试断言 **sRGB↔EV 换算、容差带内满分、带外单调、两侧独立、单向修正** | 测试输入是合成码值而非真实照片，结论与样本集无关 |
+
+## 11. 交付方式
+
+Phase 1 已交付（v1.0/v1.1 已发布 Release）；Phase 2 规划经确认后再开工。
+每次改动必须同步更新 `README.md` / `DESIGN.md`，不允许文档与实现状态不一致。

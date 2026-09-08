@@ -31,6 +31,10 @@ path = "src/bin/debug_scrfd.rs"
 name = "pic_process-probe"
 path = "src/bin/probe.rs"
 
+[[bin]]
+name = "pic_process-debug-exposure"
+path = "src/bin/debug_exposure.rs"
+
 [dependencies]
 anyhow = "1"
 base64 = "0.23"

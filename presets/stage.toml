@@ -1,0 +1,33 @@
+# ============================================================
+# firstcut 场景预设：舞台演出 / 暗厅 / live
+# 用法: pic_process score <目录> --config presets/stage.toml
+# 生成: pic_process config-template --preset stage > stage.toml
+# ============================================================
+#
+# 适用：黑幕布背景、主体被顶灯照亮但整体偏暗、逆光剪影、暗厅漫展。
+# 要点：这类照片"整体暗"是布光决定的艺术效果，不是拍摄失误，
+#       所以放宽曝光容差、降低曝光权重，把决定权交给清晰度与构图。
+
+[weights]
+sharpness = 0.30
+exposure = 0.20       # 从 0.25 降到 0.20：暗调场景曝光分波动大，少让它主导
+noise = 0.15
+composition = 0.20    # 舞台站位/三分法比曝光更能区分好坏
+aesthetic = 0.15
+
+[metric]
+sharpness_k = 800000.0
+noise_k0 = 3.0
+
+# 暗侧放宽到 -2 档满分（舞台主体常被压暗），亮侧保持 ±1 档不变
+exposure_target = 128.0
+exposure_ev_full_lo = 2.0
+exposure_ev_full_hi = 1.0
+exposure_ev_lo = 5.0
+exposure_ev_hi = 2.0
+exposure_subject_blend = 0.5
+
+rating_5 = 75.0
+rating_4 = 60.0
+rating_3 = 45.0
+rating_2 = 30.0

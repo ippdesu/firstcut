@@ -1,0 +1,33 @@
+﻿# ============================================================
+# firstcut 场景预设：人像 / 漫展 / 棚拍（等同于内置默认值）
+# 用法: pic_process score <目录> --config presets/portrait.toml
+# 生成: pic_process config-template --preset portrait > portrait.toml
+# ============================================================
+#
+# 适用：单个或少量主体、有人脸、大光圈浅景深、背景虚化。
+# 要点：清晰度与构图都能靠人脸定位到主体，曝光会用主体脸亮度做修正，
+#       所以不需要为"背景很暗/很亮"单独调参。
+
+[weights]
+sharpness = 0.30      # 主体是否合焦
+exposure = 0.25       # 欠曝/过曝
+noise = 0.15
+composition = 0.15    # 主体在三分法位置、画面占比
+aesthetic = 0.15      # CLIPIQA 美感分
+
+[metric]
+sharpness_k = 800000.0
+noise_k0 = 3.0
+
+# 曝光：±1 EV（码值 92~176）内满分，-4 EV / +2 EV 处降为 0
+exposure_target = 128.0
+exposure_ev_full_lo = 1.0
+exposure_ev_full_hi = 1.0
+exposure_ev_lo = 4.0
+exposure_ev_hi = 2.0
+exposure_subject_blend = 0.5
+
+rating_5 = 75.0
+rating_4 = 60.0
+rating_3 = 45.0
+rating_2 = 30.0
