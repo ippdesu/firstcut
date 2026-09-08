@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use pic_process::cache::ScoreCache;
 use pic_process::config::{DedupParams, ScoreConfig, ScoreWeights};
-use pic_process::dedup::{self, BurstInfo};
+use pic_process::dedup::BurstInfo;
 use pic_process::output;
 use pic_process::scan::{self};
 use pic_process::score::{self, AiEngine, AnalysisResult};
@@ -267,48 +267,23 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// 对 JPG 条目做连拍分析，返回 配对键 -> BurstInfo
+/// 对 JPG 条目做连拍分析（逻辑在 score::analyze_photo_bursts，review 共用），
+/// 返回 配对键 -> BurstInfo
 fn run_burst_analysis(
     entries: &mut [scan::PhotoEntry],
     analyzed: &HashMap<String, AnalysisResult>,
     params: &DedupParams,
     weights: &ScoreWeights,
 ) -> HashMap<String, BurstInfo> {
-    // 取有分析的 JPG（保持扫描顺序）
-    let jpg_idx: Vec<usize> = entries
+    let map = score::analyze_photo_bursts(entries, analyzed, params, weights);
+    let total = entries
         .iter()
-        .enumerate()
-        .filter(|(_, e)| !e.is_raw && analyzed.contains_key(e.pair_id()))
-        .map(|(i, _)| i)
-        .collect();
-    if jpg_idx.len() < 2 {
-        return HashMap::new();
+        .filter(|e| !e.is_raw && analyzed.contains_key(e.pair_id()))
+        .count();
+    let burst_groups = map.values().filter(|i| i.group != 0).count();
+    if total >= 2 {
+        eprintln!("[score] 连拍去重: {} 张 JPG 中 {} 张属于连拍组", total, burst_groups);
     }
-    let jpg_entries: Vec<scan::PhotoEntry> =
-        jpg_idx.iter().map(|&i| entries[i].clone()).collect();
-    let hashes: Vec<u64> =
-        jpg_idx.iter().map(|&i| analyzed[entries[i].pair_id()].dhash).collect();
-    let descs: Vec<Option<[f32; 10]>> =
-        jpg_idx.iter().map(|&i| analyzed[entries[i].pair_id()].pose_desc).collect();
-    let scores: Vec<f64> = jpg_idx
-        .iter()
-        .map(|&i| {
-            let s = analyzed[entries[i].pair_id()].scores;
-            score::total_score(&s, weights)
-        })
-        .collect();
-
-    let infos = dedup::analyze_bursts(&jpg_entries, &hashes, &scores, &descs, params);
-    let mut map = HashMap::new();
-    for (&idx, info) in jpg_idx.iter().zip(infos.iter()) {
-        map.insert(entries[idx].pair_id().to_string(), info.clone());
-    }
-    let burst_groups = infos.iter().filter(|i| i.group != 0).count();
-    eprintln!(
-        "[score] 连拍去重: {} 张 JPG 中 {} 张属于连拍组",
-        jpg_idx.len(),
-        burst_groups
-    );
     map
 }
 

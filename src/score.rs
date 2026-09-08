@@ -11,9 +11,9 @@ use crate::ai::facedetect::Scrfd;
 use crate::ai::iqa::ClipIqa;
 use crate::ai::pose::{PoseDet, head_region};
 use crate::ai::SessionPool;
-use crate::config::{MetricParams, ScoreConfig, ScoreWeights};
+use crate::config::{DedupParams, MetricParams, ScoreConfig, ScoreWeights};
 use crate::decode;
-use crate::dedup;
+use crate::dedup::{self, BurstInfo};
 use crate::metrics;
 use crate::scan::PhotoEntry;
 
@@ -111,6 +111,42 @@ pub fn pose_descriptor(f: &crate::ai::facedetect::FaceBox) -> Option<[f32; 10]> 
         desc[j * 2 + 1] = (p.1 - f.y) / f.h;
     }
     Some(desc)
+}
+
+/// 对「已分析」的 JPG 做连拍分析，返回 配对键 -> BurstInfo。
+///
+/// `score` 子命令与 `review` 复核界面共用同一逻辑，
+/// 保证两边的连拍分组/排名/保留逐张一致。
+pub fn analyze_photo_bursts(
+    entries: &[PhotoEntry],
+    analyzed: &HashMap<String, AnalysisResult>,
+    params: &DedupParams,
+    weights: &ScoreWeights,
+) -> HashMap<String, BurstInfo> {
+    let jpg_idx: Vec<usize> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| !e.is_raw && analyzed.contains_key(e.pair_id()))
+        .map(|(i, _)| i)
+        .collect();
+    let mut map = HashMap::new();
+    if jpg_idx.len() < 2 {
+        return map;
+    }
+    let jpg_entries: Vec<PhotoEntry> = jpg_idx.iter().map(|&i| entries[i].clone()).collect();
+    let hashes: Vec<u64> =
+        jpg_idx.iter().map(|&i| analyzed[entries[i].pair_id()].dhash).collect();
+    let descs: Vec<Option<[f32; 10]>> =
+        jpg_idx.iter().map(|&i| analyzed[entries[i].pair_id()].pose_desc).collect();
+    let scores: Vec<f64> = jpg_idx
+        .iter()
+        .map(|&i| total_score(&analyzed[entries[i].pair_id()].scores, weights))
+        .collect();
+    let infos = dedup::analyze_bursts(&jpg_entries, &hashes, &scores, &descs, params);
+    for (&idx, info) in jpg_idx.iter().zip(infos.iter()) {
+        map.insert(entries[idx].pair_id().to_string(), info.clone());
+    }
+    map
 }
 
 /// 分析结果 + 缓存统计

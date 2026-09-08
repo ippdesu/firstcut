@@ -7,5 +7,6 @@ pub mod decode;
 pub mod dedup;
 pub mod metrics;
 pub mod output;
+pub mod review;
 pub mod scan;
 pub mod score;

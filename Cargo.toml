@@ -12,6 +12,10 @@ name = "pic_process"
 path = "src/main.rs"
 
 [[bin]]
+name = "pic_process-review"
+path = "src/bin/review.rs"
+
+[[bin]]
 name = "pic_process-tune"
 path = "src/bin/tune.rs"
 
@@ -55,3 +59,6 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 walkdir = "2"
 jpeg-decoder = "0.3"
+axum = "0.8"
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }

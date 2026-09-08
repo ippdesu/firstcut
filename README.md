@@ -243,11 +243,11 @@ presets/                  # 场景预设（编译进二进制，config-template 
 ## 测试
 
 ```bash
-cargo test --lib                    # 单元测试（42 项）
+cargo test --lib                    # 单元测试（46 项）
 cargo test --test integration_test  # 集成测试（6 项，需要 testpic/）
 ```
 
-- **单元测试** 42 项（`cargo test --lib`）：
+- **单元测试** 46 项（`cargo test --lib`）：
   - `dedup` 11 项（datetime 解析、闰年/平年、严格 dHash、连拍分组、dHash 距离切分、
     空时间无连拍、无描述子退化 M2、M9 姿态分簇各自保留、阈值种子聚类、
     组上限截断、姿态距离值）
@@ -261,7 +261,7 @@ cargo test --test integration_test  # 集成测试（6 项，需要 testpic/）
   - `scan` 6 项（配对键含目录、侧车命名保留大小写、同目录配对、
     跨目录配对、编号回绕不合并、歧义不配对）
   - `decode` 1 项（8 种 EXIF Orientation 像素变换）
-  - `review` 若干项（路径越界 403、缩略图缓存、快照/星级与 score 一致性）
+  - `review` 4 项（路径越界拒绝、正斜杠相对路径、缩略图缓存名稳定、JPG 白名单）
 - **集成测试** 6 项（`tests/integration_test.rs`）：端到端 pipeline 验证（扫描/配置/dedup/总分/星级映射/模板）
   - 依赖 `testpic/` 真实照片目录（已 gitignore，私人照片不入库）
   - testpic 缺失时跳过依赖它的用例，其余纯逻辑用例始终执行
