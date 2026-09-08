@@ -1,9 +1,9 @@
 # 照片初筛评分工具（Rust）— 设计与实现文档
 
-> 状态：**Phase 1 已完成并发布 v1.1**（GitHub: ippdesu/firstcut，tag v1.0 / v1.1）；M6 缺陷修复已合并 main（未另发 Release）
+> 状态：**Phase 1 已完成并发布 v1.1**（GitHub: ippdesu/firstcut，tag v1.0 / v1.1）；M6/M7/M8 缺陷修复已合并 main（未另发 Release）
 > 日期：2026 规划稿 / 2026 实施完成
 > 需求来源：索尼相机 JPG+ARW 连拍/风景/人像选片地狱，需要自动初步评分
-> 配套文档：`README.md`（用户手册）/ `release_notes.md`（版本说明）/ `M5_REVIEW.md`（M5 决策记录）/ `firstcut.toml`（配置模板）
+> 配套文档：`README.md`（用户手册）/ `release_notes.md`（版本说明）/ `GLM_REVIEW.md`（外部评审记录与处理状态）/ `M5_REVIEW.md`（M5 决策记录）/ `firstcut.toml`（配置模板）
 
 ## 0. 目标（根据确认的需求）
 

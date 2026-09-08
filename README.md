@@ -234,6 +234,7 @@ cargo test --test integration_test  # 集成测试（6 项，需要 testpic/）
 
 - [`DESIGN.md`](DESIGN.md) — 设计文档（技术选型、评分引擎、Phase 2 规划）
 - [`release_notes.md`](release_notes.md) — 版本说明
+- [`GLM_REVIEW.md`](GLM_REVIEW.md) — 外部评审记录与处理状态（长期累积，每轮评审追加）
 - [`M5_REVIEW.md`](M5_REVIEW.md) — M5 调参决策历史（已落地，存档备查）
 
 ## Phase 2（规划中，未实现）

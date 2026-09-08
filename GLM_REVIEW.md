@@ -1,4 +1,39 @@
-# 项目评审与修复工单（glm-review 分支）
+# 项目评审记录（外部评审逐条工单 + 处理状态）
+
+> **本文件是长期评审记录**：每轮外部评审（GLM / 其他）的工单与处理状态都追加在这里，
+> 不再单开文件。原始工单保持原样，处理结论统一记在下面的「处理状态」表。
+>
+> **当前状态**：第 1 轮（GLM，2026-09-08）**13 项全部核实为真、全部已修复**，
+> 合入 main @ `b477c96`。测试 26 → **37 单元 + 6 集成**全过。
+
+## 处理状态（第 1 轮 · GLM · 2026-09-08）
+
+| 工单 | 问题 | 核实 | 状态 |
+|---|---|---|---|
+| PR-1 | 配对回归：`JPG/` + `RAW/` 分目录时 ARW 拿不到分数 | ✅ 成立（P0，M7-3 引入） | ✅ 已修：两步配对（同目录优先 + 无歧义跨目录兜底） |
+| PR-2 | `--config` 失败只警告；未知字段静默忽略；`star_mode` 拼错静默回退 | ✅ 全部成立 | ✅ 已修：硬报错 + `deny_unknown_fields` + 取值/百分位校验 |
+| PR-3 | EXIF Orientation 5/7 变换互换 | ✅ 成立（3×2 矩阵推演确认） | ✅ 已修 + 8 方向像素测试；`CACHE_VERSION` 10→12 |
+| PR-4a | pose 兜底在"只有小脸"时被跳过 | ✅ 成立 | ✅ 已修（`sharpness_region.is_none()`） |
+| PR-4b | 区域分/全局分取 max 未入档 | ✅ 成立（文档缺失） | ✅ 已补文档，行为不变 |
+| PR-4c | `reblur_mean_region` 实际返回 P80 | ✅ 成立 | ✅ 改名 `reblur_p80_region` |
+| PR-5a | 配置指纹含权重/星级阈值 → 改权重触发全量重算 | ✅ 成立（实测已改善） | ✅ 已修：指纹只覆盖曲线参数 |
+| PR-5b | 缓存命中判定重复、`ScoreCache::get` 死代码 | ✅ 成立 | ✅ 已收敛为 `CacheRow::matches` |
+| PR-5c | `flush` 每次重写全部行 | ✅ 成立 | ✅ 已改为只写 dirty 行 |
+| PR-6 | 文档批次修正 | ✅ 全部成立 | ✅ 已修 |
+| PR-7 | pose 输出是否需 sigmoid 注释矛盾 | ✅ 矛盾成立；**实测 248 个置信度全在 (0,1) → 已 sigmoid** | ✅ 只统一注释，代码不变 |
+
+**附A（暂不实施，等拍板）**：letterbox 预处理（需配合人脸检出率回归，基线 109/119）、
+清晰度改"命中即用区域分"、相对星级小批次畸形、他人侧车覆盖边界、低危备忘项。
+
+**附B（评审判定为正确的项）**：与实现核实一致，未发现误判。
+
+**流程教训**：PR-1 能进 main，是因为 M7 提交时跑了 `cargo test` 但用
+`Select-Object -First 3` 截断了输出，只看到 lib 结果就误判"全过"。
+此后测试结果必须看完整尾部。
+
+---
+
+## 第 1 轮原始工单（GLM，2026-09-08）
 
 > **本文件用途**：交给实现方（DSH）逐条落地为 PR 的工单。每条问题包含：
 > 精确位置（file:line）→ 现象与证据 → 根因 → 修复方案（含代码草图）→
@@ -19,15 +54,15 @@
 ## 验证命令（每个 PR 完成后都要跑）
 
 ```bash
-cargo test --lib                    # 单元测试（当前 26 项全过，改动后只能增不能减）
-cargo test --test integration_test  # 集成测试（当前 5 过 1 挂，PR-1 后应 6/6）
+cargo test --lib                    # 单元测试（当前 37 项全过，改动后只能增不能减）
+cargo test --test integration_test  # 集成测试（当前 6/6）
 cargo build --release
 
 # PR-1 手工验收（分目录布局映射）：
 ./target/release/pic_process scan testpic -o /tmp/scan.csv
-#   预期：所有 JPG/ARW 行 has_pair=true（当前全部 false）
+#   预期：除无对端者外所有 JPG/ARW 行 has_pair=true
 ./target/release/pic_process score testpic -o /tmp/score.csv --no-ai --no-cache --cache /tmp/t.sqlite
-#   预期：ARW 行的 total_score / stars / faces 与同名 JPG 一致（当前为空）
+#   预期：ARW 行的 total_score / stars / faces 与同名 JPG 一致
 #   检查列（1-based）：$4=is_raw, $5=has_pair, $19=total_score, $20=stars
 ```
 
