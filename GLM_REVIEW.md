@@ -1,218 +1,392 @@
-# 项目评审报告（glm-review 分支）
+# 项目评审与修复工单（glm-review 分支）
 
-> 评审日期：2026-09-08　|　评审基准：main @ ab768d8　|　评审人：GLM
-> 方式：通读 DESIGN.md / README.md / 全部 src 源码与测试，对照文档逐项核实；
-> 关键结论均以实机运行验证（`cargo test` + 对 testpic 实跑 `scan` / `score`），
-> 并核对了 image crate 0.25.10 与 Cargo.lock 中依赖的真实源码语义。
-> 本分支只含本报告，未改动任何代码。
+> **本文件用途**：交给实现方（DSH）逐条落地为 PR 的工单。每条问题包含：
+> 精确位置（file:line）→ 现象与证据 → 根因 → 修复方案（含代码草图）→
+> 验收标准 → 文档同步项。实现时若行号偏移，请按符号名定位。
+>
+> **基准**：main @ `ab768d8`（本分支与其同源，未改任何代码）
+> **评审日期**：2026-09-08　**评审方式**：通读 DESIGN/README/全部源码与测试；
+> 所有 🔴/🟡 级结论均经实机验证（cargo test + 对 testpic 实跑 scan/score +
+> 核对 image crate 0.25.10 依赖源码）。
+>
+> **实施红线**：
+> 1. 遵守 DESIGN.md §11——**每个 PR 必须同步更新 `README.md` / `DESIGN.md`**，不允许文档与实现脱节。
+> 2. 不修改任何评分默认值（权重/曲线/星级阈值），除非工单明确要求。
+> 3. 涉及缓存值语义变化的 PR **必须递增 `src/cache.rs` 的 `CACHE_VERSION`**（见各条标注）。
+> 4. 一个 PR 一个主题；commit message 沿用仓库现有中文 conventional 风格。
+> 5. `CACHE_VERSION` 递增冲突的协调：若多个 PR 都需 bump，按合入顺序依次 +1，后合入者 rebase 时调整。
 
----
+## 验证命令（每个 PR 完成后都要跑）
 
-## 总评
+```bash
+cargo test --lib                    # 单元测试（当前 26 项全过，改动后只能增不能减）
+cargo test --test integration_test  # 集成测试（当前 5 过 1 挂，PR-1 后应 6/6）
+cargo build --release
 
-项目文档质量高，DESIGN/README 与实现的一致性总体良好（26 项单元测试实测全过，
-M6 的 EV 容差带数学、M7 的侧车命名/相对星级实现均与文档吻合）。
-但存在 **1 个未发现的 P0 级功能回归**（M7 配对键改动静默破坏了分目录工作流，
-且集成测试在 HEAD 上是挂的）、**3 个 P1 正确性问题**（含一个与 M6-4 教训同类的
-静默回退），以及若干文档/精度/性能问题。
-
----
-
-## 🔴 P0 — 功能回归（实测复现）
-
-### 1. M7「配对键含目录」破坏了 JPG/RAW 分目录工作流：ARW 拿不到分数
-
-**位置**：`src/scan.rs:93`（`pair_key`）、`src/main.rs:177-186`（分数映射）
-
-**证据（实机复现，testpic 采用 `JPG/`、`RAW/` 两个子目录分放——M0 时代起的标准布局，
-集成测试 fixture 也按此写）**：
-
-- `pic_process scan testpic` → **全部 31 个文件 `has_pair=false`**（JPG 与 ARW
-  不在同一目录，永不配对）。
-- `pic_process score testpic` → CSV 中 **15 个 ARW 行的分数/星级/连拍字段全部为空**，
-  `DSC00886.ARW` 等没有任何来自同名 JPG 的映射分数。
-- 集成测试 `test_scan_directory_finds_photos` 在 HEAD 上 **失败**（5 过 1 挂）：
-  断言 `paired_count > 0`（tests/integration_test.rs:34）。M7 提交（db68d2b）
-  改了 scan.rs 但没有更新该测试；README/DESIGN 仍声称"6 项集成测试全过"。
-
-**影响**：索尼双卡分工（槽 1 存 JPG / 槽 2 存 RAW）或手动把 JPG、ARW 分开存放
-的用户——这是本仓库自己的测试 fixture 所建模的工作流——核心承诺
-「对 JPG 评分、把分数映射到同名 ARW」（DESIGN §0）**静默失效**：不报错、
-CSV 里 ARW 行空白、`--xmp` 模式下一个侧车都不会写出。
-
-**分析**：M7-3 决策要解决的问题是"编号回绕导致不同目录出现**不同**照片同名"
-（-roll1/roll2 场景），方案"目录+主干"正确；但把**同一张照片的 JPG/ARW 分放
-两个子目录**的情形一并排除了。两种场景需要区分。
-
-**修复方向**：同目录配对优先；无同目录配对时，跨目录同名、且全树内该主干
-无歧义（各自只有一个 JPG 和一个 ARW 候选）时兜底配对（可再加拍摄时间校验）。
-同步更新 M7-3 决策记录、测试 fixture 与 README。
+# PR-1 手工验收（分目录布局映射）：
+./target/release/pic_process scan testpic -o /tmp/scan.csv
+#   预期：所有 JPG/ARW 行 has_pair=true（当前全部 false）
+./target/release/pic_process score testpic -o /tmp/score.csv --no-ai --no-cache --cache /tmp/t.sqlite
+#   预期：ARW 行的 total_score / stars / faces 与同名 JPG 一致（当前为空）
+#   检查列（1-based）：$4=is_raw, $5=has_pair, $19=total_score, $20=stars
+```
 
 ---
 
-## 🔴 P1 — 正确性问题
+## PR-1【P0】修复配对回归：JPG/RAW 分目录存放时 ARW 拿不到分数
 
-### 2. `--config` 加载失败时静默回退默认配置，继续跑完整流水线
+### 问题
 
-**位置**：`src/main.rs:101-105`
+- **位置**：`src/scan.rs:93`（`pair_key`）、`src/scan.rs:122-141`（配对构建）、`src/main.rs:167-199`（分数/星级按 pair_key 回填）。
+- **现象**（实测）：testpic 布局为 `JPG/*.JPG` + `RAW/*.ARW` 两个子目录（M0 起
+  的 fixture 约定，集成测试也按此写）。当前：
+  - `scan testpic` → 全部 31 个文件 `has_pair=false`；
+  - `score testpic` → 15 个 ARW 行的分数/星级/连拍字段**全部为空**；
+  - 集成测试 `test_scan_directory_finds_photos` **失败**（断言 `paired_count > 0`，
+    tests/integration_test.rs:34）。M7 提交 db68d2b 改了 scan.rs 但没更新该测试。
+- **根因**：M7-3 为解决"编号回绕→不同目录出现**不同**照片同名"，把配对键改成
+  「目录+主干」，同时把**同一张照片的 JPG/ARW 分放两个子目录**（索尼双卡分工、
+  手动归档的常见形态）的情形一并排除了。两种场景被混淆。
+- **影响**：分目录用户的 CSV 里 ARW 全空白、`--xmp` 一个侧车都不写、全程无报错。
+
+### 修复方案（两步配对，保守消歧）
+
+配对解析从"隐式键相等"改为显式的 `pair_id` 分配，在 `scan_directory` 内完成：
+
+1. **同目录配对（主规则，行为不变）**：同一目录内 `stem` 相同的 JPG 与 ARW 配对。
+2. **跨目录兜底（新增）**：仅当某个 stem 在**整个扫描树内恰好只有 1 个 JPG 和
+   1 个 ARW**、且两者不在同一目录时，跨目录配对。
+   歧义（≥2 个同名 JPG 或 ≥2 个同名 ARW 跨目录，即回绕场景）时**保持不配对**，
+   宁可不配也不错误合并——回绕场景下各目录内本就有自己的同目录对，不受影响。
+
+实现要点：
 
 ```rust
-Err(err) => {
-    eprintln!("[score] 警告: 配置加载失败（使用默认）: {err:#}");
-    ScoreConfig::default()
+// PhotoEntry 增加字段（注意 serde 跳过，避免污染 CSV 列）：
+#[serde(skip_serializing)]
+pub pair_id: String,   // 同目录对: 复用 "dir|stem"；跨目录对: "cross:<stem>"
+
+// scan_directory 流程调整为：
+//   1) 现有 stem_exts 统计（键=dir|stem）——同目录配对
+//   2) 对「无同目录对」的条目，按 stem 聚合全树候选：
+//      jpg_count == 1 && arw_count == 1 → 跨目录配对，赋同一 pair_id
+//   3) 配对完成后统一回填 has_pair（有对端才为 true）
+```
+
+`src/main.rs` 中所有用 `e.pair_key()` 做回填/去重的地方改用 `e.pair_id()`：
+- L167 `by_key`（分析结果键）→ 以 JPG 的 `pair_id` 为键；
+- L178-186 ARW 回填 → 按 `pair_id` 查；
+- L190-199 星级 `rated`/`ratings` → 按 `pair_id`；
+- L202-222 XMP 的 `seen` 去重 → **改为按侧车最终路径去重**（而不是 pair_id），
+  因为跨目录对的 JPG 与 ARW 各需一份侧车（Lightroom 按图片文件所在目录找
+  `<stem>.xmp`）；同目录对路径相同自然只写一次，行为不变。
+
+### 验收标准
+
+- [ ] `cargo test --test integration_test` **6/6 通过**（现有失败用例转绿）。
+- [ ] 上面"验证命令"两条手工验收的预期输出成立。
+- [ ] 新增单元测试（scan.rs，合成条目即可，不依赖真实照片）：
+  - 分目录（JPG/ + RAW/）→ 配对成功；
+  - 回绕（roll1、roll2 各含同名 JPG+ARW）→ 各自按同目录配对，**不**跨目录合并；
+  - 歧义（1 个 JPG + 2 个跨目录同名 ARW）→ 不配对；
+  - 同目录配对行为与现状一致（既有测试 `pair_key_separates_directories` 改造后仍须通过）。
+- [ ] 回归确认：同目录混合布局的照片行为与 main 完全一致（分数、星级、侧车数）。
+
+### 文档同步
+
+- `DESIGN.md` §10 M7-3 决策记录**补记**：原方案的副作用与本修复的两步策略
+  （补一条 M7-3 修订，说明为何跨目录兜底要加无歧义约束）。
+- `README.md`：输出说明处补一句"JPG 与 ARW 分放不同子目录也可配对（同名且
+  无歧义时）"。
+
+### 注意事项
+
+- 缓存**不需要** bump `CACHE_VERSION`（单文件分析值与配对无关）。
+- 不要用拍摄时间做消歧（留作后续增强），保持本 PR 最小化。
+
+---
+
+## PR-2【P1】`--config` 失败改为硬错误 + 配置解析防静默陷阱
+
+### 问题
+
+- **2a** `src/main.rs:101-105`：`--config` 加载失败只 `eprintln!` 警告，随后用
+  **默认配置**跑完整个流水线并写出 XMP 星级侧车。用户显式传了配置却拿到默认
+  结果——与 M6-4 决策（"改了配置看不到变化属静默 bug"）同类且后果更重。
+- **2b** `src/config.rs`：`ScoreConfig` 系列只有 `#[serde(default)]`，没有
+  `deny_unknown_fields`。TOML 字段名手滑（如 `exposure_ev_Io`）被**静默忽略**，
+  用户以为改了参数、结果不变——M6-4 的教训重演在解析层。
+- **2c** `src/output/xmp.rs:89`（`assign_ratings`）：`star_mode` 只要不是
+  `"absolute"`（忽略大小写）就走 relative，拼写错误（`"absolue"`）静默回退。
+
+### 修复方案
+
+```rust
+// main.rs（2a）：
+Err(err) => anyhow::bail!("配置加载失败: {path:?}\n{err:#}"),
+// 注意：在 bail 前不得已默认配置写出任何 CSV/XMP（现状是先加载再扫描，顺序无需调整）。
+
+// config.rs（2b）：三个结构体都加
+#[serde(deny_unknown_fields, default)]
+// 两个既有测试（all_presets_are_loadable / unknown_preset_is_none）必须仍通过，
+// presets/*.toml 与 config_template() 生成的模板只含已知字段，已核实兼容。
+
+// config.rs load_config()（2c）追加校验：
+if !(m.star_mode.eq_ignore_ascii_case("relative")
+    || m.star_mode.eq_ignore_ascii_case("absolute")) {
+    anyhow::bail!("star_mode 只能是 \"relative\" 或 \"absolute\"，当前为 {m:?}（{path:?}）");
 }
 ```
 
-用户显式指定了 `--config`（意味着"我要用这份参数"），TOML 拼错/路径错时只在
-stderr 提一句，然后用**默认配置**完成评分并**写出 XMP 星级侧车**。
-这是 M6-4 决策记录里刚修过的"静默错误"的同类坑，且后果更重（错误星级落盘）。
-应当 `bail` 直接退出。
+- 建议顺带（同一 PR，小改动）：校验 relative 百分位单调递增
+  `star_five_pct <= star_four_pct <= star_three_pct <= star_two_pct`（当前无校验，
+  写反会给全批统一星）。
 
-### 3. EXIF Orientation 5/7 的变换互换（镜像翻转）
+### 验收标准
 
-**位置**：`src/decode.rs:107-109`
+- [ ] 单元测试：未知字段 → `load_config` 报错（错误信息含字段名）；`star_mode`
+  拼错 → 报错；百分位倒序 → 报错；合法配置 + 5 份预设 → 全部照常加载。
+- [ ] 手工：`score testpic --config 不存在.toml` 以非零码退出、stderr 有明确
+  原因、**不产出** CSV/XMP。
+- [ ] `config-template` / `config-template --preset <5 个>` 生成的文件都能被
+  `load_config` 接受。
+
+### 文档同步
+
+- `README.md` "多场景配置"一节：补"配置加载失败会直接报错退出（不再回退默认）；
+  未知的配置字段会被拒绝（防止拼写错误静默失效）"。
+- `DESIGN.md` §10 决策表追加一行（M8 前）：配置解析 fail-fast 决策及依据
+  （援引 M6-4）。
+
+### 注意事项
+
+- 对已持有含多余字段配置文件的用户是破坏性变更（以前静默忽略、现在报错）——
+  这正是目的，release notes 里要写明。
+- 不涉及缓存值，**不需要** bump `CACHE_VERSION`。
+
+---
+
+## PR-3【P1】修复 EXIF Orientation 5/7 变换互换
+
+### 问题
+
+- **位置**：`src/decode.rs:101-113`（`apply_orientation`，问题在 L107/L109 两行）。
 
 ```rust
+// 现状（错误）：
 5 => rotate90(&flip_horizontal(&img)),
 7 => rotate270(&flip_horizontal(&img)),
 ```
 
-已对照 image crate 0.25.10 `imageops/affine.rs` 源码确认 rotate90/270 的精确
-语义，并对 2×2 矩阵逐步推演：
+- **证据**：已对照 image crate 0.25.10 `imageops/affine.rs` 源码确认旋转语义
+  （rotate90 顺时针：old(x,y)→new(h-1-y,x)；rotate270：old(x,y)→new(y,w-1-x)），
+  并以 2×2 矩阵逐步推演：
+  - Orientation 5 的正确显示变换是 **transpose**（沿主对角线翻转）=
+    `flip_horizontal(rotate90(img))`——先转后翻；
+  - 代码现状给出的是 **anti-transpose**（反对角线翻转），恰为 orientation **7**
+    的正确变换；两者互换。镜像+倒置的照片会让人脸检测/构图/曝光全部系统性偏差。
+- 其余值已逐一验证正确：2=flipH、3=rot180、4=flipV、6=rot90CW、8=rot270CW。
+- 另已验证 `image::open` 兜底路径（decode.rs:56）不会自动应用方向
+  （`ImageReader::decode` → `DynamicImage::from_decoder`，无隐式旋转），
+  修复 `apply_orientation` 即可，两条解码路径共用此函数。
 
-- Orientation 5 要求 **transpose**（沿左上-右下主对角线翻转）= `flip_horizontal(rotate90(img))`；
-- 代码给出的 `rotate90(flip_horizontal(img))` 是 **anti-transpose**（沿反对角线翻转），
-  恰好是 orientation **7** 的正确变换；
-- Orientation 7 反之，两个 case 内外顺序写反、互换了。
+### 修复方案
 
-影响：orientation 5/7 的照片呈镜像+倒置，人脸检测/构图/曝光全部系统性偏差。
-索尼机身常写 1/3/6/8，5/7 少见，故为低频但真实的 bug。
-（6/8/2/3/4 已逐一验证正确；另已验证 `image::open` 兜底路径不会自动应用方向，
-无双重旋转问题。）
+```rust
+5 => flip_horizontal(&rotate90(&img)),
+7 => flip_horizontal(&rotate270(&img)),
+```
 
-### 4. 配置的另外两个静默陷阱：未知字段被忽略 + star_mode 无校验
+### 验收标准
 
-**位置**：`src/config.rs`（`#[serde(default)]`，无 `deny_unknown_fields`）
+- [ ] 新增单元测试（decode.rs）：构造 2×2 `RgbImage`（四角像素值 1/2/3/4），
+  对 orientation 1~8 全部断言输出像素位置（5 → 期望 `[1 3; 2 4]` 转置；
+  7 → 期望 `[4 2; 3 1]` 反对角；其余值锁定现状）。
+- [ ] `cargo test --lib` 全过。
 
-- TOML 里 `exposure_ev_Io = 3`（l 手滑成 I）会被 **静默忽略**，暗侧容差保持
-  默认 4.0——用户以为改了，结果不变。这正是 M6-4 修过的"改了配置看不到变化"
-  的变体，只是这次出在解析层。
-- `star_mode = "absolue"`（拼错）静默按 relative 处理（`assign_ratings` 只
-  区分 absolute/其他）。建议 `#[serde(deny_unknown_fields)]` + star_mode
-  白名单校验（与权重和、EV 嵌套校验放一起）。
+### 文档同步
 
----
+- `DESIGN.md` §2"像素处理"行或 §6 decode.rs 说明：补一句"orientation 5/7 为
+  先旋转后镜像（v1.2 修复过一次内外顺序写反）"。release notes 记入修复列表。
 
-## 🟡 P2 — 语义/精度问题
+### 注意事项
 
-### 5. 清晰度三层链路与文档语义不一致 + 链路有缝隙
-
-**位置**：`src/score.rs:225-241, 252, 277-283`
-
-- **(a) max 语义未入文档**：有主体级人脸时代码取 `max(region, global)`，
-  DESIGN §3.1 写的是"人脸命中 → 人脸区域 reblur P80"。当主体真糊而背景纹理
-  清晰（跑焦+繁杂背景）时 global 盖过 region——这恰是清晰度维度（尤其
-  sports 预设、权重 0.45）想抓的废片。是决策还是笔误需要定案并写进文档。
-- **(b) 三层链路缝隙**：pose 兜底条件是 `faces == 0`；SCRFD 只检出
-  高度 4%~100% 以下的小脸（如 3%）时 `faces > 0`，**跳过 pose 层**直接落
-  `max(global, 50)` 中性下限。与 M5"SCRFD 漏检 → pose"的意图不完全一致。
-- **(c) 命名误导**：`reblur_mean_region`（sharpness.rs:171）实际返回 **P80**
-  （函数内 doc 也写 P80），建议改名 `reblur_p80_region`。
-- 另注：无人脸时 `sharpness.max(50.0)` 地板会把真糊的无主体照片也抬到 50+
-  ——这是 M5 已明文记录的取舍（宁可漏判、人工 gallery 复核），不算 bug，
-  但与 sports 预设"清晰度决定成败"的定位存在张力，可在预设注释里提一句。
-
-### 6. pose.rs 两处注释自相矛盾（输出是否已 sigmoid）
-
-**位置**：`src/ai/pose.rs:9`（"cls 与 kps conf 为 logits 需 sigmoid"）
-vs `src/ai/pose.rs:88`（"Xenova 转换：score 已 sigmoid"）。代码两处都没做 sigmoid。
-
-若该模型输出实为 raw logits，则 `CONF_THRESHOLD=0.25` 实际对应 sigmoid≈0.56、
-`head_region` 的 `c > 0.3` 对应≈0.57，均比设计意图严格约一倍（方向是漏检而非
-错杀）。需用 `pic_process-probe` / `debug_pose` 实测输出值域定案，并统一注释。
-
-### 7. AI 预处理 `resize_exact` 直接压扁长宽比（无 letterbox）
-
-**位置**：`src/ai/facedetect.rs:57`、`src/ai/pose.rs:59`（640×640）、
-`src/ai/iqa.rs:36`（224×224）
-
-3:2 照片被压扁 1.5:1 后送模型。归一化坐标映射**没有**因此出错（水平/垂直各自
-归一化，已验证），但模型看到的是变形的脸——SCRFD 的选型理由恰是小脸检出，
-变形会折损这部分精度；CLIPIQA 美学分同理。标准做法是 letterbox 补边。
+- **必须 bump `CACHE_VERSION`（10 → 11）**：5/7 照片的缓存行是按错误方向算的，
+  缓存不含 orientation 字段，只能整批失效重建。
+- 实际影响频率低（索尼机身常写 1/3/6/8），release notes 中如实注明。
 
 ---
 
-## 🟡 P2 — 性能
+## PR-4【P2】清晰度三层链路：补 pose 兜底缝隙 + max 语义入档
 
-### 8. 配置指纹过宽：只调权重也会全量重算
+### 问题
 
-**位置**：`src/config.rs:149-176`（`config_fingerprint`）
+- **位置**：`src/score.rs:252`（pose 兜底条件）、`src/score.rs:277-283`（取分）、
+  `src/metrics/sharpness.rs:171`（命名）。
+- **4a 链路缝隙**：pose 兜底条件是 `faces == 0 && sharpness_region.is_none()`。
+  SCRFD 检出的人脸**全部**低于主体级门槛（高度 <4%）时 `faces > 0`，pose 层被
+  跳过，直接落到中性下限——与 M5"SCRFD 漏检 → pose"的设计意图不符。
+- **4b max 语义未入档**：有主体级人脸时代码取 `max(region, global)`
+  （L277-279），DESIGN §3.1 与 README 写的是"人脸命中 → 人脸区域 reblur"。
+  主体真糊+背景纹理清晰（跑焦）时全局分会盖过区域分——这恰是清晰度维度
+  （sports 预设权重 0.45）想抓的废片。**这是行为决策点，见下。**
+- **4c 命名误导**：`reblur_mean_region` 实际返回 **P80**（函数内 doc 自己写着
+  P80），名字里的 mean 是历史遗留。
 
-指纹把 `weights` 和 `rating_5..2` 也编了进去，但缓存行存的是五维子分+dHash+
-faces——权重与星级阈值都只在运行期合成总分/星级时才用到，**不影响缓存值**。
-后果：用户最高频的调参动作（改权重）会让全部照片重新解码+AI 推理
-（155ms/张，万张约 26 分钟）。指纹应收窄为 `sharpness_k / noise_k0 /
-exposure_target / exposure_ev_* / exposure_subject_blend`。
+### 修复方案
 
-顺带两个缓存小项：
+- **4a（本 PR 实施，低风险）**：条件改为
 
-- `ScoreCache::flush()`（cache.rs:135）每次把内存里**全部**行（含未变化的旧行）
-  INSERT OR REPLACE 一遍，且永不清理已删除文件的行；
-- 缓存命中判定逻辑在 `score.rs:122-135` 内联重复了一份，`cache.rs get()`
-  已无人调用（死代码）。两处条件将来改一处漏一处，建议收敛为一份。
+  ```rust
+  if sharpness_region.is_none() {
+  ```
+
+  （在既有 `if let Some(pp) = &ai.pose` 块内）。效果：SCRFD 只有小脸/SCRFD 出错
+  时都跑 pose 定位头部。无人脸行为不变。
+- **4b（默认只改文档；行为变更需用户拍板，不在本 PR 做）**：DESIGN §3.1 与
+  README 清晰度行补一句："人脸区域分与全局分**取高者**（防止区域估计偶发偏低
+  拉低整张）；代价是跑焦+繁杂背景的照片可能被背景纹理救回。"若用户后续决定
+  改为"命中即用区域分"，需单独 PR + 全量回归 + `CACHE_VERSION` bump。
+- **4c（本 PR 实施）**：函数改名 `reblur_mean_region` → `reblur_p80_region`
+  （调用点仅 score.rs:237 与 260 两处 + doc），行为零变化。
+
+### 验收标准
+
+- [ ] 单元测试：合成 `PersonBox`（关键点 conf 混合有 >0.3 与 <0.3）验证
+  `head_region` 返回值；4a 的条件变更以集成方式在 testpic 上冒烟
+  （faces 数与 sharpness 分布无异常跳变）。
+- [ ] `cargo test --lib` 全过；`cargo test --test integration_test` 不劣于修复前。
+
+### 文档同步
+
+- `DESIGN.md` §3.1 / README 清晰度行（4b 的一句话）。
+- release notes 记入 4a/4c。
+
+### 注意事项
+
+- 4a 会改变部分照片（仅小脸被检出者）的 sharpness 输入 → **bump
+  `CACHE_VERSION`**（合入顺序在 PR-3 之后则 11 → 12）。
+- 无人脸时 `sharpness.max(50.0)` 中性地板是 M5 已明文记录的取舍（宁可漏判真糊、
+  人工 gallery 复核），**不改**；但可在 README sports 预设注释里提一句该地板
+  对无主体题材的影响。
 
 ---
 
-## 🔵 P3 — 文档与实现不一致（DESIGN §11 明文要求不允许）
+## PR-5【P2】配置指纹收窄 + 缓存层清理
 
-| # | 位置 | 问题 |
+### 问题
+
+- **5a** `src/config.rs:149-176`（`config_fingerprint`）：指纹把 `weights` 与
+  `rating_5..2` 也编了进去，但缓存行存的是**五维子分+dHash+faces**——权重与
+  星级阈值只在运行期合成总分/星级时使用，不影响缓存值。后果：用户最高频的
+  调参动作（改权重）触发全量解码+AI 重算（155ms/张）。
+- **5b** 缓存命中判定在 `src/score.rs:122-135` 内联重复一份，
+  `src/cache.rs:106-117` 的 `ScoreCache::get` 已无人调用（死代码）；两处条件
+  （size/mtime/version/cfg_hash）将来改一处漏一处。
+- **5c** `src/cache.rs:135-161`（`flush`）：每次把内存中**全部**行（含未变化的
+  旧行）INSERT OR REPLACE 一遍；已删除文件的行永不清理，缓存只增不减。
+
+### 修复方案
+
+- **5a**：指纹只保留影响缓存值的参数——`sharpness_k`、`noise_k0`、
+  `exposure_target`、`exposure_ev_full_lo/hi`、`exposure_ev_lo/hi`、
+  `exposure_subject_blend`。删除 weights 循环与 `rating_5..2`。
+  函数 doc 注明"指纹只覆盖参与缓存值的曲线参数；权重/星级阈值每次运行期生效"。
+- **5b**：删除 `ScoreCache::get` 与 `ScoreCache` 结构体上的 `cfg_hash` 字段
+  （注意：`CacheRow.cfg_hash` 保留，score.rs 内联判定在用）。把内联判定收敛为
+  `cache.rs` 提供的单一函数（如 `CacheRow::matches(size, mtime, version, cfg_hash)`），
+  score.rs 调用它，消除重复。
+- **5c**：`ScoreCache` 增加 `dirty: std::collections::HashSet<String>`，
+  `put()` 记录脏键，`flush()` 只写脏行。旧行清理（删除照片后回收）标记为
+  **可选项**：实现的话在 main.rs flush 前传入本次扫描的 path 集做差集删除，
+  不实现则在 cache.rs 顶部注释说明缓存只增不减的现状。
+
+### 验收标准
+
+- [ ] 单元测试：仅改 weights 的两个配置 → 指纹相同；改 `sharpness_k`/任意
+  `exposure_*` → 指纹不同；`rating_5` 改动 → 指纹相同。
+- [ ] 手工：同一目录跑两遍 `score`，第二遍全部缓存命中（日志 `新分析 0`）；
+  改一个权重字段再跑 → **仍全部命中**（修复前会全量重算）；
+  改 `exposure_target` → 全量重算（预期行为）。
+- [ ] `cargo test --lib` 全过。
+
+### 文档同步
+
+- `DESIGN.md` §4 缓存小节与 §10 M6-4 行：补注"配置指纹覆盖曲线参数；权重与
+  星级阈值不参与缓存键（它们在运行期合成总分/星级）"。
+- release notes 记入性能改进（"只调权重不再触发全量重算"）。
+
+### 注意事项
+
+- 5a 会改变指纹值 → 首跑全量 miss 一次，属预期，**不需要**额外 bump
+  `CACHE_VERSION`（cfg_hash 本身就是缓存键的一部分）。
+- DefaultHasher 的跨版本稳定性不作保证——缓存只用于本地加速，哈希变化最多
+  导致一次全量重算，可接受，无需引入稳定哈希。
+
+---
+
+## PR-6【P3】文档批次修正
+
+### 清单（逐项独立小改，可合并为一个 docs PR）
+
+| # | 位置 | 修改 |
 |---|---|---|
-| 9 | `release_notes.md` | 停在 v1.1，缺 M6/M7 全部内容；"12 单元测试"现为 26 项；"Lightroom 直接可读"在 v1.1 时点并不成立（当时仍是 darktable 命名，M7 才改）。M6/M7 也未按惯例发 Release notes 更新 |
-| 10 | `tests/integration_test.rs:43-49` | 注释仍是 M5 中间方案"sharpness 0.35 → 和 1.05"，现行 0.30/1.0；断言区间 0.95~1.10 与 `load_config` 的 ±0.05 口径不一致 |
-| 11 | `README.md` CSV 列说明 | `burst_size` 写"组内张数"，实际是 **dHash 子簇内**张数（30 帧连拍可能 burst_size=2，用户会误解） |
-| 12 | `DESIGN.md` §3.4 vs `composition.rs:58` | 多人降权计数实际用硬编码 **5%** 门槛（主体级人脸定义是 4%），4%~5% 之间的脸计构图分但不计合影人数。行为合理但文档没写 |
-| 13 | 实测 | 集成测试当前 1 项失败（见 P0-1），README/DESIGN 均声称"6 项全过" |
+| 6a | `release_notes.md` | 新增"未发布（M6/M7 合入后）"小节：M6 全部缺陷修复（AI 通道布局、EXIF 方向、构图主体脸门槛、EV 容差带、缓存指纹、场景预设）、M7 全部（侧车命名 `<stem>.xmp`、相对星级、配对键含目录+PR-1 修订、连拍排序用实际权重）、以及 PR-2~PR-5 的用户可见变更（含"配置未知字段现在报错"的破坏性提示）。修正"12 单元测试"→实际数量；删除/修正"Lightroom 直接可读"在 v1.1 时点不成立的表述（当时是 darktable 命名） |
+| 6b | `tests/integration_test.rs:41-49` | 注释仍写"sharpness 0.35 → 和 1.05"（M5 中间方案），改为现行 0.30/1.0；断言区间 0.95~1.10 收紧为与 `load_config` 一致的 0.95~1.05 |
+| 6c | `README.md` CSV 列说明 | `burst_size` 语义由"组内张数"改为"**dHash 子簇内**张数"（30 帧连拍可能显示 2），并在连拍去重说明段落对齐同一用词 |
+| 6d | `DESIGN.md` §3.4 + `src/metrics/composition.rs:56-58` | 写明多人降权计数用 **5%** 门槛（硬编码 0.05，主体级定义是 4%；4%~5% 的脸计构图分但不计合影人数）——代码注释顺手补齐 |
+| 6e | `DESIGN.md` §3.1 / README | 补"人脸区域 1.5× 框"的精确几何：实现为半宽/半高 = 脸框尺寸 ×1.5（即实际区域约 3× 脸框）；pose 头部区域为关键点包围盒 ×1.4/×1.6 |
+
+### 验收标准
+
+- [ ] 文档与代码逐条对得上；`cargo test --lib` 全过（6b 改了断言范围）。
+- [ ] 抽查：文档中不再出现与实现冲突的数字（测试数、权重、阈值、几何）。
 
 ---
 
-## 🔵 P4 — 小项（不阻塞，备忘）
+## PR-7【P3·需先验证】pose 输出 sigmoid 疑点定案
 
-- 集成测试依赖本地 testpic 内容，fixture 漂移无防护（本次就漂了）；`#[ignore]`
-  改造已在 Phase 2 TODO 里，建议提前。
-- `decode.rs:41` JPEG 魔数判断第一个分支 `head == [FF D8 FF DB]` 被第二个分支
-  包含，冗余。
-- `models/` 目录与默认缓存文件均相对 CWD：换目录运行 score 找不到模型/缓存。
-- `pair_key` 对目录做小写化：Windows 无碍，大小写敏感 FS 上仅大小写不同的
-  两个目录会同键冲突（极端边缘）。
-- 相对星级在极小批次下分布畸形（2 张 → 5★+3★，永不出现 1★；1 张 → 5★）。
-  行为可接受，README 可提一句"建议整场一次跑完"已有，可再加"批次过小时星级失真"。
-- `SessionPool` 盲轮询：池 >1 时不 try_lock 空闲 session（现状 AI_POOL_SIZE=1
-  无影响；将来若扩池需注意）。
-- 噪点 ISO 解析失败静默按 100（更严格方向）；EXIF 展示值对非数字挡位的机型
-  会走这条路。
-- XMP `firstcut:` 未写 `burstSize`、无元数据时间戳；他人侧车保护只识别
-  "从未被 firstcut 写过"的侧车——用户在 LR 里改过星级的 firstcut 侧车再跑
-  `--xmp` 会被覆盖（符合"自己的侧车可覆盖"的设计，但值得在 README 提醒）。
+### 问题
+
+- **位置**：`src/ai/pose.rs:9`（模块头："cls 与 kps conf 为 logits **需 sigmoid**"）
+  vs `src/ai/pose.rs:88`（detect() 内："Xenova 转换：score **已 sigmoid**"）。
+  两处注释互相矛盾，代码两者都没做 sigmoid。
+- **风险**：若该 ONNX 实际输出 raw logits，则 `CONF_THRESHOLD=0.25` 实际对应
+  sigmoid≈0.56、`head_region` 的 `c > 0.3` 对应≈0.57——阈值比设计意图严格约
+  一倍，方向是漏检（姿态兜底更少触发）而非错杀。
+
+### 实施步骤（先验证后改，禁止跳步）
+
+1. 用 `pic_process-probe` / `pic_process-debug-pose` 对 testpic 若干张打印
+   `cls` 与 kps conf 的实际值域：
+   - 全部落在 (0,1) → 已 sigmoid，**只统一注释**（删掉"需 sigmoid"的说法）；
+   - 出现 >1 或 <0 → raw logits，加 sigmoid（`1/(1+exp(-x))`）后再比较阈值，
+     **并 bump `CACHE_VERSION`**（会影响 pose 触发面）。
+2. 无论哪种结果，在 `pose.rs` 输出解码处用一句注释锁定事实（值域 + 依据），
+   防止再次漂移。
+
+### 验收标准
+
+- [ ] 验证结论（值域截图/日志数字）写进 PR 描述；两处注释矛盾消除。
+- [ ] `cargo test --lib` 全过；集成测试不劣化。
 
 ---
 
-## ✅ 评审中验证为正确/一致的项（记录在案）
+## 附A：暂不实施（记录在案的开放问题，等用户拍板/后续版本）
 
-- 26 项单元测试实测全过，与文档数量一致。
-- M6 EV 容差带数学（sRGB↔EV 换算、容差带嵌套、两侧独立、主体单向修正）实现
-  与测试、文档三方吻合；`exposure_score` 夹取逻辑正确。
-- M7 XMP 命名（`<stem>.xmp`、保留大小写）、相对星级（并列平均位次）、
-  侧车保护、`-k` 连拍排序用实际权重——实现与决策记录一致。
-- 缓存键（path+size+mtime+CACHE_VERSION+配置指纹）与文档一致；
-  `image::open` 兜底路径无 EXIF 双重旋转问题（已读 crate 源码确认）。
-- 构图三分法距离上限 0.47、噪点 P15、dHash 严格性测试均正确。
+| 项 | 说明 |
+|---|---|
+| AI 预处理 letterbox | SCRFD/pose 640×640、CLIPIQA 224×224 目前 `resize_exact` 压扁长宽比（facedetect.rs:57 / pose.rs:59 / iqa.rs:36）。归一化坐标**不会**因此出错（已验证），但模型看到变形的脸，小脸检出率受损。改进需 letterbox + 坐标反算（x = (x_pad − pad_x)/scale），影响面大，建议独立 PR 并配合检出率回归（当前基线 109/119） |
+| 清晰度 max 语义改为"命中即用区域分" | 见 PR-4 4b，行为变更需用户拍板 + 全量回归 |
+| 相对星级小批次畸形 | 2 张 → 5★+3★（永不出现 1★）、1 张 → 5★。行为可接受；若要改，在 README"批次"提示处补一句即可 |
+| 他人侧车保护的边界 | 用户在 LR 里改过星级的 firstcut 侧车再跑 `--xmp` 会被覆盖（符合"自己的侧车可覆盖"设计）。建议仅在 README 提醒，不改行为 |
+| `models/`、默认缓存路径相对 CWD；`pair_key` 目录小写化在大小写敏感 FS 的撞键；`SessionPool` 盲轮询；JPEG 魔数判断冗余分支（decode.rs:41 第一分支被第二分支包含） | 均为低危备忘，可搭任意 PR 顺手处理或不动 |
 
-## 建议的处理顺序
+## 附B：评审中验证为正确/一致的项（无需改动）
 
-1. **P0-1 配对回归**：决定分目录工作流是否为支持目标（建议是：fixture 本来
-   就是这么建的），改配对策略 + 修测试 + 补 M7-3 决策记录。
-2. **P1-2 / P1-4**：`--config` 失败改为硬错误；serde `deny_unknown_fields`
-   + star_mode 校验。两处都是小改动、高收益。
-3. **P1-3 orientation 5/7**：对调内外顺序，补 2×2 矩阵单元测试。
-4. **P2-8 指纹收窄** + 清理 `cache.rs get()` 死代码。
-5. P2-5/6/7 与 P3 文档项按 M8 一并处理。
+- 26 项单元测试实测全过（与文档数量一致）。
+- M6 EV 容差带数学（sRGB↔EV 换算、容差带嵌套校验、两侧独立、主体单向修正）实现/测试/文档三方吻合；`exposure_score` 夹取逻辑正确。
+- M7 XMP 命名（`<stem>.xmp`、保留大小写）、相对星级（并列平均位次）、侧车保护、连拍排序用实际权重——实现与决策记录一致。
+- 缓存键（path+size+mtime+CACHE_VERSION+配置指纹）结构与文档一致；`image::open` 兜底路径无 EXIF 双重旋转问题。
+- 构图三分法距离上限 0.47、噪点 P15 选取、dHash 及其严格性测试均正确。
+- XMP 渲染无 XML 注入面（写入内容不含用户可控字符串）。
