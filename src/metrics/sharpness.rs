@@ -168,7 +168,7 @@ fn box_blur_3x3(luma: &[u8], w: usize, h: usize) -> Vec<u8> {
 /// 用于人脸检测命中时：评估人脸及周边区域的合焦程度。
 /// 取高百分位而非均值：人脸区域以平滑皮肤为主（blur 前后差异小），
 /// 均值会被皮肤稀释；眼睛/眉毛/头发边缘的高差异像素才是合焦证据。
-pub fn reblur_mean_region(
+pub fn reblur_p80_region(
     luma: &[u8],
     w: u32,
     h: u32,

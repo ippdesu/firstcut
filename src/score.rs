@@ -122,13 +122,9 @@ pub fn analyze_jpgs(
             if let Some(rows) = cache_rows {
                 if let Some((size, mtime)) = crate::cache::file_fingerprint(Path::new(&e.path)) {
                     if let Some(row) = rows.get(&e.path) {
-                        if row.size == size as i64
-                            && row.mtime == mtime
-                            && row.version == crate::cache::CACHE_VERSION
-                            && row.cfg_hash == cfg_hash
-                        {
+                        if row.matches(size, mtime, crate::cache::CACHE_VERSION, cfg_hash) {
                             hits.fetch_add(1, Ordering::Relaxed);
-                            return Some((e.pair_key(), row.result, None));
+                            return Some((e.pair_id().to_string(), row.result, None));
                         }
                     }
                 }
@@ -136,7 +132,7 @@ pub fn analyze_jpgs(
             let result = analyze_one(e, &cfg.metric, ai).ok().flatten()?;
             let row = crate::cache::file_fingerprint(Path::new(&e.path))
                 .map(|(size, mtime)| (e.path.clone(), size, mtime, result));
-            Some((e.pair_key(), result, row))
+            Some((e.pair_id().to_string(), result, row))
         })
         .fold(
             || (HashMap::new(), Vec::new()),
@@ -234,7 +230,7 @@ pub fn analyze_one(
                     // 清晰度：主体区域（1.5× 框）reblur
                     let half_w = (biggest.w as f64 * 1.5).clamp(0.05, 0.5);
                     let half_h = (biggest.h as f64 * 1.5).clamp(0.05, 0.5);
-                    let reblur = metrics::sharpness::reblur_mean_region(
+                    let reblur = metrics::sharpness::reblur_p80_region(
                         &img.luma, img.width, img.height, cx, cy, half_w, half_h,
                     );
                     sharpness_region = Some(metrics::sharpness::region_sharpness_score(reblur));
@@ -248,8 +244,10 @@ pub fn analyze_one(
         }
     }
 
-    // 人脸漏检（小脸/侧脸）时：姿态检测定位头部，评估头部区域锐度
-    if faces == 0 && sharpness_region.is_none() {
+    // 没有主体级人脸区域分时，用姿态检测定位头部再评估（SCRFD 完全漏检、
+    // 或检出的脸全部低于 4% 主体门槛时都要走这一步；
+    // 只看 faces == 0 会漏掉"只有小脸"的情形，直接掉到中性地板）
+    if sharpness_region.is_none() {
         if let Some(pp) = &ai.pose {
             match pp.acquire().detect(&img.rgb, img.width, img.height) {
                 Ok(persons) => {
@@ -257,7 +255,7 @@ pub fn analyze_one(
                         (a.w * a.h).partial_cmp(&(b.w * b.h)).unwrap_or(std::cmp::Ordering::Equal)
                     }) {
                         if let Some((cx, cy, half_w, half_h)) = head_region(biggest) {
-                            let reblur = metrics::sharpness::reblur_mean_region(
+                            let reblur = metrics::sharpness::reblur_p80_region(
                                 &img.luma, img.width, img.height, cx, cy, half_w, half_h,
                             );
                             sharpness_region =
@@ -274,6 +272,9 @@ pub fn analyze_one(
         }
     }
 
+    // 主体区域分与全局分**取高者**（不是"命中即用区域分"）：
+    // 区域估计偶发偏低时不至于把整张照片拉下去；代价是跑焦但背景纹理繁杂的
+    // 照片可能被全局分救回——真糊交给 gallery 人工复核。
     let sharpness_final = match sharpness_region {
         Some(region) if region > sharpness => region,
         // 无人脸/无主体线索时：全局指标对浅景深照片不可靠，

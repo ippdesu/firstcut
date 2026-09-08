@@ -240,6 +240,7 @@ mod tests {
             extension: "jpg".to_string(),
             is_raw: false,
             has_pair: false,
+            pair_id: name.to_string(),
             date_time_original: datetime.to_string(),
             camera_make: String::new(),
             camera_model: String::new(),

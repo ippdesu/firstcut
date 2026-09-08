@@ -98,15 +98,22 @@ pub fn read_orientation(path: &Path) -> u16 {
 }
 
 /// 按 EXIF Orientation 旋转/镜像像素（1MP 图，成本可忽略）
+///
+/// 变换语义（对照 EXIF 规范与 image crate 的 rotate90=顺时针）：
+/// - 5 = 转置（沿主对角线翻转）= `flip_horizontal(rotate90(img))`
+/// - 7 = 反对角线翻转 = `flip_horizontal(rotate270(img))`
+///
+/// 注意：5/7 是**先旋转后镜像**；早期版本写成 `rotate90(flip_horizontal(img))`
+/// 使两者互换（那是 rot180 与反对角线的差别），镜像+倒置的照片会方向错误。
 pub fn apply_orientation(img: image::RgbImage, orientation: u16) -> image::RgbImage {
     use image::imageops::{flip_horizontal, flip_vertical, rotate180, rotate270, rotate90};
     match orientation {
         2 => flip_horizontal(&img),
         3 => rotate180(&img),
         4 => flip_vertical(&img),
-        5 => rotate90(&flip_horizontal(&img)),
+        5 => flip_horizontal(&rotate90(&img)),
         6 => rotate90(&img),
-        7 => rotate270(&flip_horizontal(&img)),
+        7 => flip_horizontal(&rotate270(&img)),
         8 => rotate270(&img),
         _ => img,
     }
@@ -203,3 +210,34 @@ fn build_analysis_image(rgb: image::RgbImage) -> AnalyzedImage {
 pub const OVEREXPOSED_THRESHOLD: u8 = 250;
 /// 亮度欠曝阈值：≤ 此值视为死黑
 pub const UNDEREXPOSED_THRESHOLD: u8 = 5;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 2×2 灰度图：1 2 / 3 4
+    fn grid() -> image::RgbImage {
+        image::RgbImage::from_raw(2, 2, vec![1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4, 4]).unwrap()
+    }
+
+    /// 行优先读回 R 通道
+    fn values(img: &image::RgbImage) -> Vec<u8> {
+        img.pixels().map(|p| p[0]).collect()
+    }
+
+    /// 8 种 EXIF Orientation 的像素变换（对照规范逐值锁定）
+    ///
+    /// 5 = 转置（主对角线）、7 = 反对角线翻转——这两者曾写反，
+    /// 导致"镜像+旋转"的照片方向系统性错误。
+    #[test]
+    fn orientation_transforms_match_exif() {
+        assert_eq!(values(&apply_orientation(grid(), 1)), vec![1, 2, 3, 4], "1 = 原样");
+        assert_eq!(values(&apply_orientation(grid(), 2)), vec![2, 1, 4, 3], "2 = 水平镜像");
+        assert_eq!(values(&apply_orientation(grid(), 3)), vec![4, 3, 2, 1], "3 = 180°");
+        assert_eq!(values(&apply_orientation(grid(), 4)), vec![3, 4, 1, 2], "4 = 垂直镜像");
+        assert_eq!(values(&apply_orientation(grid(), 5)), vec![1, 3, 2, 4], "5 = 转置");
+        assert_eq!(values(&apply_orientation(grid(), 6)), vec![3, 1, 4, 2], "6 = 顺时针 90°");
+        assert_eq!(values(&apply_orientation(grid(), 7)), vec![4, 2, 3, 1], "7 = 反对角线");
+        assert_eq!(values(&apply_orientation(grid(), 8)), vec![2, 4, 1, 3], "8 = 逆时针 90°");
+    }
+}

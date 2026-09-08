@@ -96,13 +96,18 @@ pic_process score <目录> --config stage.toml
 只写想改的字段即可。**换了 `--config` 无需换缓存文件**：配置指纹已并入缓存键，
 配置变化会自动重算（见下）。
 
+> 配置是 **fail-fast** 的：`--config` 指向的文件不存在/解析失败会直接报错退出
+> （不再静默回退默认值），未知字段名也会被拒绝——防止手滑的字段名静默失效。
+> 但注意：改**权重**或**星级阈值**不会触发重算（它们不影响缓存里的五维子分），
+> 改曲线参数（`sharpness_k`/`noise_k0`/`exposure_*`）才会。
+
 ## 输出说明
 
 **CSV**（`report.csv`）每行一张照片（ARW 分数映射自同名 JPG）：
 
 | 列 | 含义 |
 |---|---|
-| `path, filename, extension, is_raw, has_pair` | 文件标识与 JPG/ARW 配对状态 |
+| `path, filename, extension, is_raw, has_pair` | 文件标识与 JPG/ARW 配对状态（JPG 与 ARW 同目录配对；分放 `JPG/`+`RAW/` 时同名且无歧义也可配对） |
 | `date_time_original` | EXIF 拍摄时间（连拍聚类用） |
 | `camera_make, camera_model, lens_model` | 相机/镜头 |
 | `iso, f_number, shutter_speed, focal_length` | 曝光参数 |
@@ -110,7 +115,7 @@ pic_process score <目录> --config stage.toml
 | `total_score` | 加权总分（0-100，跨批次可比） |
 | `stars` | 星级 1-5（默认按**本批次相对排名**，见下） |
 | `faces` | SCRFD 检测到的人脸数 |
-| `burst_group, burst_size, burst_rank, burst_keep` | 连拍去重：组号、组内张数、组内排名、是否建议保留 |
+| `burst_group, burst_size, burst_rank, burst_keep` | 连拍去重：组号、**dHash 子簇内**张数、子簇内排名、是否建议保留（`burst_size` 是"几乎同一张"的子簇大小，不是整组张数） |
 
 **XMP 侧车**（`--xmp`）：写 `<stem>.xmp`（如 `DSC00001.xmp`），含
 `xmp:Rating`（1-5 星）+ `firstcut:` 命名空间（五维子分/人脸/连拍信息）。
@@ -124,7 +129,7 @@ pic_process score <目录> --config stage.toml
 
 | 维度 | 权重 | 方法 |
 |---|---|---|
-| 清晰度 | 0.30 | 主体感知三层链路：SCRFD 人脸区域 reblur P80 → 人脸漏检时 YOLOv8-pose 头部关键点区域 reblur → 都无则 50 分中性下限（大光圈浅景深照片不会被误判） |
+| 清晰度 | 0.30 | 主体感知三层链路：SCRFD 人脸区域 reblur P80（半宽/半高 = 脸框尺寸 ×1.5，即约 3× 脸框）→ 无主体级人脸时 YOLOv8-pose 头部关键点区域 reblur P80 → 都无则 50 分中性下限（大光圈浅景深照片不会被误判）；区域分与全局分**取高者** |
 | 曝光 | 0.25 | 过曝/欠曝像素比例（4× 惩罚）+ 判定亮度偏离理想值的 **EV 容差带**（默认 ±1 档内满分，-4 档 / +2 档降为 0）；判定亮度在有主体级人脸时用主体脸亮度做单向修正 |
 | 噪点 | 0.15 | 暗部 8×8 块标准差 P15（最平滑暗块）+ ISO 容忍度曲线 `k = 3.0·(1+0.3·log10(iso/100))` |
 | 构图 | 0.15 | SCRFD 主体级人脸（高度 ≥ 4%）：三分法位置 + 主体大小（8%~30% 理想）+ 多人降权；无主体脸时中性 60（不惩罚风景/静物） |
@@ -165,8 +170,9 @@ pic_process score <目录> --config stage.toml
 > 注意：星级依赖"批次"——建议**整场照片一次跑完**。分批跑不同子目录会各自归一化，
 > 星级之间不可比。
 
-**连拍去重**：拍摄时间间隔 ≤2s 成组 → dHash 汉明距离 ≤10 分簇 → 簇内按总分
-排序，`-k` 控制每簇保留数（默认 2），`burst_keep=true|false` 标记建议保留。
+**连拍去重**：拍摄时间间隔 ≤2s 成组 → 组内按 dHash 汉明距离 ≤10 分**子簇**（近乎同一张）
+→ 子簇内按总分排序，`-k` 控制每子簇保留数（默认 2），`burst_keep=true|false` 标记建议保留。
+注意 `burst_size` 是子簇大小：30 张连拍若姿势各异可能分成多个小簇，各自都保留。
 
 ## 性能（16 核机器实测，119 张 33MP JPG）
 
@@ -204,22 +210,25 @@ presets/                  # 场景预设（编译进二进制，config-template 
 ## 测试
 
 ```bash
-cargo test --lib                    # 单元测试（26 项）
+cargo test --lib                    # 单元测试（37 项）
 cargo test --test integration_test  # 集成测试（6 项，需要 testpic/）
 ```
 
-- **单元测试** 26 项（`cargo test --lib`）：
+- **单元测试** 37 项（`cargo test --lib`）：
   - `dedup` 6 项（datetime 解析、闰年/平年、严格 dHash、连拍分组、dHash 距离切分、空时间无连拍）
   - `metrics::composition` 4 项（无脸中性、三分法偏好、理想大小、微小人脸降分）
   - `metrics::exposure` 7 项（sRGB↔EV 换算、容差带内满分、带外单调衰减、
     两侧容差独立、主体感知单向修正、暗背景救回、剪裁惩罚）
   - `output::xmp` 5 项（绝对阈值分档、XMP 关键字段、相对分档百分位、
     同分并列同星、absolute 模式）
-  - `config` 2 项（全部场景预设可加载且参数自洽、未知预设名返回 None）
-  - `scan` 2 项（配对键含目录、侧车命名保留大小写）
+  - `config` 7 项（预设可加载、未知预设名、未知字段拒绝、star_mode 校验、
+    百分位递增校验、权重和校验、指纹只覆盖缓存输入）
+  - `scan` 6 项（配对键含目录、侧车命名保留大小写、同目录配对、
+    跨目录配对、编号回绕不合并、歧义不配对）
+  - `decode` 1 项（8 种 EXIF Orientation 像素变换）
 - **集成测试** 6 项（`tests/integration_test.rs`）：端到端 pipeline 验证（扫描/配置/dedup/总分/星级映射/模板）
   - 依赖 `testpic/` 真实照片目录（已 gitignore，私人照片不入库）
-  - 跑前需先准备好照片目录；纯克隆仓库运行该集成测试会 panic（`#[ignore]` 改造见 Phase 2 TODO）
+  - testpic 缺失时跳过依赖它的用例，其余纯逻辑用例始终执行
 
 ## 相关文档
 

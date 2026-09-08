@@ -92,19 +92,17 @@ fn main() -> Result<()> {
         }
         Commands::Score { dir, output, keep, no_ai, xmp, cache, no_cache, config } => {
             // 0) 评分配置（默认或文件）
+            //    显式传入的配置加载失败必须硬报错：静默回退默认值会让用户
+            //    以为参数已生效（M6-4 同类问题的解析层版本）
             let cfg = match &config {
-                Some(path) => match pic_process::config::load_config(path) {
-                    Ok(c) => {
-                        eprintln!("[score] 配置已加载: {}", path.display());
-                        c
-                    }
-                    Err(err) => {
-                        eprintln!("[score] 警告: 配置加载失败（使用默认）: {err:#}");
-                        ScoreConfig::default()
-                    }
-                },
+                Some(path) => pic_process::config::load_config(path).map_err(|err| {
+                    anyhow::anyhow!("配置加载失败: {}\n{err:#}", path.display())
+                })?,
                 None => ScoreConfig::default(),
             };
+            if config.is_some() {
+                eprintln!("[score] 配置已加载: {}", config.as_ref().unwrap().display());
+            }
 
             let mut entries = scan::scan_directory(&dir)?;
             eprintln!("[score] 发现 {} 个文件（JPG/ARW）", entries.len());
@@ -166,7 +164,7 @@ fn main() -> Result<()> {
             // 4) 回填 JPG 分数 + 连拍信息
             let by_key: HashMap<String, AnalysisResult> = outcome.results;
             for e in entries.iter_mut().filter(|e| !e.is_raw) {
-                let key = e.pair_key();
+                let key = e.pair_id().to_string();
                 if let Some(r) = by_key.get(&key) {
                     apply_scores(e, &r.scores, r.faces, &cfg);
                 }
@@ -174,9 +172,9 @@ fn main() -> Result<()> {
                     apply_burst(e, info);
                 }
             }
-            // 5) JPG 结果映射到同名 ARW（同一目录下同名才算配对）
+            // 5) JPG 结果映射到 ARW（同目录配对，或无歧义的跨目录配对）
             for e in entries.iter_mut().filter(|e| e.is_raw) {
-                let key = e.pair_key();
+                let key = e.pair_id().to_string();
                 if let Some(r) = by_key.get(&key) {
                     apply_scores(e, &r.scores, r.faces, &cfg);
                 }
@@ -193,29 +191,35 @@ fn main() -> Result<()> {
                 .collect();
             let ratings = output::xmp::assign_ratings(&rated, &cfg.metric);
             for e in entries.iter_mut() {
-                if let Some(st) = ratings.get(&e.pair_key()) {
+                if let Some(st) = ratings.get(e.pair_id()) {
                     e.stars = st.to_string();
                 }
             }
 
-            // 7) XMP 星级侧车（可选；同一配对键只写一次，JPG/ARW 共用）
+            // 7) XMP 星级侧车（可选）
+            //    按**侧车最终路径**去重：同目录配对的 JPG/ARW 路径相同只写一次；
+            //    跨目录配对的两端各需一份侧车（LR 按图片所在目录找 <stem>.xmp）。
             if xmp {
                 let mut written = 0usize;
                 let mut skipped = 0usize;
                 let mut seen: HashSet<String> = HashSet::new();
                 for e in &entries {
-                    let key = e.pair_key();
-                    if !seen.insert(key.clone()) {
+                    let key = e.pair_id();
+                    let Some(r) = by_key.get(key) else { continue };
+                    let stem = pic_process::scan::stem_raw_of(&e.filename);
+                    let sidecar = std::path::Path::new(&e.path)
+                        .with_file_name(format!("{stem}.xmp"))
+                        .display()
+                        .to_string();
+                    if !seen.insert(sidecar) {
                         continue;
                     }
-                    if let Some(r) = by_key.get(&key) {
-                        let total = score::total_score(&r.scores, &cfg.weights);
-                        let rating = *ratings.get(&key).unwrap_or(&3);
-                        match output::xmp::write_sidecar(e, &r.scores, total, rating) {
-                            Ok(true) => written += 1,
-                            Ok(false) => skipped += 1,
-                            Err(err) => eprintln!("[xmp] 写入失败 {}: {err:#}", e.path),
-                        }
+                    let total = score::total_score(&r.scores, &cfg.weights);
+                    let rating = *ratings.get(key).unwrap_or(&3);
+                    match output::xmp::write_sidecar(e, &r.scores, total, rating) {
+                        Ok(true) => written += 1,
+                        Ok(false) => skipped += 1,
+                        Err(err) => eprintln!("[xmp] 写入失败 {}: {err:#}", e.path),
                     }
                 }
                 eprintln!("[xmp] 侧车写入 {written} 个，跳过 {skipped} 个");
@@ -239,7 +243,7 @@ fn run_burst_analysis(
     let jpg_idx: Vec<usize> = entries
         .iter()
         .enumerate()
-        .filter(|(_, e)| !e.is_raw && analyzed.contains_key(&e.pair_key()))
+        .filter(|(_, e)| !e.is_raw && analyzed.contains_key(e.pair_id()))
         .map(|(i, _)| i)
         .collect();
     if jpg_idx.len() < 2 {
@@ -248,11 +252,11 @@ fn run_burst_analysis(
     let jpg_entries: Vec<scan::PhotoEntry> =
         jpg_idx.iter().map(|&i| entries[i].clone()).collect();
     let hashes: Vec<u64> =
-        jpg_idx.iter().map(|&i| analyzed[&entries[i].pair_key()].dhash).collect();
+        jpg_idx.iter().map(|&i| analyzed[entries[i].pair_id()].dhash).collect();
     let scores: Vec<f64> = jpg_idx
         .iter()
         .map(|&i| {
-            let s = analyzed[&entries[i].pair_key()].scores;
+            let s = analyzed[entries[i].pair_id()].scores;
             score::total_score(&s, weights)
         })
         .collect();
@@ -260,7 +264,7 @@ fn run_burst_analysis(
     let infos = dedup::analyze_bursts(&jpg_entries, &hashes, &scores, params);
     let mut map = HashMap::new();
     for (&idx, info) in jpg_idx.iter().zip(infos.iter()) {
-        map.insert(entries[idx].pair_key(), info.clone());
+        map.insert(entries[idx].pair_id().to_string(), info.clone());
     }
     let burst_groups = infos.iter().filter(|i| i.group != 0).count();
     eprintln!(

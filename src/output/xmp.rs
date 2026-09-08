@@ -172,6 +172,7 @@ mod tests {
             extension: "jpg".into(),
             is_raw: false,
             has_pair: false,
+            pair_id: "testpic/jpg|dsc00001".into(),
             date_time_original: String::new(),
             camera_make: String::new(),
             camera_model: String::new(),

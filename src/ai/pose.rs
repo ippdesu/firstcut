@@ -6,7 +6,9 @@
 //! models/yolov8n_pose.onnx：
 //! - 输入 1x3x640x640 RGB，/255 归一化
 //! - 输出 [1, 56, 8400]：每列 [cx, cy, w, h, cls(person), kps 17×3(x,y,conf)]
-//!   （cls 与 kps conf 为 logits 需 sigmoid；坐标已解码到输入像素空间）
+//! - **cls 与 kps conf 已应用 sigmoid、坐标已在输入像素空间**（Xenova 转换）。
+//!   实测 5 张照片 248 个置信度全部落在 (0,1)，无需再做 sigmoid；
+//!   若将来换模型，先跑 `pic_process-debug-pose` 核验值域再改这里。
 
 use anyhow::Result;
 use ndarray::Array4;
@@ -85,7 +87,7 @@ impl PoseDet {
         let mut persons: Vec<PersonBox> = Vec::new();
         for i in 0..ANCHORS {
             // flat 布局 [1,56,8400]（通道优先）：anchor i 的特征 j 位于 data[j*8400 + i]
-            // Xenova 转换：score 已 sigmoid、坐标已在输入像素空间（见仓库 README）
+            // 置信度已是 sigmoid 后的概率（见模块头注释），直接与阈值比较
             let cls = data[4 * ANCHORS + i];
             if cls < CONF_THRESHOLD {
                 continue;

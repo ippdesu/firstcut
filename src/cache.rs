@@ -12,15 +12,17 @@ use anyhow::{Context, Result};
 use crate::score::{AnalysisResult, PixelScores};
 
 /// 缓存分析版本：评分参数（k 值/权重/模型）变化时递增
-pub const CACHE_VERSION: i64 = 10;
+pub const CACHE_VERSION: i64 = 12;
 
 /// 照片分析缓存
 pub struct ScoreCache {
     conn: rusqlite::Connection,
     /// 预加载的 (path -> 缓存行)
     rows: HashMap<String, CacheRow>,
-    /// 本次运行的评分配置指纹（参与缓存键）
+    /// 本次运行使用的评分配置指纹（参与缓存键）
     cfg_hash: i64,
+    /// 本次新增/更新的行（flush 只写这些）
+    dirty: std::collections::HashSet<String>,
 }
 
 /// 单条缓存行（公开；供并行分析段只读快照使用）
@@ -32,6 +34,18 @@ pub struct CacheRow {
     /// 生成该行时使用的评分配置指纹
     pub cfg_hash: i64,
     pub result: AnalysisResult,
+}
+
+impl CacheRow {
+    /// 缓存命中判定：文件未变且分析版本、配置指纹一致
+    ///
+    /// 收敛到这里，避免 score.rs 内联一份、cache.rs 再有一份而将来改漏。
+    pub fn matches(&self, size: u64, mtime: i64, version: i64, cfg_hash: i64) -> bool {
+        self.size == size as i64
+            && self.mtime == mtime
+            && self.version == version
+            && self.cfg_hash == cfg_hash
+    }
 }
 
 impl ScoreCache {
@@ -94,26 +108,12 @@ impl ScoreCache {
             }
             rows
         };
-        Ok(ScoreCache { conn, rows, cfg_hash })
+        Ok(ScoreCache { conn, rows, cfg_hash, dirty: std::collections::HashSet::new() })
     }
 
     /// 只读快照（供 rayon 并行段使用；Connection 非 Sync 不能跨线程）
     pub fn rows(&self) -> &HashMap<String, CacheRow> {
         &self.rows
-    }
-
-    /// 查询缓存：文件未变且配置指纹一致时返回 Some
-    pub fn get(&self, path: &str, size: u64, mtime: i64) -> Option<AnalysisResult> {
-        let row = self.rows.get(path)?;
-        if row.size == size as i64
-            && row.mtime == mtime
-            && row.version == CACHE_VERSION
-            && row.cfg_hash == self.cfg_hash
-        {
-            Some(row.result)
-        } else {
-            None
-        }
     }
 
     /// 写入（或更新）一条缓存；批量写入后统一 flush
@@ -128,13 +128,21 @@ impl ScoreCache {
                 result: *result,
             },
         );
+        self.dirty.insert(path.to_string());
         Ok(())
     }
 
-    /// 将内存中的全部条目落盘（单事务）
+    /// 只把本次新增/更新的行落盘（单事务）
+    ///
+    /// 旧实现每次 flush 都会把内存中全部行重写一遍（含未变化的旧行），
+    /// 上万张时是纯粹的浪费。
     pub fn flush(&mut self) -> Result<()> {
+        if self.dirty.is_empty() {
+            return Ok(());
+        }
         let tx = self.conn.transaction()?;
-        for (path, row) in &self.rows {
+        for path in &self.dirty {
+            let Some(row) = self.rows.get(path) else { continue };
             let s = row.result.scores;
             tx.execute(
                 "INSERT OR REPLACE INTO photo_cache
@@ -157,6 +165,7 @@ impl ScoreCache {
             )?;
         }
         tx.commit()?;
+        self.dirty.clear();
         Ok(())
     }
 

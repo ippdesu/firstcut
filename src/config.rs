@@ -9,7 +9,7 @@ use std::path::Path;
 
 /// 各维度权重（总和应为 1.0）
 #[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ScoreWeights {
     pub sharpness: f64,
     pub exposure: f64,
@@ -34,7 +34,7 @@ impl Default for ScoreWeights {
 
 /// 指标曲线参数 + 星级分档 + 曝光目标
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct MetricParams {
     /// 清晰度饱和常数：归一化清晰度 = k 时得 ~63 分
     pub sharpness_k: f64,
@@ -104,7 +104,7 @@ impl Default for MetricParams {
 
 /// 连拍去重参数（M2）
 #[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct DedupParams {
     /// 时间聚类间隔阈值（秒）：间隔 ≤ 此值视为同一连拍组
     pub gap_secs: f64,
@@ -126,7 +126,7 @@ impl Default for DedupParams {
 
 /// 完整评分配置
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ScoreConfig {
     pub weights: ScoreWeights,
     pub metric: MetricParams,
@@ -143,18 +143,14 @@ impl Default for ScoreConfig {
 
 /// 评分配置指纹（用于缓存键）
 ///
-/// 评分曲线参数变化后必须让旧缓存失效，否则用户改了 `--config` 却看到
-/// 与之前完全一样的结果（缓存命中直接返回旧的五维分数）。
-/// 这里把参与评分的全部参数按位哈希成一个整数，存进缓存行一起比对。
+/// **只覆盖影响缓存值的参数**：缓存行存的是五维子分 + dHash + 人脸数，
+/// 只有这些曲线参数会改变子分。权重与星级阈值只在运行期合成总分/星级时
+/// 使用，改它们不应该触发全量解码+AI 重算（那是用户最高频的调参动作）。
 pub fn config_fingerprint(cfg: &ScoreConfig) -> i64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
     let mut h = DefaultHasher::new();
-    let w = &cfg.weights;
-    for v in [w.sharpness, w.exposure, w.noise, w.composition, w.aesthetic] {
-        v.to_bits().hash(&mut h);
-    }
     let m = &cfg.metric;
     for v in [
         m.sharpness_k,
@@ -165,10 +161,6 @@ pub fn config_fingerprint(cfg: &ScoreConfig) -> i64 {
         m.exposure_ev_lo,
         m.exposure_ev_hi,
         m.exposure_subject_blend,
-        m.rating_5,
-        m.rating_4,
-        m.rating_3,
-        m.rating_2,
     ] {
         v.to_bits().hash(&mut h);
     }
@@ -205,6 +197,27 @@ pub fn load_config(path: &Path) -> Result<ScoreConfig> {
     }
     if !(0.0..=1.0).contains(&m.exposure_subject_blend) {
         anyhow::bail!("exposure_subject_blend 应在 0~1 之间（{path:?}）");
+    }
+    // 星级模式必须显式合法：拼错会静默走 relative，用户以为改成了 absolute
+    if !(m.star_mode.eq_ignore_ascii_case("relative") || m.star_mode.eq_ignore_ascii_case("absolute"))
+    {
+        anyhow::bail!(
+            "star_mode 只能是 \"relative\" 或 \"absolute\"，当前为 {:?}（{path:?}）",
+            m.star_mode
+        );
+    }
+    // 相对分档的百分位必须单调递增，否则会给整批同一星级
+    if !(m.star_five_pct <= m.star_four_pct
+        && m.star_four_pct <= m.star_three_pct
+        && m.star_three_pct <= m.star_two_pct)
+    {
+        anyhow::bail!(
+            "星级百分位必须递增（star_five_pct ≤ star_four_pct ≤ star_three_pct ≤ star_two_pct），当前为 {}/{}/{}/{}（{path:?}）",
+            m.star_five_pct,
+            m.star_four_pct,
+            m.star_three_pct,
+            m.star_two_pct
+        );
     }
     Ok(cfg)
 }
@@ -344,5 +357,78 @@ mod tests {
     fn unknown_preset_is_none() {
         assert!(preset("nope").is_none());
         assert!(preset("stage").is_some());
+    }
+
+    fn load_text(name: &str, text: &str) -> anyhow::Result<ScoreConfig> {
+        let dir = std::env::temp_dir().join("firstcut_cfg_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{name}.toml"));
+        std::fs::write(&path, text).unwrap();
+        load_config(&path)
+    }
+
+    /// 未知字段必须报错：手滑的字段名静默忽略会让用户以为参数已生效
+    #[test]
+    fn unknown_field_is_rejected() {
+        let err = load_text("unknown", "[metric]\nexposure_ev_Io = 2.0\n").unwrap_err();
+        assert!(format!("{err:#}").contains("exposure_ev_Io"), "{err:#}");
+    }
+
+    /// star_mode 拼错必须报错，不能静默回退 relative
+    #[test]
+    fn bad_star_mode_is_rejected() {
+        let err = load_text("starmode", "[metric]\nstar_mode = \"absolue\"\n").unwrap_err();
+        assert!(format!("{err:#}").contains("star_mode"), "{err:#}");
+    }
+
+    /// 百分位倒序必须报错（否则整批同星级）
+    #[test]
+    fn reversed_percentiles_are_rejected() {
+        let err = load_text(
+            "pct",
+            "[metric]\nstar_five_pct = 90.0\nstar_two_pct = 10.0\n",
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("递增"), "{err:#}");
+    }
+
+    /// 权重和偏离 1.0 过多必须报错
+    #[test]
+    fn bad_weight_sum_is_rejected() {
+        let err = load_text("weights", "[weights]\nsharpness = 0.9\n").unwrap_err();
+        assert!(format!("{err:#}").contains("权重"), "{err:#}");
+    }
+
+    /// 合法的最小配置可以加载
+    #[test]
+    fn minimal_config_loads() {
+        let cfg = load_text("min", "[metric]\nexposure_target = 120.0\n").unwrap();
+        assert_eq!(cfg.metric.exposure_target, 120.0);
+        assert_eq!(cfg.weights.sharpness, 0.30);
+    }
+
+    /// 配置指纹只覆盖影响缓存值的曲线参数：
+    /// 改权重/星级阈值不应触发全量重算，改曲线参数必须触发
+    #[test]
+    fn fingerprint_covers_only_cached_inputs() {
+        let base = ScoreConfig::default();
+        let fp = config_fingerprint(&base);
+
+        let mut w = ScoreConfig::default();
+        w.weights.sharpness = 0.40;
+        w.weights.composition = 0.05;
+        assert_eq!(config_fingerprint(&w), fp, "改权重不应改变指纹");
+
+        let mut r = ScoreConfig::default();
+        r.metric.rating_5 = 80.0;
+        assert_eq!(config_fingerprint(&r), fp, "改星级阈值不应改变指纹");
+
+        for mut m in [ScoreConfig::default(), ScoreConfig::default()] {
+            m.metric.sharpness_k += 1.0;
+            assert_ne!(config_fingerprint(&m), fp, "改 sharpness_k 应改变指纹");
+        }
+        let mut e = ScoreConfig::default();
+        e.metric.exposure_target = 130.0;
+        assert_ne!(config_fingerprint(&e), fp, "改曝光目标应改变指纹");
     }
 }

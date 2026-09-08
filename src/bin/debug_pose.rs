@@ -30,7 +30,7 @@ fn main() -> Result<()> {
         match head_region(p) {
             Some((cx, cy, hw, hh)) => {
                 println!("     头部区域: 中心=({cx:.3},{cy:.3}) 半宽={hw:.3} 半高={hh:.3}");
-                let reblur = pic_process::metrics::sharpness::reblur_mean_region(
+                let reblur = pic_process::metrics::sharpness::reblur_p80_region(
                     &img.luma, img.width, img.height, cx, cy, hw, hh,
                 );
                 println!(

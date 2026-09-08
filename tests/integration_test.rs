@@ -40,15 +40,14 @@ fn test_scan_directory_finds_photos() {
 /// 验证配置加载和权重校验
 #[test]
 fn test_config_validation() {
-    // 默认配置权重和应为 1.0（曝光权重 0.25 + sharpness 0.35 + noise 0.15 + composition 0.15 + aesthetic 0.15 = 1.05）
+    // 默认权重和应为 1.0（清晰度 0.30 + 曝光 0.25 + 噪点 0.15 + 构图 0.15 + 美学 0.15）
     let default_cfg = ScoreConfig::default();
     let w = &default_cfg.weights;
     let sum = w.sharpness + w.exposure + w.noise + w.composition + w.aesthetic;
-    // M5 决策 A1 将曝光从 0.20 提升到 0.25，总和为 1.05
-    // 校验权重之和在合理范围内（0.95~1.10）
-    assert!(sum >= 0.95 && sum <= 1.10, "默认权重和应在 0.95~1.10 范围内，实际为 {}", sum);
+    // 与 load_config 的校验一致：偏离 1.0 超过 0.05 会被拒绝
+    assert!(sum >= 0.95 && sum <= 1.05, "默认权重和应在 0.95~1.05 范围内，实际为 {}", sum);
 
-    // 验证曝光权重已更新为 0.25（M5 决策 A1）
+    // 验证曝光权重为 0.25（M5 决策 A）
     assert_eq!(w.exposure, 0.25, "曝光权重应为 0.25");
 }
 
