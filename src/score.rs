@@ -1,7 +1,7 @@
 //! 评分汇总（M1/M3）：像素分析 + AI 推理调度 + 加权总分
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rayon::prelude::*;
@@ -15,7 +15,7 @@ use crate::config::{DedupParams, MetricParams, ScoreConfig, ScoreWeights};
 use crate::decode;
 use crate::dedup::{self, BurstInfo};
 use crate::metrics;
-use crate::scan::PhotoEntry;
+use crate::scan::{self, PhotoEntry};
 
 /// AI 推理引擎（CLIPIQA + SCRFD + YOLOv8-pose 多 session 池，进程内共享）
 ///
@@ -161,12 +161,16 @@ pub struct AnalysisOutcome {
     pub new_rows: Vec<(String, u64, i64, AnalysisResult)>,
 }
 
-/// 对全部 JPG 并行做像素分析 + AI 推理（优先命中缓存快照），返回分析结果
+/// 对全部 JPG 并行做像素分析 + AI 推理（优先命中缓存快照），返回分析结果。
+///
+/// `on_progress(done, total)`：进度回调（每 25 张与最后一张各报一次）；
+/// `score` 子命令用它打 stderr，`review` 用它更新跑批进度。
 pub fn analyze_jpgs(
     entries: &[PhotoEntry],
     ai: &AiEngine,
     cache_rows: Option<&std::collections::HashMap<String, crate::cache::CacheRow>>,
     cfg: &ScoreConfig,
+    on_progress: &(dyn Fn(usize, usize) + Sync),
 ) -> AnalysisOutcome {
     let counter = AtomicUsize::new(0);
     let hits = AtomicUsize::new(0);
@@ -180,7 +184,7 @@ pub fn analyze_jpgs(
         .filter_map(|e| {
             let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
             if done % 25 == 0 || done == total {
-                eprintln!("[score] 进度 {}/{}", done, total);
+                on_progress(done, total);
             }
             // 缓存命中则跳过分析（快照为纯数据，可跨线程共享）
             if let Some(rows) = cache_rows {
@@ -374,4 +378,231 @@ pub fn analyze_one(
         faces,
         pose_desc: subject_face.as_ref().and_then(pose_descriptor),
     }))
+}
+
+// ---- M-UI2：评分流程抽库（score 子命令与 review 跑批共用同一实现） ----
+
+/// 一次评分任务的输出选项
+#[derive(Debug, Clone)]
+pub struct ScoreJobOptions {
+    pub output_csv: PathBuf,
+    pub cache_path: PathBuf,
+    pub no_cache: bool,
+    /// 跳过 AI 推理（纯像素快速预览）
+    pub no_ai: bool,
+    pub xmp: bool,
+    /// 实验性 DirectML（仅 `--features gpu` 构建生效）
+    pub gpu: bool,
+    /// CLI `-k` 显式覆盖（None = 用 `[dedup] keep_k` 配置）
+    pub keep_override: Option<usize>,
+}
+
+/// 跑批事件（CLI 转成 stderr 行，review 转成进度状态）
+pub enum ScoreEvent {
+    Info(String),
+    Progress { done: usize, total: usize },
+    Finished { total_jpg: usize, hits: usize, misses: usize },
+}
+
+/// 跑批结果摘要
+#[derive(Debug)]
+pub struct ScoreJobSummary {
+    pub total_jpg: usize,
+    pub hits: usize,
+    pub misses: usize,
+    pub failed_jpgs: Vec<String>,
+    pub unmapped_arw: usize,
+    pub burst_members: usize,
+    pub csv_path: PathBuf,
+}
+
+/// 完整评分流水线：扫描 → 分析+AI（缓存优先）→ 连拍去重 → 回填 → 星级 → XMP/CSV。
+///
+/// **不修改/删除任何照片文件**，只写 XMP 侧车（可选）、CSV、SQLite 缓存。
+/// `score` 子命令与 `review` 的"重新评分"共用；同一输入输出逐字节一致。
+pub fn run_score_job(
+    dir: &Path,
+    cfg: &ScoreConfig,
+    opts: &ScoreJobOptions,
+    on_event: &(dyn Fn(ScoreEvent) + Sync),
+) -> anyhow::Result<ScoreJobSummary> {
+    if opts.gpu && !cfg!(feature = "gpu") {
+        anyhow::bail!("GPU 推理需要启用 DirectML 构建：cargo build --release --features gpu");
+    }
+
+    on_event(ScoreEvent::Info(format!(
+        "发现文件中…（目录 {}）",
+        dir.display()
+    )));
+    let mut entries = scan::scan_directory(dir)?;
+    on_event(ScoreEvent::Info(format!("发现 {} 个文件（JPG/ARW）", entries.len())));
+
+    // AI 引擎（加载失败降级为纯像素评分，不中断）
+    let engine = if opts.no_ai {
+        on_event(ScoreEvent::Info("跳过 AI 推理（--no-ai）".into()));
+        AiEngine::none()
+    } else {
+        match AiEngine::load(opts.gpu) {
+            Ok(e) => e,
+            Err(err) => {
+                on_event(ScoreEvent::Info(format!(
+                    "AI 模型不可用，降级为纯像素评分（可加 --no-ai 关闭提示）: {err:#}"
+                )));
+                AiEngine::none()
+            }
+        }
+    };
+
+    // 增量缓存（打不开降级为不使用，不中断）
+    let mut cache = if opts.no_cache {
+        None
+    } else {
+        match crate::cache::ScoreCache::open(&opts.cache_path, crate::config::config_fingerprint(cfg))
+        {
+            Ok(c) => Some(c),
+            Err(err) => {
+                on_event(ScoreEvent::Info(format!("缓存不可用（本次不使用）: {err:#}")));
+                None
+            }
+        }
+    };
+
+    // 分析（并行；进度经回调）
+    let total_jpg = entries.iter().filter(|e| !e.is_raw).count();
+    let cache_rows = cache.as_ref().map(|c| c.rows());
+    let outcome = analyze_jpgs(&entries, &engine, cache_rows, cfg, &|done, total| {
+        on_event(ScoreEvent::Progress { done, total });
+    });
+    on_event(ScoreEvent::Finished {
+        total_jpg,
+        hits: outcome.hits,
+        misses: outcome.misses,
+    });
+    if let Some(c) = &mut cache {
+        for (path, size, mtime, r) in &outcome.new_rows {
+            let _ = c.put(path, *size, *mtime, r);
+        }
+        if let Err(err) = c.flush() {
+            on_event(ScoreEvent::Info(format!("缓存写入失败: {err:#}")));
+        }
+    }
+
+    // 连拍去重（score/review 同一函数 + 同一参数合成）
+    let dedup_params = crate::config::effective_dedup(opts.keep_override, cfg);
+    let analyzed_count = outcome.results.len();
+    let burst_map =
+        analyze_photo_bursts(&entries, &outcome.results, &dedup_params, &cfg.weights);
+    let burst_members = burst_map.values().filter(|i| i.group != 0).count();
+    on_event(ScoreEvent::Info(format!(
+        "连拍去重: {analyzed_count} 张 JPG 中 {burst_members} 张属于连拍组"
+    )));
+
+    // 回填 + 异常报告
+    let by_key: HashMap<String, AnalysisResult> = outcome.results;
+    for e in entries.iter_mut() {
+        let key = e.pair_id().to_string();
+        if let Some(r) = by_key.get(&key) {
+            apply_scores(e, &r.scores, r.faces, cfg);
+        }
+        if let Some(info) = burst_map.get(&key) {
+            apply_burst(e, info);
+        }
+    }
+    for e in entries.iter_mut() {
+        e.analysis_ok = if e.total_score.is_empty() { "false" } else { "true" }.into();
+    }
+    let failed_jpgs: Vec<String> = entries
+        .iter()
+        .filter(|e| !e.is_raw && e.total_score.is_empty())
+        .map(|e| e.path.clone())
+        .collect();
+    if !failed_jpgs.is_empty() {
+        on_event(ScoreEvent::Info(format!(
+            "警告: {} 张 JPG 解码/分析失败: {}",
+            failed_jpgs.len(),
+            failed_jpgs.iter().take(10).cloned().collect::<Vec<_>>().join(", ")
+        )));
+    }
+    let unmapped_arw = entries.iter().filter(|e| e.is_raw && e.total_score.is_empty()).count();
+    if unmapped_arw > 0 {
+        on_event(ScoreEvent::Info(format!(
+            "警告: {unmapped_arw} 张 ARW 无同名 JPG 可映射分数（analysis_ok=false）"
+        )));
+    }
+
+    // 星级
+    let rated: Vec<(String, f64)> = by_key
+        .iter()
+        .map(|(k, r)| (k.clone(), total_score(&r.scores, &cfg.weights)))
+        .collect();
+    let ratings = crate::output::xmp::assign_ratings(&rated, &cfg.metric);
+    for e in entries.iter_mut() {
+        if let Some(st) = ratings.get(e.pair_id()) {
+            e.stars = st.to_string();
+        }
+    }
+
+    // XMP 侧车（按侧车最终路径去重；跨目录配对两端各一份）
+    if opts.xmp {
+        let mut written = 0usize;
+        let mut skipped = 0usize;
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for e in &entries {
+            let key = e.pair_id();
+            let Some(r) = by_key.get(key) else { continue };
+            let stem = scan::stem_raw_of(&e.filename);
+            let sidecar = Path::new(&e.path)
+                .with_file_name(format!("{stem}.xmp"))
+                .display()
+                .to_string();
+            if !seen.insert(sidecar) {
+                continue;
+            }
+            let total = total_score(&r.scores, &cfg.weights);
+            let rating = *ratings.get(key).unwrap_or(&3);
+            match crate::output::xmp::write_sidecar(e, &r.scores, total, rating) {
+                Ok(true) => written += 1,
+                Ok(false) => skipped += 1,
+                Err(err) => on_event(ScoreEvent::Info(format!("XMP 写入失败 {}: {err:#}", e.path))),
+            }
+        }
+        on_event(ScoreEvent::Info(format!("XMP 侧车写入 {written} 个，跳过 {skipped} 个")));
+    }
+
+    crate::output::csv::write_csv(&opts.output_csv, &entries)?;
+    on_event(ScoreEvent::Info(format!("CSV 已写出: {}", opts.output_csv.display())));
+
+    Ok(ScoreJobSummary {
+        total_jpg,
+        hits: outcome.hits,
+        misses: outcome.misses,
+        failed_jpgs,
+        unmapped_arw,
+        burst_members,
+        csv_path: opts.output_csv.clone(),
+    })
+}
+
+/// 把分数写入 PhotoEntry 的 CSV 字段
+fn apply_scores(e: &mut PhotoEntry, s: &PixelScores, faces: usize, cfg: &ScoreConfig) {
+    e.sharpness_score = fmt(s.sharpness);
+    e.exposure_score = fmt(s.exposure);
+    e.noise_score = fmt(s.noise);
+    e.composition_score = fmt(s.composition);
+    e.aesthetic_score = fmt(s.aesthetic);
+    e.total_score = fmt(total_score(s, &cfg.weights));
+    e.faces = faces.to_string();
+}
+
+/// 把连拍信息写入 PhotoEntry 的 CSV 字段
+fn apply_burst(e: &mut PhotoEntry, info: &BurstInfo) {
+    e.burst_group = if info.group == 0 { "0".into() } else { info.group.to_string() };
+    e.burst_size = if info.size == 0 { String::new() } else { info.size.to_string() };
+    e.burst_rank = if info.rank == 0 { String::new() } else { info.rank.to_string() };
+    e.burst_keep = if info.size == 0 { String::new() } else { info.keep.to_string() };
+    e.burst_pose = if info.size == 0 { String::new() } else { info.pose_cluster.to_string() };
+}
+
+fn fmt(v: f64) -> String {
+    format!("{:.1}", v)
 }

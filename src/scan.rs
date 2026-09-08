@@ -115,11 +115,20 @@ impl PhotoEntry {
     }
 }
 
+/// review 缩略图缓存目录名（整个子树跳过，防止 320px 缩略图被当照片评分）
+const CACHE_DIR_NAME: &str = ".firstcut";
+
 /// 递归扫描目录，返回排序后的照片索引
 pub fn scan_directory(dir: &Path) -> Result<Vec<PhotoEntry>> {
     let mut files: Vec<PathBuf> = Vec::new();
-    for entry in walkdir::WalkDir::new(dir).follow_links(false) {
+    let mut walker = walkdir::WalkDir::new(dir).follow_links(false).into_iter();
+    while let Some(entry) = walker.next() {
         let entry = entry?;
+        if entry.file_type().is_dir() && entry.file_name().to_string_lossy() == CACHE_DIR_NAME {
+            // 不递归进缓存目录（walkdir 默认会继续展开子目录）
+            walker.skip_current_dir();
+            continue;
+        }
         if entry.file_type().is_file() {
             let name = entry.file_name().to_string_lossy().to_string();
             if is_supported_file(&name) {

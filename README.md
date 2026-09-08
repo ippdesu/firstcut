@@ -5,7 +5,8 @@
 **CSV 报告**和 **XMP 星级侧车**。全程本地运行、照片不上传。
 
 > 当前状态：**v1.1 已发布**，并已合入 M6 缺陷修复 + M7 交付兼容 + M8 评审修复 +
-> M9 自适应连拍保留（每个姿势簇各自保留）+ M-UI1 本地复核界面（`review` 子命令）。
+> M9 自适应连拍保留（每个姿势簇各自保留）+ M-UI1 复核界面 + M-UI2 操作台
+> （`review` 子命令内跑批/改星/配置编辑）。
 > Phase 2 批量 RAW 开发规划中，详见 `DESIGN.md` §9。
 
 ## 构建
@@ -185,7 +186,7 @@ pic_process score <目录> --config stage.toml
 无人脸的帧退化为 dHash 行为；`burst_keep=true|false` 只是建议保留标记。
 阈值/开关/上限都在 `[dedup]` 配置段（`adaptive_keep = false` 回退旧行为）。
 
-## 本地复核界面（review）
+## 本地复核与操作台（review）
 
 ```bash
 pic_process review <照片目录>            # 浏览器自动打开 http://127.0.0.1:8787
@@ -199,9 +200,14 @@ pic_process review <目录> --port 9000 --config stage.toml
   是否合焦时随时放大到 100%。
 - **连拍组并排对比**：灯箱内勾选同组 2~4 张，并排窗格**同步缩放平移**
   （滚轮/拖拽作用于所有窗格），逐帧对比合焦位置。
-- 数据来源：扫描目录 + SQLite 缓存（星级/连拍与 `score` 同一逻辑在线计算），
-  **只读**——不会写任何文件（缩略图缓存目录 `.firstcut/thumbs/` 除外）。
-  未跑过 `score` 的照片显示为未评分。
+- **UI 内跑批**（M-UI2）：侧栏"重新评分"触发完整评分流水线（与 `score` 子命令
+  同一实现），进度条 + 日志实时可见，完成后快照自动刷新，无需重启服务。
+- **UI 内改星**（M-UI2）：灯箱内点星级或按 `1~5` 快捷键 → 写入 XMP 侧车
+  （只改 `xmp:Rating`，firstcut 子分保留；他人侧车不覆盖）。
+- **配置编辑**（M-UI2）：权重/星级阈值/EV 容差/[dedup] 表单化编辑，
+  保存保留 TOML 注释，非法值（权重和越界等）拒绝写盘。
+- 数据来源：扫描目录 + SQLite 缓存（星级/连拍与 `score` 同一逻辑在线计算）。
+  未跑过评分的照片显示为未评分。
 
 ## 性能（16 核机器实测）
 
@@ -242,11 +248,11 @@ presets/                  # 场景预设（编译进二进制，config-template 
 ## 测试
 
 ```bash
-cargo test --lib                    # 单元测试（47 项）
+cargo test --lib                    # 单元测试（51 项）
 cargo test --test integration_test  # 集成测试（6 项，需要 testpic/）
 ```
 
-- **单元测试** 47 项（`cargo test --lib`）：
+- **单元测试** 51 项（`cargo test --lib`）：
   - `dedup` 11 项（datetime 解析、闰年/平年、严格 dHash、连拍分组、dHash 距离切分、
     空时间无连拍、无描述子退化 M2、M9 姿态分簇各自保留、阈值种子聚类、
     组上限截断、姿态距离值）
@@ -260,7 +266,9 @@ cargo test --test integration_test  # 集成测试（6 项，需要 testpic/）
   - `scan` 6 项（配对键含目录、侧车命名保留大小写、同目录配对、
     跨目录配对、编号回绕不合并、歧义不配对）
   - `decode` 1 项（8 种 EXIF Orientation 像素变换）
-  - `review` 4 项（路径越界拒绝、正斜杠相对路径、缩略图缓存名稳定、JPG 白名单）
+  - `review` 10 项（路径越界拒绝、文件名含 `..` 放行、正斜杠相对路径、
+    缩略图缓存名稳定、JPG 白名单、单任务互斥与日志环形缓冲、
+    配置编辑保留注释/非法值拒绝写盘）
 - **集成测试** 6 项（`tests/integration_test.rs`）：端到端 pipeline 验证（扫描/配置/dedup/总分/星级映射/模板）
   - 依赖 `testpic/` 真实照片目录（已 gitignore，私人照片不入库）
   - testpic 缺失时跳过依赖它的用例，其余纯逻辑用例始终执行

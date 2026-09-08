@@ -198,39 +198,51 @@ pub fn config_fingerprint(cfg: &ScoreConfig) -> i64 {
 /// 从 TOML 文件加载配置；字段缺失用默认值
 pub fn load_config(path: &Path) -> Result<ScoreConfig> {
     let text = std::fs::read_to_string(path)?;
-    let cfg: ScoreConfig = toml::from_str(&text)?;
+    load_config_text(&text, &path.display().to_string())
+}
+
+/// 从 TOML 文本加载配置（review 配置编辑写盘前的校验入口）
+pub fn load_config_text(text: &str, source: &str) -> Result<ScoreConfig> {
+    let cfg: ScoreConfig = toml::from_str(text)?;
+    validate_config(&cfg, source)?;
+    Ok(cfg)
+}
+
+/// 配置合法性校验（权重和 / EV 容差嵌套 / 主体混合权重 / star_mode / 百分位单调）
+fn validate_config(cfg: &ScoreConfig, source: &str) -> Result<()> {
     let w = &cfg.weights;
     let sum = w.sharpness + w.exposure + w.noise + w.composition + w.aesthetic;
     if (sum - 1.0).abs() > 0.05 {
-        anyhow::bail!("权重之和应约为 1.0，当前为 {sum:.3}（{path:?}）");
+        anyhow::bail!("权重之和应约为 1.0，当前为 {sum:.3}（{source}）");
     }
     // 曝光容差带必须严格嵌套，否则衰减区间宽度为 0，分数会出现断崖
     let m = &cfg.metric;
     if m.exposure_ev_full_lo < 0.0 || m.exposure_ev_full_hi < 0.0 {
-        anyhow::bail!("曝光满分容差不能为负（{path:?}）");
+        anyhow::bail!("曝光满分容差不能为负（{source}）");
     }
     if m.exposure_ev_lo <= m.exposure_ev_full_lo {
         anyhow::bail!(
-            "exposure_ev_lo({}) 必须大于 exposure_ev_full_lo({})（{path:?}）",
+            "exposure_ev_lo({}) 必须大于 exposure_ev_full_lo({})（{source}）",
             m.exposure_ev_lo,
             m.exposure_ev_full_lo
         );
     }
     if m.exposure_ev_hi <= m.exposure_ev_full_hi {
         anyhow::bail!(
-            "exposure_ev_hi({}) 必须大于 exposure_ev_full_hi({})（{path:?}）",
+            "exposure_ev_hi({}) 必须大于 exposure_ev_full_hi({})（{source}）",
             m.exposure_ev_hi,
             m.exposure_ev_full_hi
         );
     }
     if !(0.0..=1.0).contains(&m.exposure_subject_blend) {
-        anyhow::bail!("exposure_subject_blend 应在 0~1 之间（{path:?}）");
+        anyhow::bail!("exposure_subject_blend 应在 0~1 之间（{source}）");
     }
     // 星级模式必须显式合法：拼错会静默走 relative，用户以为改成了 absolute
-    if !(m.star_mode.eq_ignore_ascii_case("relative") || m.star_mode.eq_ignore_ascii_case("absolute"))
+    if !(m.star_mode.eq_ignore_ascii_case("relative")
+        || m.star_mode.eq_ignore_ascii_case("absolute"))
     {
         anyhow::bail!(
-            "star_mode 只能是 \"relative\" 或 \"absolute\"，当前为 {:?}（{path:?}）",
+            "star_mode 只能是 \"relative\" 或 \"absolute\"，当前为 {:?}（{source}）",
             m.star_mode
         );
     }
@@ -240,14 +252,14 @@ pub fn load_config(path: &Path) -> Result<ScoreConfig> {
         && m.star_three_pct <= m.star_two_pct)
     {
         anyhow::bail!(
-            "星级百分位必须递增（star_five_pct ≤ star_four_pct ≤ star_three_pct ≤ star_two_pct），当前为 {}/{}/{}/{}（{path:?}）",
+            "星级百分位必须递增（star_five_pct ≤ star_four_pct ≤ star_three_pct ≤ star_two_pct），当前为 {}/{}/{}/{}（{source}）",
             m.star_five_pct,
             m.star_four_pct,
             m.star_three_pct,
             m.star_two_pct
         );
     }
-    Ok(cfg)
+    Ok(())
 }
 
 /// 生成默认配置模板文本（供 `pic_process config-template` 输出）

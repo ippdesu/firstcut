@@ -52,6 +52,27 @@
   #strip .st input{position:absolute;top:2px;left:2px;cursor:pointer}
   #strip .st .r{position:absolute;bottom:2px;right:2px;font-size:10px;background:rgba(0,0,0,.75);padding:0 4px;border-radius:2px}
   #empty{color:var(--dim);text-align:center;padding:60px 0}
+  /* ---- M-UI2 操作台 ---- */
+  .btn{background:#2a2a2a;border:1px solid var(--line);color:var(--fg);padding:5px 10px;border-radius:4px;cursor:pointer;font-size:12px}
+  .btn.primary{background:#2e6b30;border-color:#2e6b30;color:#fff}
+  .btn:disabled{opacity:.45;cursor:default}
+  #runBlock{margin-top:10px}
+  #runBarWrap{height:8px;background:#111;border-radius:4px;overflow:hidden;margin:6px 0;display:none}
+  #runBar{height:100%;width:0;background:var(--acc);transition:width .3s}
+  #runLog{display:none;max-height:150px;overflow-y:auto;background:#0d0d0d;border:1px solid var(--line);border-radius:4px;padding:6px;font-size:11px;line-height:1.5;white-space:pre-wrap;word-break:break-all;color:#9c9c9c;margin-top:6px}
+  .starbtns{display:flex;gap:4px;margin-top:6px}
+  .starbtns button{background:none;border:1px solid var(--line);color:#ffc107;font-size:14px;padding:2px 7px;border-radius:4px;cursor:pointer}
+  .starbtns button:hover{background:#333}
+  #modal{position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:30;display:none;align-items:center;justify-content:center}
+  #modal .box{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:18px;width:560px;max-height:85vh;overflow-y:auto;font-size:13px}
+  #modal h3{margin:0 0 4px;font-size:15px}
+  #modal .grp{margin-top:10px;padding-top:8px;border-top:1px solid var(--line)}
+  #modal .grp b{color:var(--acc);font-size:12px}
+  #modal label{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:4px 0}
+  #modal input[type=number]{width:110px;background:#111;border:1px solid var(--line);color:var(--fg);padding:3px 6px;border-radius:4px}
+  #modal select{background:#111;border:1px solid var(--line);color:var(--fg);padding:3px;border-radius:4px}
+  #modal .foot{display:flex;gap:8px;justify-content:flex-end;margin-top:14px}
+  #toast{position:fixed;top:52px;right:16px;z-index:40;display:none;background:#2e6b30;color:#fff;padding:8px 14px;border-radius:6px;font-size:13px}
 </style>
 </head>
 <body>
@@ -83,6 +104,18 @@
       <option value="time">拍摄时间 新→旧</option>
       <option value="path">文件名</option>
     </select>
+    <h3>评分（M-UI2）</h3>
+    <div id="runBlock">
+      <label><input type="checkbox" id="runXmp" checked> 跑批后写 XMP 侧车</label>
+      <label><input type="checkbox" id="runNoAi"> 跳过 AI（纯像素快速）</label>
+      <div style="display:flex;gap:6px;margin-top:6px">
+        <button class="btn primary" id="runBtn" style="flex:1">▶ 重新评分</button>
+        <button class="btn" id="cfgBtn">⚙ 配置</button>
+      </div>
+      <div id="runBarWrap"><div id="runBar"></div></div>
+      <div class="dim" id="runState" style="display:none"></div>
+      <pre id="runLog"></pre>
+    </div>
     <h3 class="dim">说明</h3>
     <div class="dim">点击卡片看 1:1 原图（滚轮缩放 / 拖拽平移 / 双击复位 / ←→ 组内切换 / Esc 关闭）。连拍组内可在灯箱勾选 2~4 张进入同步缩放对比。</div>
   </aside>
@@ -101,6 +134,7 @@
   <div class="top">
     <span id="lbName"></span>
     <span class="meta" id="lbMeta"></span>
+    <span class="starbtns" id="lbStars" title="点击改星（快捷键 1~5），写入 XMP 侧车"></span>
     <button id="lbCompare">并排对比</button>
     <button class="close" id="lbClose">✕ Esc</button>
   </div>
@@ -126,16 +160,22 @@ const f = {
 };
 
 // ---------- 初始化 ----------
+function ingest(){
+  jpgs = SNAPSHOT.photos.filter(p => !p.is_raw);
+  document.getElementById("info").textContent =
+    `${SNAPSHOT.root} — ${jpgs.length} 张（已评分 ${jpgs.filter(p=>p.scores).length}）`;
+  apply();
+}
 async function boot(){
   const res = await fetch("/api/photos");
   if(!res.ok){ document.getElementById("info").textContent = "快照加载失败：" + res.status; return; }
   SNAPSHOT = await res.json();
-  jpgs = SNAPSHOT.photos.filter(p => !p.is_raw);
-  document.getElementById("info").textContent =
-    `${SNAPSHOT.root} — ${jpgs.length} 张（已评分 ${jpgs.filter(p=>p.scores).length}）`;
+  ingest();
   buildFilters();
-  apply();
   document.querySelectorAll("aside input, aside select").forEach(el => el.addEventListener("input", onFilter));
+}
+function loadData(){
+  fetch("/api/photos").then(r=>r.json()).then(j=>{ SNAPSHOT = j; ingest(); renderLB && LB && renderLB(); });
 }
 function buildFilters(){
   const starBox = document.getElementById("fStars");
@@ -288,6 +328,7 @@ function renderLB(){
   }
   requestAnimationFrame(()=> layoutPanes());
 
+  renderLbStars();
   // 底条（组内成员，供导航与对比勾选）
   const strip = document.getElementById("strip");
   strip.innerHTML = "";
@@ -396,6 +437,148 @@ window.addEventListener("keydown", e=>{
   }
 });
 
+// ---------- M-UI2：跑批 / 星级 / 配置 ----------
+function toast(msg){
+  const t = document.getElementById('toast');
+  t.textContent = msg; t.style.display = 'block';
+  clearTimeout(t._h); t._h = setTimeout(()=> t.style.display='none', 2600);
+}
+let jobPolling = null;
+function pollJob(){
+  fetch('/api/job').then(r=>r.json()).then(j=>{
+    const bar = document.getElementById('runBarWrap');
+    const barIn = document.getElementById('runBar');
+    const st = document.getElementById('runState');
+    const log = document.getElementById('runLog');
+    const btn = document.getElementById('runBtn');
+    if(j.state === 'running'){
+      bar.style.display = 'block'; log.style.display = 'block'; btn.disabled = true;
+      btn.textContent = '评分中…';
+      const pct = j.total ? Math.round(j.done/j.total*100) : 0;
+      barIn.style.width = pct + '%';
+      st.style.display = 'block'; st.textContent = `进度 ${j.done}/${j.total}（${pct}%）`;
+      log.textContent = (j.log||[]).join('
+');
+      log.scrollTop = log.scrollHeight;
+    } else {
+      bar.style.display = 'none'; btn.disabled = false; btn.textContent = '▶ 重新评分';
+      if(j.state === 'done' || j.state === 'failed'){
+        st.style.display = 'block';
+        st.textContent = j.state==='done' ? `✓ ${j.summary}` : `✗ ${j.error}`;
+        st.style.color = j.state==='done' ? 'var(--acc)' : '#f44336';
+      }
+      log.style.display = (j.log||[]).length ? 'block' : 'none';
+      if((j.log||[]).length) log.textContent = j.log.join('
+');
+      // 完成瞬间刷新数据
+      if(j.state === 'done' && jobPolling){ loadData(); }
+    }
+    // 运行中持续轮询；结束后再多拉一次就停
+    if(j.state === 'running'){ schedulePoll(); }
+    else { const keep = jobPolling; jobPolling = null; if(keep) setTimeout(()=>{}, 0); }
+  }).catch(()=>{});
+}
+function schedulePoll(){ if(jobPolling) clearTimeout(jobPolling); jobPolling = setTimeout(pollJob, 600); }
+document.getElementById('runBtn').addEventListener('click', ()=>{
+  fetch('/api/score/run', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({xmp: document.getElementById('runXmp').checked, no_ai: document.getElementById('runNoAi').checked})
+  }).then(r=>{
+    if(r.status === 409){ toast('已有评分任务在运行'); }
+    jobPolling = setTimeout(pollJob, 300);
+  });
+});
+pollJob();
+
+// 星级：灯箱内按钮 + 快捷键
+function renderLbStars(){
+  const cur = LB && LB.list[LB.idx];
+  const box = document.getElementById('lbStars');
+  box.innerHTML = '';
+  if(!cur || !cur.scores){ box.innerHTML = '<span class="dim" style="font-size:11px">未评分</span>'; return; }
+  for(let s2=1; s2<=5; s2++){
+    const b = document.createElement('button');
+    b.textContent = s2 <= (cur.stars||0) ? '★' : '☆';
+    b.title = `${s2} 星`;
+    b.addEventListener('click', ()=> setStars(cur, s2));
+    box.appendChild(b);
+  }
+}
+function setStars(photo, n){
+  fetch('/api/rate', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({p: photo.path, stars: n})
+  }).then(async r=>{
+    const j = await r.json().catch(()=>({}));
+    if(r.ok && j.ok){
+      toast(`已写入 ${n} 星侧车`);
+      // 本地数据同步（同 stem 共享星级）
+      const stem = photo.path.replace(/\.[^.]+$/,'').toLowerCase();
+      jpgs.forEach(p=>{ if(p.path.replace(/\.[^.]+$/,'').toLowerCase() === stem) p.stars = n; });
+      renderLB(); apply();
+    } else {
+      toast(j && typeof j === 'string' ? j : (j.error || r.statusText || '写入失败'));
+    }
+  });
+}
+// 快捷键 1~5（灯箱打开时）
+window.addEventListener('keydown', e=>{
+  if(lbEl.style.display !== 'flex') return;
+  if(e.key >= '1' && e.key <= '5'){
+    const cur = LB && LB.list[LB.idx];
+    if(cur && cur.scores) setStars(cur, +e.key);
+  }
+});
+
+// 配置对话框
+const FIELDS = [
+  ['权重（和 ≈ 1.0）', [['w_sharpness','清晰度'],['w_exposure','曝光'],['w_noise','噪点'],['w_composition','构图'],['w_aesthetic','美学']]],
+  ['星级', [['star_mode','分档模式（select:relative/absolute）'],['star_five_pct','5★ 百分位'],['star_four_pct','4★ 百分位'],['star_three_pct','3★ 百分位'],['star_two_pct','2★ 百分位'],['rating_5','5★ 阈值'],['rating_4','4★ 阈值'],['rating_3','3★ 阈值'],['rating_2','2★ 阈值']]],
+  ['曝光 EV 容差带', [['exposure_target','目标亮度'],['exposure_ev_full_lo','暗侧满分'],['exposure_ev_full_hi','亮侧满分'],['exposure_ev_lo','暗侧归零'],['exposure_ev_hi','亮侧归零'],['exposure_subject_blend','主体混合权重']]],
+  ['连拍 [dedup]', [['dedup_keep_k','每姿势簇保留'],['dedup_pose_cluster_threshold','姿态阈值'],['dedup_burst_group_cap','单组上限']]],
+];
+document.getElementById('cfgBtn').addEventListener('click', async ()=>{
+  const r = await fetch('/api/config'); const j = await r.json();
+  document.getElementById('cfgPath').textContent = '→ ' + j.path + (j.exists ? '' : '（文件尚不存在，保存时创建）');
+  const v = j.values, body = document.getElementById('cfgBody');
+  body.innerHTML = '';
+  for(const [title, fields] of FIELDS){
+    const g = document.createElement('div'); g.className = 'grp';
+    g.innerHTML = `<b>${title}</b>`;
+    for(const [k, label] of fields){
+      const row = document.createElement('label');
+      if(k === 'star_mode'){
+        row.innerHTML = `<span>${label}</span>`;
+        const sel = document.createElement('select'); sel.dataset.k = k;
+        sel.innerHTML = `<option value="relative" ${v[k]==='relative'?'selected':''}>relative 批次内相对</option><option value="absolute" ${v[k]==='absolute'?'selected':''}>absolute 总分阈值</option>`;
+        row.appendChild(sel);
+      } else if(k === 'dedup_adaptive_keep'){
+        row.innerHTML = `<span>M9 自适应保留</span><input type="checkbox" data-k="${k}" ${v[k]?'checked':''}>`;
+      } else {
+        row.innerHTML = `<span>${label}</span>`;
+        const inp = document.createElement('input');
+        inp.type = 'number'; inp.step = 'any'; inp.dataset.k = k; inp.value = v[k];
+        row.appendChild(inp);
+      }
+      g.appendChild(row);
+    }
+    body.appendChild(g);
+  }
+  document.getElementById('modal').style.display = 'flex';
+});
+document.getElementById('cfgCancel').addEventListener('click', ()=> document.getElementById('modal').style.display='none');
+document.getElementById('cfgSave').addEventListener('click', ()=>{
+  const values = {};
+  document.querySelectorAll('#cfgBody [data-k]').forEach(el=>{
+    values[el.dataset.k] = el.type === 'checkbox' ? el.checked : (el.type === 'number' ? parseFloat(el.value)||0 : el.value);
+  });
+  values.star_mode = document.querySelector('#cfgBody select[data-k]').value;
+  fetch('/api/config', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(values)})
+    .then(async r=>{
+      const t = await r.text();
+      toast(r.ok ? (JSON.parse(t).note || '已保存') : t);
+      if(r.ok) document.getElementById('modal').style.display='none';
+    });
+});
+
 // 恢复上次的筛选条件
 try{
   const saved = JSON.parse(localStorage.getItem("fc_filters") || "null");
@@ -419,5 +602,16 @@ boot().then(()=>{
   apply();
 });
 </script>
+<div id="modal">
+  <div class="box">
+    <h3>评分配置 <span class="dim" id="cfgPath" style="font-weight:normal;font-size:11px"></span></h3>
+    <div id="cfgBody"></div>
+    <div class="foot">
+      <button class="btn" id="cfgCancel">取消</button>
+      <button class="btn primary" id="cfgSave">保存</button>
+    </div>
+  </div>
+</div>
+<div id="toast"></div>
 </body>
 </html>

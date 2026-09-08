@@ -1,12 +1,8 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use pic_process::cache::ScoreCache;
-use pic_process::config::{DedupParams, ScoreConfig, ScoreWeights};
-use pic_process::dedup::BurstInfo;
-use pic_process::output;
+use pic_process::config::ScoreConfig;
 use pic_process::scan::{self};
-use pic_process::score::{self, AiEngine, AnalysisResult};
-use std::collections::{HashMap, HashSet};
+use pic_process::score;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -126,161 +122,26 @@ fn main() -> Result<()> {
                 eprintln!("[score] 配置已加载: {}", config.as_ref().unwrap().display());
             }
 
-            // GPU 是实验性 opt-in：默认构建不含 DirectML，显式报错而不是静默忽略
-            if gpu && !cfg!(feature = "gpu") {
-                anyhow::bail!(
-                    "--gpu 需要启用 DirectML 构建：cargo build --release --features gpu"
-                );
-            }
-
-            let mut entries = scan::scan_directory(&dir)?;
-            eprintln!("[score] 发现 {} 个文件（JPG/ARW）", entries.len());
-
-            // 0) AI 引擎（可跳过）
-            let engine = if no_ai {
-                eprintln!("[score] 跳过 AI 推理（--no-ai）");
-                AiEngine::none()
-            } else {
-                match AiEngine::load(gpu) {
-                    Ok(e) => e,
-                    Err(err) => {
-                        eprintln!("[score] 警告: {err:#}");
-                        eprintln!("[score] 降级为纯像素评分；或使用 --no-ai 关闭提示");
-                        AiEngine::none()
-                    }
-                }
+            // 评分流水线在库内（score::run_score_job），review 界面的"重新评分"共用同一实现
+            let opts = score::ScoreJobOptions {
+                output_csv: output,
+                cache_path: cache,
+                no_cache,
+                no_ai,
+                xmp,
+                gpu,
+                keep_override: keep,
             };
-
-            // 1) 增量缓存（可禁用）
-            let mut cache = if no_cache {
-                None
-            } else {
-                match ScoreCache::open(&cache, pic_process::config::config_fingerprint(&cfg)) {
-                    Ok(c) => {
-                        eprintln!("[score] 缓存: {} 条（{}）", c.len(), cache.display());
-                        Some(c)
-                    }
-                    Err(err) => {
-                        eprintln!("[score] 警告: {err:#}（本次不使用缓存）");
-                        None
-                    }
+            score::run_score_job(&dir, &cfg, &opts, &|ev| match ev {
+                score::ScoreEvent::Info(s) => eprintln!("[score] {s}"),
+                score::ScoreEvent::Progress { done, total } => {
+                    eprintln!("[score] 进度 {}/{}", done, total)
                 }
-            };
-
-            // 2) JPG 像素分析 + AI（优先缓存命中；并行段只读快照）
-            let jpg_count = entries.iter().filter(|e| !e.is_raw).count();
-            let cache_rows = cache.as_ref().map(|c| c.rows());
-            let outcome = score::analyze_jpgs(&entries, &engine, cache_rows, &cfg);
-            eprintln!(
-                "[score] 分析完成: {} 张 JPG（缓存命中 {}，新分析 {}）",
-                jpg_count, outcome.hits, outcome.misses
-            );
-            // 新结果落盘
-            if let Some(c) = &mut cache {
-                for (path, size, mtime, r) in &outcome.new_rows {
-                    let _ = c.put(path, *size, *mtime, r);
-                }
-                if let Err(err) = c.flush() {
-                    eprintln!("[score] 警告: 缓存写入失败: {err:#}");
-                }
-            }
-
-            // 3) 连拍去重（只针对有分析的 JPG）；
-            //    去重参数：CLI -k（显式给出时）覆盖配置的 keep_k，其余来自 [dedup]。
-            //    review 界面走同一合成函数，同配置下两处结果一致
-            let dedup_params = pic_process::config::effective_dedup(keep, &cfg);
-            let burst_info =
-                run_burst_analysis(&mut entries, &outcome.results, &dedup_params, &cfg.weights);
-
-            // 4) 回填 JPG 分数 + 连拍信息
-            let by_key: HashMap<String, AnalysisResult> = outcome.results;
-            for e in entries.iter_mut().filter(|e| !e.is_raw) {
-                let key = e.pair_id().to_string();
-                if let Some(r) = by_key.get(&key) {
-                    apply_scores(e, &r.scores, r.faces, &cfg);
-                }
-                if let Some(info) = burst_info.get(&key) {
-                    apply_burst(e, info);
-                }
-            }
-            // 5) JPG 结果映射到 ARW（同目录配对，或无歧义的跨目录配对）
-            for e in entries.iter_mut().filter(|e| e.is_raw) {
-                let key = e.pair_id().to_string();
-                if let Some(r) = by_key.get(&key) {
-                    apply_scores(e, &r.scores, r.faces, &cfg);
-                }
-                if let Some(info) = burst_info.get(&key) {
-                    apply_burst(e, info);
-                }
-            }
-
-            // 5.5) 异常文件报告：analysis_ok 列 + stderr 摘要。
-            //      万张跑批时解码失败/无配对 ARW 只在日志里一笔带过会被忽略，
-            //      落成 CSV 列才可过滤、可统计。
-            for e in entries.iter_mut() {
-                e.analysis_ok = if e.total_score.is_empty() { "false" } else { "true" }.into();
-            }
-            let failed_jpgs: Vec<&str> = entries
-                .iter()
-                .filter(|e| !e.is_raw && e.total_score.is_empty())
-                .map(|e| e.path.as_str())
-                .collect();
-            let unmapped_arw = entries.iter().filter(|e| e.is_raw && e.total_score.is_empty()).count();
-            if !failed_jpgs.is_empty() {
-                eprintln!(
-                    "[score] 警告: {} 张 JPG 解码/分析失败: {}",
-                    failed_jpgs.len(),
-                    failed_jpgs.iter().take(10).cloned().collect::<Vec<_>>().join(", ")
-                );
-            }
-            if unmapped_arw > 0 {
-                eprintln!("[score] 警告: {unmapped_arw} 张 ARW 无同名 JPG 可映射分数（analysis_ok=false）");
-            }
-
-            // 6) 星级（批次内相对排名或绝对阈值，见 config.star_mode）
-            //    同一配对键的 JPG/ARW 共用同一星级
-            let rated: Vec<(String, f64)> = by_key
-                .iter()
-                .map(|(k, r)| (k.clone(), score::total_score(&r.scores, &cfg.weights)))
-                .collect();
-            let ratings = output::xmp::assign_ratings(&rated, &cfg.metric);
-            for e in entries.iter_mut() {
-                if let Some(st) = ratings.get(e.pair_id()) {
-                    e.stars = st.to_string();
-                }
-            }
-
-            // 7) XMP 星级侧车（可选）
-            //    按**侧车最终路径**去重：同目录配对的 JPG/ARW 路径相同只写一次；
-            //    跨目录配对的两端各需一份侧车（LR 按图片所在目录找 <stem>.xmp）。
-            if xmp {
-                let mut written = 0usize;
-                let mut skipped = 0usize;
-                let mut seen: HashSet<String> = HashSet::new();
-                for e in &entries {
-                    let key = e.pair_id();
-                    let Some(r) = by_key.get(key) else { continue };
-                    let stem = pic_process::scan::stem_raw_of(&e.filename);
-                    let sidecar = std::path::Path::new(&e.path)
-                        .with_file_name(format!("{stem}.xmp"))
-                        .display()
-                        .to_string();
-                    if !seen.insert(sidecar) {
-                        continue;
-                    }
-                    let total = score::total_score(&r.scores, &cfg.weights);
-                    let rating = *ratings.get(key).unwrap_or(&3);
-                    match output::xmp::write_sidecar(e, &r.scores, total, rating) {
-                        Ok(true) => written += 1,
-                        Ok(false) => skipped += 1,
-                        Err(err) => eprintln!("[xmp] 写入失败 {}: {err:#}", e.path),
-                    }
-                }
-                eprintln!("[xmp] 侧车写入 {written} 个，跳过 {skipped} 个");
-            }
-
-            pic_process::output::csv::write_csv(&output, &entries)?;
-            eprintln!("[score] CSV 已写出: {}", output.display());
+                score::ScoreEvent::Finished { total_jpg, hits, misses } => eprintln!(
+                    "[score] 分析完成: {} 张 JPG（缓存命中 {}，新分析 {}）",
+                    total_jpg, hits, misses
+                ),
+            })?;
         }
         Commands::Review { dir, config, cache, port, no_browser } => {
             // 与 score 相同的 fail-fast 配置加载
@@ -293,53 +154,9 @@ fn main() -> Result<()> {
             if config.is_some() {
                 eprintln!("[review] 配置已加载: {}", config.as_ref().unwrap().display());
             }
-            pic_process::review::serve(&dir, &cfg, &cache, port, !no_browser)
+            pic_process::review::serve(&dir, &cfg, &cache, port, !no_browser, config.as_deref())
                 .with_context(|| "复核服务启动失败")?;
         }
     }
     Ok(())
-}
-
-/// 对 JPG 条目做连拍分析（逻辑在 score::analyze_photo_bursts，review 共用），
-/// 返回 配对键 -> BurstInfo
-fn run_burst_analysis(
-    entries: &mut [scan::PhotoEntry],
-    analyzed: &HashMap<String, AnalysisResult>,
-    params: &DedupParams,
-    weights: &ScoreWeights,
-) -> HashMap<String, BurstInfo> {
-    let map = score::analyze_photo_bursts(entries, analyzed, params, weights);
-    let total = entries
-        .iter()
-        .filter(|e| !e.is_raw && analyzed.contains_key(e.pair_id()))
-        .count();
-    let burst_groups = map.values().filter(|i| i.group != 0).count();
-    if total >= 2 {
-        eprintln!("[score] 连拍去重: {} 张 JPG 中 {} 张属于连拍组", total, burst_groups);
-    }
-    map
-}
-
-/// 把分数写入 PhotoEntry 的 CSV 字段
-fn apply_scores(e: &mut scan::PhotoEntry, s: &score::PixelScores, faces: usize, cfg: &ScoreConfig) {
-    e.sharpness_score = fmt(s.sharpness);
-    e.exposure_score = fmt(s.exposure);
-    e.noise_score = fmt(s.noise);
-    e.composition_score = fmt(s.composition);
-    e.aesthetic_score = fmt(s.aesthetic);
-    e.total_score = fmt(score::total_score(s, &cfg.weights));
-    e.faces = faces.to_string();
-}
-
-/// 把连拍信息写入 PhotoEntry 的 CSV 字段
-fn apply_burst(e: &mut scan::PhotoEntry, info: &BurstInfo) {
-    e.burst_group = if info.group == 0 { "0".into() } else { info.group.to_string() };
-    e.burst_size = if info.size == 0 { String::new() } else { info.size.to_string() };
-    e.burst_rank = if info.rank == 0 { String::new() } else { info.rank.to_string() };
-    e.burst_keep = if info.size == 0 { String::new() } else { info.keep.to_string() };
-    e.burst_pose = if info.size == 0 { String::new() } else { info.pose_cluster.to_string() };
-}
-
-fn fmt(v: f64) -> String {
-    format!("{:.1}", v)
 }
