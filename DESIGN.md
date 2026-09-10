@@ -235,8 +235,6 @@ pic_process/
 - 索尼 ARW 的 maker notes 里**内嵌镜头校正数据**（畸变/暗角/色差），RawTherapee 的 Lens/Geometry 可读取（[参考](https://photo.stackexchange.com/questions/114615/raw-therapee-lens-geometry-correction-sony-a6100/114621)）→ 可作**备用引擎**。
 - 本机 lensfun 版本 **0.3.4**（随 darktable 5.6.1）。
 - **对 Phase 1 无影响**：索尼 JPG 出厂即烘焙镜头校正，评分用 JPG 天然已校正。
-
-**两个易踩的坑（已排除/需注意）**：
 - `18-135mm` 与 `23mm f/1.4` 在 `mil-fujifilm.xml` 里也有同名条目（`XF18-135mmF3.5-5.6R LM OIS WR`、`XF23mmF1.4 R`），**那是富士 X 口，不是命中**；两支镜头各自另有真正的 Sony E 口条目。
 - **不要假定"命中 Sony E 口 = 三项校正齐全"**：`FE 24-70 GM II` 缺暗角；`FE 70-200mm f/2.8 GM OSS` 只有畸变。通用判定逻辑必须**逐条目解析 `<calibration>`**，不能只看是否命中。
 
@@ -246,6 +244,60 @@ pic_process/
 > **两支适马（50/1.4 DG DN、70-200 DG DN OS）上游同样没有条目**，只能自建 profile 或跳过。
 > 真正"完全无 lensfun"的合计 **1522 张 / 8603 = 17.7%**。
 > 建议把"两支适马是否进入上游"做成**周期性检查项**。
+
+### 9.4b P2-M1 侧车方案（已实测定案，2026-09-09）
+
+> 结论来源：对 darktable 5.6.1 逐字段/逐偏移实测 + 源码核对（详见 `p2_notes/xmp_fields.md`，
+> 成品侧车 `p2_notes/reference/DSC00886.ARW.xmp`，机器可读模板 `xmp_template_ILCE-7M5_dt5.6.1.json`）。
+
+**① 侧车命名：两条命名各司其职，不冲突**
+
+| 文件名 | 谁读 | 读什么 |
+|---|---|---|
+| **`<原文件名含扩展名>.xmp`**（`DSC00886.ARW.xmp`） | **darktable 正牌侧车** | 全部，**含 `darktable:history`** |
+| `<stem>.xmp`（`DSC00886.xmp`） | darktable 仅经 `dt_lightroom_import()` | **只有 rating / Label / 关键词；`darktable:history` 被静默忽略** |
+| `<stem>.xmp` | **Lightroom / ACR（M7 决策）** | rating 等 |
+
+→ **Phase 1 保持现状不动**（写 `<stem>.xmp` 给 Lightroom）。
+**Phase 2 编排器另写 `<原名>.ARW.xmp`**（含完整 history + 同时带上 `xmp:Rating` / `firstcut:*`，
+因为正牌侧车存在时 LR 风格那份不再被合并）。两者共存，darktable 优先读正牌侧车。
+`darktable-cli` 会**自动发现**输入同目录的同名侧车，且 **CLI 全程不写侧车**（只读不写，安全）。
+
+**② 四个"写错就静默失效"的点**
+
+- 顶层 `darktable:xmp_version` **合法范围只有 2..5**（缺失/0/1 → legacy 解析 → history 静默丢弃；≥6 → 不支持）。
+- 每条 history 必须齐 `operation` + `params` + `modversion`，缺任一 → **整条丢弃**。
+- `darktable:enabled` 默认是 **0（关闭）**，必须显式写 1。
+- `darktable:history_end` = 实际应用条数。
+
+**③ 落地方式：完整栈模板 + 定点补丁（不能用"部分侧车"）**
+
+部分侧车实测不可用：只写 1 条 exposure 时 darktable 只补 9 条强制模块（**不补 sigmoid / color
+calibration**），结果 512px mean 128.1（无侧车默认 138.7）并随参数剧烈漂移（EV=2.2 时过曝 65.6%）。
+→ 做法：用 `darktable-cli <copy.ARW> <out> --library <tmp>/library.db --core --configdir <tmp>/cfg`
+导入一张该机型 ARW，从临时库 `history` 表抓**默认栈**（本机 ILCE-7M5 = 11 条，含 modversion 与原始 hex），
+之后只做三件事：**原地替换** exposure 的 EV、**原地替换** temperature 的系数、**追加** lens 与 denoiseprofile。
+实测完整栈原样回灌与"无侧车导出"逐像素几乎一致（Δmean 0.002/255）→ 模板法可靠。
+
+**④ 四个模块的 `op_params` 结构（小端 hex，均无指针/变长，可安全手写）**
+
+| 模块 | modversion / 大小 | 关键字段 |
+|---|---|---|
+| `lens` | v10 / 356B | 偏移 332 `has_been_set=0` → 走 EXIF+lensfun **自动匹配**（camera[]/lens[] 留空）。默认栈里没有，需追加 |
+| `exposure` | v7 / 28B | 偏移 8 = EV。**陷阱**：本机 ARW 机身曝光补偿 −1.3EV，默认 `comp_bias=1` 会补上 → 我们的 ΔEV 要写成 `exposure = 0.7 + Δ` 且**保持 comp_bias=1** |
+| `denoiseprofile` | v12 / 416B | `a[0]` 必须 **−1.0f** = 按相机+ISO 自动取 profile（**写 0 实测导出几乎全黑**）；偏移 8 = `strength`；mode=4 为 wavelets-auto |
+| `temperature` | v4 / 20B | **没有 Kelvin/tint**，只有红绿蓝系数；`preset=2` 才用给定系数（`preset=0` as-shot 会被 EXIF 覆盖）；**必须原地替换**默认栈那条（追加会变两个实例叠加） |
+
+**⑤ 版本/相机强绑定 → 必须做防御性校验**
+
+模板与 **darktable 版本 + 相机型号**强绑定（`rawprepare`/`colorin` 等 params 与相机相关，
+modversion 随版本变）。Rust 侧要用 `darktable-cli --version` 做模板键，
+并且**导出后必须校验非全黑**——版本或 params 长度写错时 darktable **不报错**，
+直接给黑图或未初始化内存（`modversion` 偏新 → params 是未初始化内存）。
+
+**⑥ 仍待确认**：`firstcut:*` 在 GUI「改图→保存侧车」后是否 100% 保留（源码上会保留）；
+自定义 `iop_order_version`；Kelvin/tint → 相机 RGB 系数的精确换算（`wb_presets.json` 无 ILCE-7M5）；
+降噪强度分级最优值需目视；16bit TIFF 导出参数。
 
 ### 9.5 里程碑追加（Phase 2 在 Phase 1 M5 之后）
 
