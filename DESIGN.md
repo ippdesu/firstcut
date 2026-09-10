@@ -167,7 +167,7 @@ pic_process/
 |---|---|---|
 | 批量 RAW 开发引擎 | [darktable-cli](https://darktable-org.github.io/dtdocs/en/special-topics/program-invocation/darktable-cli/)（无头批处理，Windows 有官方构建，索尼 ARW 支持好） | ✅ 成熟 |
 | 镜头校正 | [lensfun](https://github.com/lensfun/lensfun)（darktable 内置，开源镜头数据库）；冷门头可自校准（[lens_calibrate](https://gitlab.com/cryptomilk/lens_calibrate)） | ✅ 成熟，覆盖视镜头而定 |
-| AI 降噪 | darktable 5.0 [neural restore 模块](https://darktable-org.github.io/dtdocs/en/module-reference/utility-modules/shared/neural-restore/)（ONNX Runtime 后端，含 RAW 降噪方向，[PR #20854](https://github.com/darktable-org/darktable/pull/20854) 在做 Bayer 域 RawNIND） | ✅ 5.0 已内置，演进中 |
+| AI 降噪 | ~~darktable neural restore~~ **实测不可用于 CLI**（见下）→ 改用 `rawdenoise`（RAW 域小波）+ `denoise (profiled)`（主） | ❌ neural restore 仅 GUI；替代方案 ✅ 已实测 |
 | 自动曝光/色调 | darktable exposure 模块 auto-exposure + Lua（[autostyle](https://darktable-org.github.io/luadocs/lua.scripts.manual/scripts/contrib/autostyle/)）；**Phase 1 的曝光分析直接产出每张补偿值写入 XMP** | 🟡 可达成，8 成效果 |
 | 备选（不推荐） | 纯 Rust 自研：rawler 解码 + 自写色调映射 + `ort` 跑 NAFNet/SCUNet ONNX（[NAFNet](https://github.com/megvii-research/NAFNet)、[ONNX 权重](https://huggingface.co/qualcomm/NAFNet-DeNoise)） | 色彩科学差距大，工作量巨大 |
 
@@ -180,7 +180,8 @@ pic_process/
   1. 为每张 ARW 生成 XMP 侧车（darktable 可读）：
      - lens correction: auto（lensfun）
      - exposure: 补偿值（来自 Phase 1 分析）
-     - neural restore: 按 ISO 分级降噪强度
+     - denoise: `rawdenoise` + `denoise (profiled)`（按 ISO 调 `strength`；
+       **不是** neural restore——它没有 CLI 入口，见 §9.3）
      - 白平衡: 按场景（日光/阴天/自动）简单预设
   2. 循环调用 darktable-cli 批量导出：
      - 16bit TIFF（归档，保留后期空间）
@@ -191,7 +192,21 @@ pic_process/
 ### 9.3 Phase 2 风险
 
 - **lensfun 对用户镜头的覆盖**：需实测；缺失时用 lens_calibrate 自校准（一次性的活）。
-- **neural restore 的 RAW 降噪**（RawNIND）可能尚未合入正式版，需在实施时确认 darktable 版本能力；不可用则退回 darktable 传统 profiled 降噪（效果仍可接受）。
+- **neural restore 无法用于 CLI 批量（已实测定案，2026-09-09）**：
+  模块**存在**且 **RAW 域降噪（RawNIND / PR #20854）确已合入 5.6**，但它是 `dt_lib_module_t`
+  （GUI 工具面板）**而非 iop**：不接收 XMP 参数、不在 pixelpipe 里、靠人点 Process 触发，
+  自己跑后台任务写新 DNG/TIFF 再重新导入，源码里没有 `dt_dev_add_history_item`。
+  `darktable-cli` 侧证据：① `--help` 无任何 AI/模型选项；② `--luacmd` 脚本**从不执行**
+  （Lua 走 `dt_lua_async_call()` 异步投递，而 CLI 是同步直线流程从不进主循环，
+  `init_gui=FALSE` 还导致 `dt_lib_init()` 不跑、模块连注册都没发生）；
+  ③ 二进制里确有 `darktable.ai` Lua API，但只有 GUI 版接受 `--luacmd`。
+  **点一次 GUI 也救不回来**（不是一次性下载问题）。
+  → **替代方案（已实测）**：`rawdenoise`（RAW 域小波，轻）+ `denoise (profiled)`（主）。
+  两者都是标准 iop、可走 XMP。**`denoise (profiled)` 内置相机噪声 profile 并按 ISO
+  自动插值**，"按 ISO 分级降噪"是它的原生行为，`strength` 即分级主旋钮。
+  modversion / `op_params` 二进制布局见 `p2_notes/neural_restore.md`；
+  验证方式：同源同参数只改 `<darktable:enabled>` 1→0，两个 16bit TIFF 的 md5 不同。
+  保留未来路径：若上游给 neural restore 加 CLI 入口再重评。
 - **darktable 读 XMP 侧车的字段**：需用真实照片验证一遍（M4 阶段已计划验证 XMP 星级，可一并做）。
 - **GPU 需求**：neural restore 走 ONNX Runtime，无 GPU 会慢，需确认机器配置。
 
