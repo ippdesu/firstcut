@@ -299,6 +299,79 @@ modversion 随版本变）。Rust 侧要用 `darktable-cli --version` 做模板�
 自定义 `iop_order_version`；Kelvin/tint → 相机 RGB 系数的精确换算（`wb_presets.json` 无 ILCE-7M5）；
 降噪强度分级最优值需目视；16bit TIFF 导出参数。
 
+### 9.4c P2-M2 编排器方案（已实测定案，2026-09-09）
+
+> 结论来源：darktable-cli 5.6.1 Windows 下 27 组用例 + 并发压测 + 基准（详见 `p2_notes/cli_batch.md`）。
+
+**① 并发模型：一张一进程 + worker 池，默认并发 6**
+
+实测（12 张全分辨率 16bit TIFF）：P=4 → 27.4s，**P=6 → 24.0s（最优，2.0s/张）**，
+P=8 → 26.2s（退化），**P=12 → 81.2s（比串行还慢 2×，灾难）**。
+原因：单进程已能吃满 16 逻辑核，超订导致线程爆炸 + 换页（P=12 时单张 CPU 从 12s 涨到 48s，约 200 线程）。
+→ `并发 = clamp(cores/3, 2, 8)`，并加**内存闸门**（全分辨率每张预留 1.2GB，2048px JPG 预留 0.6GB）。
+**不要用"一进程多图"**：位置参数传多个输入只有第一张被导出（其余静默忽略、exit 0）；
+只有重复 `--import` 才真多图，但牺牲逐图错误归因、内存线性增长且不更快。
+
+**② 成功判定：必须以文件系统为准，绝不能靠退出码**
+
+实测 3 张里 2 张成功 + 1 张损坏 → **退出码仍是 1**（整批聚合，无法区分全败/部分败）。
+
+```
+运行前：create_dir_all(outdir)；记录 outdir 已有文件
+spawn ：darktable-cli <输入正斜杠绝对路径> <输出目录正斜杠>/ --out-ext <ext> --apply-custom-presets 0
+判定  ：exists(outdir/(stem+"."+ext)) && size > MIN_BYTES   # jpg ≥ 10KB，tif ≥ 1MB
+```
+日志兜底**只能匹配英文模块名前缀**（`[export_job] exported to`、`[imageio_storage_disk] could not export`、
+`[rawspeed] ... corrupt`）——**本机运行期错误提示是中文的**（随 locale 变），匹配中文必失效。
+
+**③ 三个必须做的前置动作（否则静默产出垃圾）**
+
+1. **路径全部 `\` → `/` 并在构造参数后断言不含 `\`**：反斜杠被**直接删除**而非转义，
+   `F:\p2cli\out\` 会落盘到 `F:\p2cli\p2cliout\`，exit 0 且无警告。
+2. **自己先 `create_dir_all` 输出目录**：目录不存在时 `$(FILE_NAME)` 不展开，
+   写出字面名文件 `$(FILE_NAME).jpg` 且 **exit 0、日志照样写 exported**。
+3. **加 `--apply-custom-presets 0`**：GUI 在跑时 CLI 默认 0.66s 内 `database lock ... aborting` exit 1；
+   该选项是官方给的"multiple instances"开关。注意 `--library` **不能**绕过锁。
+
+**④ 另外 7 个坑**
+
+- 加了 `--apply-custom-presets 0` 后 **`--style` 必然失败**（style 存数据库里）→ **渲染方案必须走预生成
+  含 history 的 XMP，不能用 `--style`**。
+- **重跑不覆盖**：同目录已有产物时新文件叫 `_01`/`_02`，导致"按预期文件名判成功"的编排器第二次跑会误判全失败。
+  → 每 worker 独立输出目录，或跑前清空，并按"本次新增文件"判定。
+- 位置参数传第二张图被静默忽略（exit 0）；`--import DIR` **不递归**。
+- **配置目录无法隔离**（`libdarktable.dll` 里没有 `DARKTABLE_CONFIGDIR`/`XDG_CONFIG_HOME`，"假 LOCALAPPDATA"无效）；
+  CLI 每次运行都会重写 `darktablerc`（幂等，未观测到损坏）→ 当**共享资源**处理。
+- **中文路径其实可用**：之前的"不可用"是 PowerShell 5.1 把 UTF-8 无 BOM 的 `.ps1` 按 GBK 解码造成的假象；
+  Rust 用宽字符 API 无此问题。但反斜杠的 `--library` 路径会触发 `GLib-CRITICAL g_utf8_to_utf16` 断言。
+- **不要用 `--library`**（它的语义是"从库读 history **而非** XMP 侧车"，指向没导入过这些照片的库 = 全部按默认导出）。
+- `--verbose` 无帮助；无 `--bpp`（help 标 unsupported）、无 `--format`。
+
+**⑤ 性能与资源（写 Rust 用得上）**
+
+| 输出 | 单张墙钟 | 峰值工作集 | 产物 |
+|---|---|---|---|
+| 全分辨率 16bit TIFF | **~8.1s** | 870MB~1.1GB | 45.5MB |
+| 全分辨率 JPG | ~5.0s | ~1.05GB | 8.77MB |
+| 2048px JPG | ~3.7s | ~0.36GB | 736KB |
+
+内存是阶梯式：~70MB 解码 → ~360MB → **865MB 平台**。TIFF 已验证：4688×7032、16bit、3 通道、
+Compression=8 (Adobe Deflate)、内嵌 ICC 9012B。
+
+**⑥ 安全结论（重要）**：CLI **不写也不改 XMP 侧车**（前后 MD5 一致），源图无侧车也不新建
+→ **`F:\PS_Process` 原库可以安全只读使用**。
+
+**⑦ 建议命令模板**
+
+```
+darktable-cli.exe <正斜杠输入绝对路径> <已创建的正斜杠输出目录>/ --out-ext tif --apply-custom-presets 0
+# 勿用 --style / --library / --bpp / --verbose
+```
+
+**⑧ 待确认**：`--apply-custom-presets 0` 在"用户已配置自定义预设"时是否影响成像
+（本机无自定义预设，无法实测差异；P2 用预生成 XMP 正好规避该依赖）；OpenCL 是否真启用
+（`cltest` 跑 10 分钟未返回，本轮 CPU 时间占比像纯 CPU）。
+
 ### 9.5 里程碑追加（Phase 2 在 Phase 1 M5 之后）
 
 - **P2-M1**：环境验证 —— 安装 darktable，darktable-cli 手动跑通一张 ARW 全流程（校正+降噪+导出 TIFF/JPG）
