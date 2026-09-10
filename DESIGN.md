@@ -195,27 +195,42 @@ pic_process/
 - **darktable 读 XMP 侧车的字段**：需用真实照片验证一遍（M4 阶段已计划验证 XMP 星级，可一并做）。
 - **GPU 需求**：neural restore 走 ONNX Runtime，无 GPU 会慢，需确认机器配置。
 
-### 9.4 镜头清单与校正策略（已确认镜头）
+### 9.4 镜头清单与校正策略（**已按实机实测重写**，2026-09-09）
 
-用户主力镜头：FE 24-70mm F2.8 GM II（SEL2470GM2）、Sigma 50mm F1.4 DG DN Art（E 口）、Sony 70-350mm F4.5-6.3 G OSS（SEL70350G）、后续添置 Sony 200-600mm F5.6-6.3 G OSS（SEL200600G）。
+> 原表基于"听说有哪几支镜头"填写，与实际库存严重不符：实测（`pic_process scan F:\PS_Process`，
+> 全库 15979 文件 / 8603 ARW）发现占比最高的 FE 24mm GM、E 18-135、Viltrox 23 都没被列出，
+> 而 200-600G 是**已购入但尚未拍摄**（保留，不删）。
+> lensfun 结论由解析本机全部 56 个 XML / 1563 条 `<lens>` 条目 + 上游 master 交叉验证得出。
+
+**实际镜头与 lensfun 覆盖实测**：
+
+| 镜头 | ARW 张数 | Sony E 口 lensfun 条目 | 支持校正项 | 结论 |
+|---|---|---|---|---|
+| FE 24mm F1.4 GM | 2569 | ✅ `mil-sony.xml` | 畸变+色差+暗角 | 直接用 lensfun |
+| E 18-135mm F3.5-5.6 OSS | 1731 | ✅ `mil-sony.xml` | 畸变+色差+暗角 | 直接用 lensfun |
+| **Sigma 50mm F1.4 DG DN \| Art 023** | **1518** | ❌ **无条目** | — | **🔴 必须兜底（占 17.6%，最高优先级）** |
+| Viltrox 23mm F1.4 E | 1397 | ✅ `misc.xml` | 畸变+色差+暗角 | 可用；**标定源自富士 X-T20**（cropfactor 1.53 vs E 口 1.534），失真/TCA 可靠、**暗角可能略偏**，建议抽样目视 |
+| E 70-350mm F4.5-6.3 G OSS | 1231 | ✅ `mil-sony.xml` | 畸变+色差+暗角 | 直接用 lensfun |
+| FE 24-70mm F2.8 GM II | 151 | ✅ `mil-sony.xml` | 畸变+色差；**暗角缺** | 用 lensfun，暗角另想办法（**一代 GM 的暗角系数不可套用二代**） |
+| Sigma 70-200mm F2.8 DG DN OS \| Sports 023 | 4 | ❌ 无条目 | — | 需兜底（优先级极低） |
+| FE 200-600mm F5.6-6.3 G OSS | 0（**已购入未拍摄**） | ✅ `mil-sony.xml` | 畸变+色差+暗角 | 已确认覆盖，拍到即可用 |
 
 **关键背景**：
 - darktable 的 lens correction 模块只走 **lensfun 数据库**，按 EXIF 自动匹配，匹配不到则"无 profile"（[官方文档](https://darktable-org.github.io/dtdocs/en/module-reference/processing-modules/lens-correction/)、[社区反馈](https://github.com/darktable-org/darktable/issues/11022)）；内嵌校正数据（embedded DNG corrections）仅 DNG 支持（[PR #12880](https://github.com/darktable-org/darktable/pull/12880)），**ARW 不适用**。
 - 索尼 ARW 的 maker notes 里**内嵌镜头校正数据**（畸变/暗角/色差），RawTherapee 的 Lens/Geometry 可读取（[参考](https://photo.stackexchange.com/questions/114615/raw-therapee-lens-geometry-correction-sony-a6100/114621)）→ 可作**备用引擎**。
-- 24-70 GM II 光学素质极高（畸变极小，Adobe 早期都无官方 profile、依赖内嵌数据）→ 即使无 lensfun profile，跳过校正也可接受。
+- 本机 lensfun 版本 **0.3.4**（随 darktable 5.6.1）。
+- **对 Phase 1 无影响**：索尼 JPG 出厂即烘焙镜头校正，评分用 JPG 天然已校正。
 
-**lensfun 覆盖实测（2026 直连 lensfun master 分支数据库文件核对）**：
+**两个易踩的坑（已排除/需注意）**：
+- `18-135mm` 与 `23mm f/1.4` 在 `mil-fujifilm.xml` 里也有同名条目（`XF18-135mmF3.5-5.6R LM OIS WR`、`XF23mmF1.4 R`），**那是富士 X 口，不是命中**；两支镜头各自另有真正的 Sony E 口条目。
+- **不要假定"命中 Sony E 口 = 三项校正齐全"**：`FE 24-70 GM II` 缺暗角；`FE 70-200mm f/2.8 GM OSS` 只有畸变。通用判定逻辑必须**逐条目解析 `<calibration>`**，不能只看是否命中。
 
-| 镜头 | lensfun 覆盖 | 校正数据类型 | 结论 |
-|---|---|---|---|
-| FE 24-70 GM II | ✅ 命中 | 畸变(ptlens) ✅ 色差(poly3) ✅ 暗角 ❌ 缺 | 用 lensfun；GM II 暗角极轻，可接受；不满意再用内嵌数据补暗角 |
-| Sigma 50/1.4 DG DN | ❌ **未命中**（mil-sigma.xml 无此条目） | — | 兜底：RawTherapee 内嵌数据；仍不行→跳过（Art 系畸变极小） |
-| 70-350G | ✅ 命中 | 畸变 ✅ 暗角(pa) ✅ 色差 ✅ 全套 | 直接用 lensfun |
-| 200-600G | ✅ 命中（此前 Affinity 论坛帖时代缺失，现已加入） | 畸变 ✅ 暗角(pa) ✅ 色差 ✅ 全套 | 直接用 lensfun |
+**兜底链路（按优先级）**：darktable lensfun 命中 → RawTherapee 读索尼内嵌数据（同一张 ARW 换引擎出图）→ lens_calibrate 自校准 → 跳过（仅限畸变可忽略的镜头）。
 
-**兜底链路（按优先级）**：darktable lensfun 命中 → RawTherapee 读索尼内嵌数据（同一张 ARW 换引擎出图）→ lens_calibrate 自校准 → 跳过（仅限畸变可忽略的镜头）。当前实际只需要对 **Sigma 50/1.4 DG DN** 走兜底。
-
-**对 Phase 1 无影响**：索尼 JPG 出厂即烘焙镜头校正，评分用 JPG 天然已校正。
+> ⚠️ **`lensfun-update-data` 类的升级路径救不了**：已抓上游 master 验证，
+> **两支适马（50/1.4 DG DN、70-200 DG DN OS）上游同样没有条目**，只能自建 profile 或跳过。
+> 真正"完全无 lensfun"的合计 **1522 张 / 8603 = 17.7%**。
+> 建议把"两支适马是否进入上游"做成**周期性检查项**。
 
 ### 9.5 里程碑追加（Phase 2 在 Phase 1 M5 之后）
 

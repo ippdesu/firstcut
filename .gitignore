@@ -22,3 +22,10 @@
 /.firstcut/
 
 /lens_inventory.csv
+
+# Phase 2 调研中间产物（子代理产出，结论已并入 DESIGN.md）
+/p2_notes/
+/p2_test/
+
+# 子代理调研用的 darktable 源码副本（70MB，不入库）
+/dt_research/
