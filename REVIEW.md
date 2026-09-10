@@ -5,8 +5,9 @@
 >
 > **当前状态**：
 > - 第 1 轮（GLM → DSH，2026-09-08）**13 项全部核实为真、全部已修复**（main `b477c96`，测试 26 → 37 单元 + 6 集成）。
-> - 第 2 轮（DSH → GLM，2026-09-09）**M9 / M-UI1 验收：6 项遗漏 → 全部已修复**（分支 `fix/v2-review-acceptance`，M9/UI 主体实现无功能性错误）。
-> - 当前测试基线：**47 单元 + 6 集成**全过。
+> - 第 2 轮（DSH → GLM，2026-09-09）**M9 / M-UI1 验收：6 项遗漏 → 全部已修复**（`fix/v2-review-acceptance`）。
+> - 第 3 轮（DSH 验收 M-UI2，2026-09-09）**6 项复验通过；M-UI2 操作台可用；新增 4 条加固建议待排期**。
+> - 当前测试基线：**51 单元 + 6 集成**全过。
 
 ## 追加新一轮评审的格式
 
@@ -15,6 +16,39 @@
 2. 在本文件末尾新增一节 `## 第 N 轮原始工单（<来源>，<日期>）`，原样保留对方工单。
 3. 暂不实施/待拍板的项写进该轮的「附」小节，不要静默丢弃。
 4. 同步更新 `README.md` / `DESIGN.md`（见 `DESIGN.md` §11 的交付纪律）。
+
+## 处理状态（第 3 轮 · DSH 验收 GLM 的 M-UI2 + 6 项修复 · 2026-09-09）
+
+> 验收对象：`fix/v2-review-acceptance`（74c060f）+ `ui-m2`（4b09845），已合入 main。
+> **结论：第 2 轮 6 项全部修复且实测通过；M-UI2 把复核界面升级为可写操作台，功能可用，未发现阻断性问题。**
+> 以下 4 条为加固建议，**不阻断、待排期**。
+
+**第 2 轮 6 项修复的复验（全部实测）**
+
+| 项 | 复验结果 |
+|---|---|
+| V2-1 | `pic_process review --help` 正常；独立二进制目标已从 `Cargo.toml` 移除（单一入口 ✓） |
+| V2-2 | 抽 `config::effective_dedup`：配置 `keep_k=1` → 保留 9，`keep_k=3` → 保留 17（配置生效 ✓）；score/review 共用同一函数 |
+| V2-3 | CSV 新增 `burst_pose` 列 ✓ |
+| V2-4 | release_notes 与最终基线对齐（现为 51 单元 + 6 集成） |
+| V2-5 | `.gitignore` 已加 `.firstcut/` ✓ |
+| V2-6 | 改按路径段判断；`sub/a..b.jpg` 不再误伤（单测覆盖）✓ |
+
+**额外修复（GLM 自查发现，已复验）**：`scan_directory` 跳过 `.firstcut/` 子树 ——
+实测照片根放 4 个文件（含 `.firstcut/thumbs/x.jpg`）只扫出 3 个，320px 缩略图不再被当照片评分 ✓。
+
+**第 3 轮工单（加固建议，待排期）**
+
+| 编号 | 建议 | 依据 / 实测 |
+|---|---|---|
+| V3-1 | 写接口加 **Host 头白名单**（校验 `Host` 为 `127.0.0.1:<port>` / `localhost:<port>`） | 实测 `POST /api/score/run` 带伪造 `Origin: http://evil.example` **仍返回 202**，无 Origin 校验。普通 CSRF 目前被"必须 JSON 体 → 浏览器预检"挡住（实测 `OPTIONS` → 405、无 CORS 头），但 **DNS rebinding** 可绕过（同源后直连 127.0.0.1，无 Host 校验即全写权限）。概率低、加固成本极低 |
+| V3-2 | UI 跑批的 `report.csv` 与配置编辑的 `firstcut.toml` 默认相对**服务进程 CWD**，建议默认落到照片根或明确提示 | `mod.rs:221` `PathBuf::from("report.csv")`、`mod.rs:64` 默认 `firstcut.toml`；实测在仓库根启动服务时 `/api/config` 指向仓库自己的 `firstcut.toml` |
+| V3-3 | `cargo fmt` 一下 | `src/config.rs:476` 折行异常（两个语句挤一行）。本机未装 rustfmt（`rustup component add rustfmt`） |
+| V3-4 | 清理陈旧构建产物 | `target/release/pic_process-review.exe` 在 bin 目标移除后仍留在磁盘（无害，`cargo clean` 可清） |
+
+**第 3 轮验收通过项**：`/api/rate` 写入 XMP 侧车成功且只改 Rating、非法星级 400、他人侧车 409；
+`/api/config` GET/POST 正常、toml_edit 保留注释、写盘前全量校验；`/api/job` 进度轮询与日志环形缓冲（有单测）；
+跑批单任务互斥 + 快照热替换；`run_score_job` 抽取后 CLI 与 UI 共用；全量回归 archive 119 张星级 **12/24/41/31/11**（与基线一致）。
 
 ## 处理状态（第 2 轮 · DSH 验收 GLM 的 M9 / M-UI1 改动 · 2026-09-09）
 
