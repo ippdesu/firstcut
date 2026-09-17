@@ -83,6 +83,10 @@ pub struct AnalysisResult {
     /// M9 头部姿态描述子：最大主体级人脸的 5 个 SCRFD 关键点按人脸框归一化
     /// （对位置/尺度不变），连拍组内聚类"不同姿势"用。None = 无主体级人脸。
     pub pose_desc: Option<[f32; 10]>,
+    /// 建议曝光修正（EV，1/3 档；None = 曝光在容差带内、不给建议）。
+    /// 写进 XMP（`firstcut:suggestedEV` + `crs:Exposure2`）与 CSV，
+    /// 实际修正由用户在 Lightroom 里确认应用。
+    pub suggested_ev: Option<f64>,
 }
 
 /// 加权总分（0-100，1 位小数）
@@ -363,8 +367,10 @@ pub fn analyze_one(
         ev_lo: p.exposure_ev_lo,
         ev_hi: p.exposure_ev_hi,
         subject_blend: p.exposure_subject_blend,
+        suggest_cap: p.exposure_suggest_cap,
     };
     let exposure = metrics::exposure::exposure_score(&stats, subject_luma, &exposure_curve);
+    let suggested_ev = metrics::exposure::suggested_ev(&stats, subject_luma, &exposure_curve);
 
     Ok(Some(AnalysisResult {
         scores: PixelScores {
@@ -377,6 +383,7 @@ pub fn analyze_one(
         dhash,
         faces,
         pose_desc: subject_face.as_ref().and_then(pose_descriptor),
+        suggested_ev,
     }))
 }
 
@@ -502,7 +509,7 @@ pub fn run_score_job(
     for e in entries.iter_mut() {
         let key = e.pair_id().to_string();
         if let Some(r) = by_key.get(&key) {
-            apply_scores(e, &r.scores, r.faces, cfg);
+            apply_scores(e, &r.scores, r.suggested_ev, r.faces, cfg);
         }
         if let Some(info) = burst_map.get(&key) {
             apply_burst(e, info);
@@ -560,7 +567,7 @@ pub fn run_score_job(
             }
             let total = total_score(&r.scores, &cfg.weights);
             let rating = *ratings.get(key).unwrap_or(&3);
-            match crate::output::xmp::write_sidecar(e, &r.scores, total, rating) {
+            match crate::output::xmp::write_sidecar(e, &r.scores, total, rating, r.suggested_ev) {
                 Ok(true) => written += 1,
                 Ok(false) => skipped += 1,
                 Err(err) => on_event(ScoreEvent::Info(format!("XMP 写入失败 {}: {err:#}", e.path))),
@@ -584,7 +591,13 @@ pub fn run_score_job(
 }
 
 /// 把分数写入 PhotoEntry 的 CSV 字段
-fn apply_scores(e: &mut PhotoEntry, s: &PixelScores, faces: usize, cfg: &ScoreConfig) {
+fn apply_scores(
+    e: &mut PhotoEntry,
+    s: &PixelScores,
+    suggested_ev: Option<f64>,
+    faces: usize,
+    cfg: &ScoreConfig,
+) {
     e.sharpness_score = fmt(s.sharpness);
     e.exposure_score = fmt(s.exposure);
     e.noise_score = fmt(s.noise);
@@ -592,6 +605,11 @@ fn apply_scores(e: &mut PhotoEntry, s: &PixelScores, faces: usize, cfg: &ScoreCo
     e.aesthetic_score = fmt(s.aesthetic);
     e.total_score = fmt(total_score(s, &cfg.weights));
     e.faces = faces.to_string();
+    // 建议 EV：无建议留空；有建议带符号两位小数（+0.33 / -1.00）
+    e.suggested_ev = match suggested_ev {
+        Some(ev) if ev.abs() > 1e-9 => format!("{:+.2}", ev),
+        _ => String::new(),
+    };
 }
 
 /// 把连拍信息写入 PhotoEntry 的 CSV 字段

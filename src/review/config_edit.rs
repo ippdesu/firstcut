@@ -34,6 +34,7 @@ pub struct ConfigValues {
     pub exposure_ev_lo: f64,
     pub exposure_ev_hi: f64,
     pub exposure_subject_blend: f64,
+    pub exposure_suggest_cap: f64,
     pub dedup_keep_k: f64,
     pub dedup_adaptive_keep: bool,
     pub dedup_pose_cluster_threshold: f64,
@@ -63,6 +64,7 @@ impl ConfigValues {
             exposure_ev_lo: c.metric.exposure_ev_lo,
             exposure_ev_hi: c.metric.exposure_ev_hi,
             exposure_subject_blend: c.metric.exposure_subject_blend,
+            exposure_suggest_cap: c.metric.exposure_suggest_cap,
             dedup_keep_k: c.dedup.keep_k as f64,
             dedup_adaptive_keep: c.dedup.adaptive_keep,
             dedup_pose_cluster_threshold: c.dedup.pose_cluster_threshold,
@@ -130,6 +132,7 @@ pub fn save(path: &Path, values: &ConfigValues) -> Result<()> {
         t["exposure_ev_lo"] = toml_edit::value(values.exposure_ev_lo);
         t["exposure_ev_hi"] = toml_edit::value(values.exposure_ev_hi);
         t["exposure_subject_blend"] = toml_edit::value(values.exposure_subject_blend);
+        t["exposure_suggest_cap"] = toml_edit::value(values.exposure_suggest_cap);
     }
     if let Some(t) = doc["dedup"].as_table_mut() {
         t["keep_k"] = toml_edit::value(values.dedup_keep_k.max(0.0) as i64);

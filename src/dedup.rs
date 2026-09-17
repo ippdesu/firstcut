@@ -346,6 +346,7 @@ mod tests {
             composition_score: String::new(),
             aesthetic_score: String::new(),
             total_score: String::new(),
+            suggested_ev: String::new(),
             stars: String::new(),
             faces: String::new(),
             analysis_ok: String::new(),

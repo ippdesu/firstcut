@@ -3,6 +3,8 @@
 //! 为每张照片写侧车 `<stem>.xmp`（Lightroom / Camera Raw / darktable 均可读）：
 //! - `xmp:Rating`（1-5 星）
 //! - `firstcut:` 自定义命名空间存 5 维子分 + 人脸数 + 连拍信息
+//! - 建议曝光 EV（仅曝光出容差带时）：`crs:Exposure2`（Lightroom 自家开发字段）
+//!   + `firstcut:suggestedEV`（信息字段）；实际修正由用户在 Lightroom 里确认
 //!
 //! 命名说明：Lightroom/ACR 读 `<basename>.xmp`（不带扩展名），darktable 也兼容
 //! 该格式（另外还认自己的 `<basename>.<ext>.xmp`）。所以统一用 `<stem>.xmp`，
@@ -94,15 +96,29 @@ pub fn assign_ratings(pairs: &[(String, f64)], m: &MetricParams) -> HashMap<Stri
 }
 
 /// 生成 XMP 侧车内容
-pub fn render_xmp(e: &PhotoEntry, s: &PixelScores, total: f64, rating: u8) -> String {
+pub fn render_xmp(e: &PhotoEntry, s: &PixelScores, total: f64, rating: u8,
+    suggested_ev: Option<f64>,
+) -> String {
     let faces = e.faces.parse::<usize>().unwrap_or(0);
+    // 建议曝光 EV（Lightroom 联动）：有建议才写入，无建议侧车完全不变。
+    // crs:Exposure2 = LR 自家曝光开发字段（侧车被读取时建议值成为 LR 初始曝光）；
+    // firstcut:suggestedEV = 信息性元数据字段（LR 元数据面板可见）。
+    let (crs_ns, crs_attr, ev_line) = match suggested_ev {
+        Some(ev) => (
+            String::from(" xmlns:crs=\"http://ns.adobe.com/camera-raw-settings/1.0/\""),
+            format!(" crs:Exposure2=\"{ev:.2}\""),
+            format!("    <firstcut:suggestedEV>{ev:+.2}</firstcut:suggestedEV>\n"),
+        ),
+        None => (String::new(), String::new(), String::new()),
+    };
+    let (crs_ns, crs_attr, ev_line) = (crs_ns.as_str(), crs_attr.as_str(), ev_line.as_str());
     format!(
         "<?xpacket begin=\"\u{feff}\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\n\
          <x:xmpmeta xmlns:x=\"adobe:ns:meta/\">\n\
          \x20<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n\
          \x20\x20<rdf:Description rdf:about=\"\"\n\
          \x20\x20\x20 xmlns:xmp=\"http://ns.adobe.com/xap/1.0/\"\n\
-         \x20\x20\x20 xmlns:firstcut=\"{NS_FIRSTCUT}\">\n\
+         \x20\x20\x20 xmlns:firstcut=\"{NS_FIRSTCUT}\"{crs_ns}{crs_attr}>\n\
          \x20\x20\x20\x20<xmp:Rating>{rating}</xmp:Rating>\n\
          \x20\x20\x20\x20<firstcut:sharpness>{:.1}</firstcut:sharpness>\n\
          \x20\x20\x20\x20<firstcut:exposure>{:.1}</firstcut:exposure>\n\
@@ -111,7 +127,7 @@ pub fn render_xmp(e: &PhotoEntry, s: &PixelScores, total: f64, rating: u8) -> St
          \x20\x20\x20\x20<firstcut:aesthetic>{:.1}</firstcut:aesthetic>\n\
          \x20\x20\x20\x20<firstcut:faces>{faces}</firstcut:faces>\n\
          \x20\x20\x20\x20<firstcut:total>{total:.1}</firstcut:total>\n\
-         \x20\x20\x20\x20<firstcut:burstGroup>{}</firstcut:burstGroup>\n\
+         {ev_line}\x20\x20\x20\x20<firstcut:burstGroup>{}</firstcut:burstGroup>\n\
          \x20\x20\x20\x20<firstcut:burstRank>{}</firstcut:burstRank>\n\
          \x20\x20\x20\x20<firstcut:burstKeep>{}</firstcut:burstKeep>\n\
          \x20\x20</rdf:Description>\n\
@@ -136,6 +152,7 @@ pub fn write_sidecar(
     s: &PixelScores,
     total: f64,
     rating: u8,
+    suggested_ev: Option<f64>,
 ) -> anyhow::Result<bool> {
     if e.total_score.is_empty() {
         return Ok(false);
@@ -156,7 +173,7 @@ pub fn write_sidecar(
         }
     }
 
-    let xml = render_xmp(e, s, total, rating);
+    let xml = render_xmp(e, s, total, rating, suggested_ev);
     std::fs::write(&sidecar, xml)?;
     Ok(true)
 }
@@ -187,6 +204,7 @@ mod tests {
             composition_score: "60.0".into(),
             aesthetic_score: "45.0".into(),
             total_score: "66.0".into(),
+            suggested_ev: String::new(),
             stars: "4".into(),
             faces: "1".into(),
             analysis_ok: "true".into(),
@@ -222,7 +240,7 @@ mod tests {
             composition: 60.0,
             aesthetic: 45.0,
         };
-        let xml = render_xmp(&e, &s, 66.0, 4);
+        let xml = render_xmp(&e, &s, 66.0, 4, None);
         assert!(xml.contains("<xmp:Rating>4</xmp:Rating>"));
         assert!(xml.contains("<firstcut:sharpness>75.0</firstcut:sharpness>"));
         assert!(xml.contains("<firstcut:aesthetic>45.0</firstcut:aesthetic>"));
@@ -271,5 +289,47 @@ mod tests {
         let r = assign_ratings(&pairs, &m);
         assert_eq!(r["a"], 5);
         assert_eq!(r["b"], 1);
+    }
+
+    /// 建议 EV 存在：写 crs:Exposure2（LR 属性）+ firstcut:suggestedEV（元数据），且位置正确
+    #[test]
+    fn xmp_contains_suggested_ev_when_present() {
+        let e = entry();
+        let s = PixelScores {
+            sharpness: 75.0,
+            exposure: 30.0,
+            noise: 60.0,
+            composition: 60.0,
+            aesthetic: 45.0,
+        };
+        let xml = render_xmp(&e, &s, 55.0, 2, Some(-0.33));
+        assert!(xml.contains(r#"<firstcut:suggestedEV>-0.33</firstcut:suggestedEV>"#));
+        assert!(xml.contains(r#"crs:Exposure2="-0.33""#));
+        assert!(xml.contains("xmlns:crs=\"http://ns.adobe.com/camera-raw-settings/1.0/\""));
+        // 建议行位于 total 与 burstGroup 之间
+        let i = xml.find("<firstcut:total>").unwrap();
+        let j = xml.find("<firstcut:suggestedEV>").unwrap();
+        let k = xml.find("<firstcut:burstGroup>").unwrap();
+        assert!(i < j && j < k, "suggestedEV 应在 total 之后、burstGroup 之前");
+    }
+
+    /// 无建议：侧车与旧版逐字节一致（无 crs 命名空间、无 suggestedEV、无 Exposure2）
+    #[test]
+    fn xmp_untouched_when_no_suggested_ev() {
+        let e = entry();
+        let s = PixelScores {
+            sharpness: 75.0,
+            exposure: 80.0,
+            noise: 60.0,
+            composition: 60.0,
+            aesthetic: 45.0,
+        };
+        let xml_none = render_xmp(&e, &s, 66.0, 4, None);
+        assert!(!xml_none.contains("suggestedEV"), "无建议不应出现 suggestedEV");
+        assert!(!xml_none.contains("Exposure2"), "无建议不应出现 Exposure2");
+        assert!(!xml_none.contains("crs"), "无建议不应出现 crs 命名空间");
+        let xml_some = render_xmp(&e, &s, 66.0, 4, Some(1.0));
+        assert!(xml_some.contains(r#"<firstcut:suggestedEV>+1.00</firstcut:suggestedEV>"#));
+        assert!(xml_some.contains(r#"crs:Exposure2="1.00""#));
     }
 }

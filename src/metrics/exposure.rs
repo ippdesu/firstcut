@@ -88,6 +88,8 @@ pub struct ExposureCurve {
     pub ev_hi: f64,
     /// 主体脸亮度权重（0 = 只看全图，1 = 只看主体脸）
     pub subject_blend: f64,
+    /// 建议 EV 上限（档）：带外照片的建议修正被钳在 ±此值内；0 = 不给建议
+    pub suggest_cap: f64,
 }
 
 /// sRGB 码值 → 线性光
@@ -122,9 +124,7 @@ fn tone_term(code: f64, c: &ExposureCurve) -> f64 {
     .clamp(0.0, 1.0)
 }
 
-/// 曝光分数（0-100，100 最佳）
-///
-/// `subject_mean`：主体级人脸区域的平均亮度（无人脸时 None）。
+/// 判定亮度（0-255 码值）：全图截尾均值 + 主体脸的单向拉回混合
 ///
 /// 主体亮度只用于**把被背景误导的判定拉回中灰方向**：
 /// - 判定值先夹到 `[min(全图, 目标), max(全图, 目标)]` 之间，
@@ -135,13 +135,9 @@ fn tone_term(code: f64, c: &ExposureCurve) -> f64 {
 /// （舞台黑幕布偏低、白裙白背景偏高），主体脸均值被脸框内的头发/阴影带偏。
 /// 让主体信息只做"拉回中灰"的单向修正，可以救回被背景误判的照片，
 /// 又不会因为一个暗色/亮色误检框而把本来正常的照片打下去。
-pub fn exposure_score(
-    stats: &ExposureStats,
-    subject_mean: Option<f64>,
-    c: &ExposureCurve,
-) -> f64 {
+pub fn exposure_basis(stats: &ExposureStats, subject_mean: Option<f64>, c: &ExposureCurve) -> f64 {
     let blend = c.subject_blend.clamp(0.0, 1.0);
-    let basis = match subject_mean {
+    match subject_mean {
         Some(s) => {
             let lo = stats.mean_trunc.min(c.target);
             let hi = stats.mean_trunc.max(c.target);
@@ -149,9 +145,52 @@ pub fn exposure_score(
             stats.mean_trunc + blend * pull
         }
         None => stats.mean_trunc,
-    };
+    }
+}
+
+/// 曝光分数（0-100，100 最佳）
+///
+/// `subject_mean`：主体级人脸区域的平均亮度（无人脸时 None）。
+pub fn exposure_score(
+    stats: &ExposureStats,
+    subject_mean: Option<f64>,
+    c: &ExposureCurve,
+) -> f64 {
+    let basis = exposure_basis(stats, subject_mean, c);
     let clip_penalty = 4.0 * stats.over_ratio + 4.0 * stats.under_ratio;
     (100.0 * (1.0 - clip_penalty).max(0.0) * tone_term(basis, c)).clamp(0.0, 100.0)
+}
+
+/// 建议曝光修正（EV，1/3 档取整；None = 不需要建议）
+///
+/// 与打分共用同一判定亮度：
+/// - 判定值落在满分容差带内（与打分同带）→ 正常照片，不给建议；
+/// - 带外 → 建议反向修正（暗 → +EV，亮 → −EV），钳位在 ±`suggest_cap`
+///   （极欠/极曝的照片应该在筛选里被淘汰，而不是被建议 +3 档这种鬼数值）；
+/// - `suggest_cap = 0` → 一律不给建议。
+///
+/// 建议值同时写进 XMP（`firstcut:suggestedEV` 信息字段 + `crs:Exposure2`
+/// Lightroom 开发字段），实际曝光修正由用户在 Lightroom 里确认/应用，
+/// 本程序不修改照片。
+pub fn suggested_ev(stats: &ExposureStats, subject_mean: Option<f64>, c: &ExposureCurve) -> Option<f64> {
+    let cap = c.suggest_cap;
+    if cap <= 0.0 {
+        return None;
+    }
+    let basis = exposure_basis(stats, subject_mean, c);
+    let ev = ev_offset(basis, c.target); // 负 = 偏暗
+    if ev >= -c.ev_full_lo && ev <= c.ev_full_hi {
+        return None; // 容差带内 = 曝光正常，不折腾
+    }
+    let corr = -ev;
+    // 先 1/3 档取整、再钳位：钳位在取整之后才能保证建议值不越过 cap
+    let rounded = (corr * 3.0).round() / 3.0;
+    let clamped = rounded.clamp(-cap, cap);
+    if clamped.abs() < 1e-9 {
+        None
+    } else {
+        Some(clamped)
+    }
 }
 
 /// 指定区域（归一化坐标）的平均亮度（0-255）
@@ -201,6 +240,7 @@ mod tests {
             ev_lo: 4.0,
             ev_hi: 2.0,
             subject_blend: 0.5,
+            suggest_cap: 2.0,
         }
     }
 
@@ -302,5 +342,65 @@ mod tests {
         s.over_ratio = 0.1; // 10% 死白
         let scored = exposure_score(&s, None, &c);
         assert!(scored < 70.0 && scored > 50.0, "10% 死白应扣到 ~60 分，实际 {scored}");
+    }
+
+    /// 建议 EV：容差带内不给建议（与打分同带，正常的片不折腾）
+    #[test]
+    fn suggested_ev_none_inside_band() {
+        let c = curve();
+        for code in [93.0, 110.0, 128.0, 150.0, 175.0] {
+            assert!(suggested_ev(&stats(code), None, &c).is_none(), "码值 {code} 带内不应有建议");
+        }
+        // 边界外 1/3 档（码值 87 ≈ -1.18 EV）→ 建议 +1.33（1/3 档取整）
+        let dark = suggested_ev(&stats(87.0), None, &c);
+        assert!(dark.map_or(false, |v| (v - 4.0 / 3.0).abs() < 1e-9), "应建议 +1.33 档，实际 {dark:?}");
+    }
+
+    /// 建议 EV：方向与量级（暗 → +EV、亮 → −EV），1/3 档取整
+    #[test]
+    fn suggested_ev_direction_and_third_stop() {
+        let c = curve();
+        // 码值 65.7 ≈ -2 EV → 建议 +2.0
+        let dark = suggested_ev(&stats(65.7), None, &c).unwrap();
+        assert!((dark - 2.0).abs() < 1e-9, "欠曝 2 档应建议 +2.0，实际 {dark}");
+        // 码值 239 ≈ +2 EV → 建议 -2.0
+        let bright = suggested_ev(&stats(239.0), None, &c).unwrap();
+        assert!((bright + 2.0).abs() < 1e-9, "过曝 2 档应建议 -2.0，实际 {bright}");
+        // 1/3 档取整：码值 100 ≈ -0.76 EV，仍在容差带内（< -1 EV 才给建议）
+        assert!(suggested_ev(&stats(100.0), None, &c).is_none());
+        // 码值 89 ≈ -1.11 EV → +1.11 取 1/3 档 = +1.0（3/3）
+        let r = suggested_ev(&stats(89.0), None, &c).unwrap();
+        assert!((r - 1.0).abs() < 1e-9, "89 码值应建议 +1.0，实际 {r}");
+        // 码值 87 ≈ -1.18 EV → +1.18 取 1/3 档 = +1.33（4/3）
+        let r = suggested_ev(&stats(87.0), None, &c).unwrap();
+        assert!((r - 4.0 / 3.0).abs() < 1e-9, "87 码值应建议 +1.33，实际 {r}");
+    }
+
+    /// 建议 EV：超上限钳位（极欠/极曝不给出鬼建议），suggest_cap=0 关闭
+    #[test]
+    fn suggested_ev_clamped_by_cap() {
+        // 码值 31 ≈ -4 EV，cap=2.0 → 只建议 +2.0
+        let c = curve();
+        let dark = suggested_ev(&stats(31.0), None, &c).unwrap();
+        assert!((dark - 2.0).abs() < 1e-9, "-4 EV 应钳到 +2.0，实际 {dark}");
+        // cap=0 → 一律无建议
+        let c0 = ExposureCurve { suggest_cap: 0.0, ..curve() };
+        assert!(suggested_ev(&stats(31.0), None, &c0).is_none());
+        assert!(suggested_ev(&stats(128.0), None, &c0).is_none());
+        // 小 cap：cap=0.5 → -4 EV 建议 +0.5
+        let c5 = ExposureCurve { suggest_cap: 0.5, ..curve() };
+        let dark = suggested_ev(&stats(31.0), None, &c5).unwrap();
+        assert!((dark - 0.5).abs() < 1e-9, "实际 {dark}");
+    }
+
+    /// 建议 EV：与打分共用同一判定亮度（主体脸拉回影响建议，方向一致）
+    #[test]
+    fn suggested_ev_uses_subject_basis() {
+        let c = curve();
+        let dark = stats(38.0); // 舞台黑幕布
+        let global = suggested_ev(&dark, None, &c); // -2.26 EV → +2.0（钳位）
+        let with_subject = suggested_ev(&dark, Some(110.0), &c); // 判定被拉回 → 建议变小
+        assert!(global.is_some() && with_subject.is_some());
+        assert!(with_subject.unwrap() < global.unwrap(), "主体脸救回后建议应减小");
     }
 }

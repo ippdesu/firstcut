@@ -280,7 +280,7 @@ async fn rate(State(state): State<Arc<AppState>>, axum::Json(p): axum::Json<Rate
         return (StatusCode::CONFLICT, "评分任务进行中，暂不能改星").into_response();
     }
     // 从当前快照取该照片的分数（未评分照片没有可写子分，拒绝）
-    let (scores, total, entry) = {
+    let (scores, total, suggested_ev, entry) = {
         let guard = state.snapshot.read().unwrap();
         let Some(photo) = guard.photos.iter().find(|x| x.path == p.p) else {
             return (StatusCode::NOT_FOUND, "照片不在快照中").into_response();
@@ -317,6 +317,7 @@ async fn rate(State(state): State<Arc<AppState>>, axum::Json(p): axum::Json<Rate
             composition_score: format!("{:.1}", s.composition),
             aesthetic_score: format!("{:.1}", s.aesthetic),
             total_score: format!("{:.1}", s.total),
+            suggested_ev: String::new(),
             stars: String::new(),
             faces: photo.faces.to_string(),
             analysis_ok: "true".into(),
@@ -334,10 +335,10 @@ async fn rate(State(state): State<Arc<AppState>>, axum::Json(p): axum::Json<Rate
                 .map(|b| b.pose_cluster.to_string())
                 .unwrap_or_default(),
         };
-        (px, s.total, entry)
+        (px, s.total, s.suggested_ev, entry)
     };
 
-    match crate::output::xmp::write_sidecar(&entry, &scores, total, p.stars) {
+    match crate::output::xmp::write_sidecar(&entry, &scores, total, p.stars, suggested_ev) {
         Ok(true) => {
             // 内存快照同步（同 stem 的 JPG/ARW 行共享星级）
             {

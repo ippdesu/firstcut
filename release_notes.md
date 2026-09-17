@@ -30,6 +30,18 @@
 - **配置编辑器**：权重/星级/EV 容差/连拍参数表单化编辑，保留 TOML 注释，非法值拒绝写盘。
 - 扫描器跳过 `.firstcut/` 缩略图缓存目录（缩略图不会被误当照片评分）。
 
+**✨ 新功能（建议曝光 EV → Lightroom 联动）**
+- **建议曝光修正**：照片曝光落在满分容差带外（默认 ±1 档）时，XMP 侧车多写一条建议修正：
+  `firstcut:suggestedEV`（信息性元数据）+ `crs:Exposure2`（Lightroom 自家曝光开发字段——
+  LR 读取侧车时建议值直接成为 LR 内的初始曝光）。本程序**不修改照片**，由用户在
+  Lightroom 里确认/应用；容差带内的照片侧车与旧版逐字节一致。
+- 建议按 1/3 档取整，上下限 `[metric] exposure_suggest_cap`（默认 2.0；0 = 关闭建议）；
+  判定亮度与曝光打分共用同一基准（含主体脸单向修正），所以"给建议"与"扣曝光分"永远一致。
+- CSV 新增 `suggested_ev` 列（带符号两位小数，空 = 无建议）；review 配置编辑器新增该字段。
+- 缓存行携带建议值（`CACHE_VERSION` 14，旧缓存自动失效重建）。
+- **Phase 2 方向变更**：darktable 批量 RAW 开发管线（DESIGN §9 调研）停掉留档，
+  firstcut 回归筛选工具本位——修图交回 Lightroom。
+
 **🧪 实验性**
 - **`score --gpu`**（需 `cargo build --release --features gpu`）：DirectML 推理。
   实测 119 张 16.7s vs CPU 17.4s——无显著收益，保持实验性、默认构建不含。

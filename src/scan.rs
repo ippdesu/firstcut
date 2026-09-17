@@ -38,6 +38,9 @@ pub struct PhotoEntry {
     pub composition_score: String,
     pub aesthetic_score: String,
     pub total_score: String,
+    /// 建议曝光修正（EV，带符号；空 = 曝光在容差带内不给建议）。
+    /// 同步写入 XMP（`firstcut:suggestedEV` + `crs:Exposure2`），供 Lightroom 确认应用
+    pub suggested_ev: String,
     /// 星级（1-5；relative 模式为批次内相对排名，absolute 模式为总分阈值）
     pub stars: String,
     /// 检测到的人脸数

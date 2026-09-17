@@ -532,7 +532,7 @@ window.addEventListener('keydown', e=>{
 const FIELDS = [
   ['权重（和 ≈ 1.0）', [['w_sharpness','清晰度'],['w_exposure','曝光'],['w_noise','噪点'],['w_composition','构图'],['w_aesthetic','美学']]],
   ['星级', [['star_mode','分档模式（select:relative/absolute）'],['star_five_pct','5★ 百分位'],['star_four_pct','4★ 百分位'],['star_three_pct','3★ 百分位'],['star_two_pct','2★ 百分位'],['rating_5','5★ 阈值'],['rating_4','4★ 阈值'],['rating_3','3★ 阈值'],['rating_2','2★ 阈值']]],
-  ['曝光 EV 容差带', [['exposure_target','目标亮度'],['exposure_ev_full_lo','暗侧满分'],['exposure_ev_full_hi','亮侧满分'],['exposure_ev_lo','暗侧归零'],['exposure_ev_hi','亮侧归零'],['exposure_subject_blend','主体混合权重']]],
+  ['曝光 EV 容差带', [['exposure_target','目标亮度'],['exposure_ev_full_lo','暗侧满分'],['exposure_ev_full_hi','亮侧满分'],['exposure_ev_lo','暗侧归零'],['exposure_ev_hi','亮侧归零'],['exposure_subject_blend','主体混合权重'],['exposure_suggest_cap','建议EV上限']]],
   ['连拍 [dedup]', [['dedup_keep_k','每姿势簇保留'],['dedup_pose_cluster_threshold','姿态阈值'],['dedup_burst_group_cap','单组上限']]],
 ];
 document.getElementById('cfgBtn').addEventListener('click', async ()=>{

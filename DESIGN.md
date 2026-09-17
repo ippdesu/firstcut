@@ -158,6 +158,14 @@ pic_process/
 
 ## 9. Phase 2（远期）：批量 RAW 开发，替代 Lightroom 手动流程
 
+> **⚠️ 状态更新（2026-09-18）：darktable 批量开发管线已停。**
+> 方向由用户拍板：firstcut 回归**筛选工具本位**——新增"建议曝光 EV → XMP"
+> （`firstcut:suggestedEV` 信息字段 + `crs:Exposure2` Lightroom 开发字段，
+> 带外才给建议、±2 EV 钳位、1/3 档取整；配置 `exposure_suggest_cap`），
+> 星级/筛选名单本就在 XMP 里，**实际开发仍由 Lightroom 完成**。
+> 本章 §9.1~§9.4d 的调研结论（darktable-cli / 侧车模板 / 16bit TIFF / EV patch）
+> **全部留档备查、不再实施**。设计文档由用户重写，本章仅作历史档案。
+
 > 需求：选片后不想进 LR，希望自动完成"自动曝光/色调 + 镜头校正 + AI 降噪"批量出图。
 > 结论（已调研）：**可行**，采用"Rust 编排 + darktable-cli 引擎"分工。
 

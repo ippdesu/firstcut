@@ -14,7 +14,7 @@ use crate::score::{AnalysisResult, PixelScores};
 /// 缓存分析版本：评分参数（k 值/权重/模型）变化时递增
 ///
 /// 13 = M9：缓存行增加姿态描述子（SCRFD 关键点），旧行全部失效重建
-pub const CACHE_VERSION: i64 = 13;
+pub const CACHE_VERSION: i64 = 14;
 
 /// 照片分析缓存
 pub struct ScoreCache {
@@ -66,6 +66,7 @@ impl ScoreCache {
                 noise REAL NOT NULL,
                 composition REAL NOT NULL,
                 aesthetic REAL NOT NULL,
+                suggested_ev REAL,
                 dhash INTEGER NOT NULL,
                 faces INTEGER NOT NULL,
                 cfg_hash INTEGER NOT NULL DEFAULT 0,
@@ -78,13 +79,15 @@ impl ScoreCache {
             [],
         );
         let _ = conn.execute("ALTER TABLE photo_cache ADD COLUMN pose_desc BLOB", []);
+        let _ = conn.execute("ALTER TABLE photo_cache ADD COLUMN suggested_ev REAL", []);
 
         let rows = {
             let mut stmt = conn.prepare(
-                "SELECT path, size, mtime, version, sharpness, exposure, noise, composition, aesthetic, dhash, faces, cfg_hash, pose_desc FROM photo_cache",
+                "SELECT path, size, mtime, version, sharpness, exposure, noise, composition, aesthetic, suggested_ev, dhash, faces, cfg_hash, pose_desc FROM photo_cache",
             )?;
             let iter = stmt.query_map([], |r| {
-                let pose_desc: Option<Vec<u8>> = r.get(12)?;
+                let pose_desc: Option<Vec<u8>> = r.get(13)?;
+                let suggested_ev: Option<f64> = r.get(9)?;
                 Ok((
                     r.get::<_, String>(0)?,
                     CacheRow {
@@ -99,11 +102,12 @@ impl ScoreCache {
                                 composition: r.get(7)?,
                                 aesthetic: r.get(8)?,
                             },
-                            dhash: r.get::<_, i64>(9)? as u64,
-                            faces: r.get(10)?,
+                            dhash: r.get::<_, i64>(10)? as u64,
+                            faces: r.get(11)?,
+                            suggested_ev,
                             pose_desc: pose_desc.as_deref().and_then(blob_to_desc),
                         },
-                        cfg_hash: r.get(11)?,
+                        cfg_hash: r.get(12)?,
                     },
                 ))
             })?;
@@ -153,8 +157,8 @@ impl ScoreCache {
             let pose_desc = row.result.pose_desc.map(desc_to_blob);
             tx.execute(
                 "INSERT OR REPLACE INTO photo_cache
-                    (path, size, mtime, version, sharpness, exposure, noise, composition, aesthetic, dhash, faces, cfg_hash, pose_desc)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                    (path, size, mtime, version, sharpness, exposure, noise, composition, aesthetic, suggested_ev, dhash, faces, cfg_hash, pose_desc)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                 rusqlite::params![
                     path,
                     row.size,
@@ -165,6 +169,7 @@ impl ScoreCache {
                     s.noise,
                     s.composition,
                     s.aesthetic,
+                    row.result.suggested_ev,
                     row.result.dhash as i64,
                     row.result.faces as i64,
                     row.cfg_hash,

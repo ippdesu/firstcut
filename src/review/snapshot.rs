@@ -43,6 +43,8 @@ pub struct ScoresJson {
     pub composition: f64,
     pub aesthetic: f64,
     pub total: f64,
+    /// 建议曝光修正（EV；None = 容差带内不给建议）——改星重渲染侧车时要原样带回
+    pub suggested_ev: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -124,6 +126,7 @@ pub fn build_snapshot(root: &Path, cfg: &ScoreConfig, cache_path: &Path) -> anyh
                     composition: r.scores.composition,
                     aesthetic: r.scores.aesthetic,
                     total: score::total_score(&r.scores, &cfg.weights),
+                    suggested_ev: r.suggested_ev,
                 }),
                 stars: ratings.get(e.pair_id()).copied(),
                 faces: analyzed_result.map(|r| r.faces).unwrap_or(0),
