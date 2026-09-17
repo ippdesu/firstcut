@@ -275,8 +275,10 @@ pic_process/
 部分侧车实测不可用：只写 1 条 exposure 时 darktable 只补 9 条强制模块（**不补 sigmoid / color
 calibration**），结果 512px mean 128.1（无侧车默认 138.7）并随参数剧烈漂移（EV=2.2 时过曝 65.6%）。
 → 做法：用 `darktable-cli <copy.ARW> <out> --library <tmp>/library.db --core --configdir <tmp>/cfg`
-导入一张该机型 ARW，从临时库 `history` 表抓**默认栈**（本机 ILCE-7M5 = 11 条，含 modversion 与原始 hex），
-之后只做三件事：**原地替换** exposure 的 EV、**原地替换** temperature 的系数、**追加** lens 与 denoiseprofile。
+导入一张该机型 ARW，从临时库 `history` 表抓**默认栈**（本机 ILCE-7M5 = 11 条、ILCE-6700 = 13 条，
+含 modversion 与原始 hex；6700 的 lens/denoiseprofile 自带，见 §9.4d ⑦ 重抓流程），
+之后只做三件事：**原地** patch exposure 的 EV、**原地替换** temperature 的系数、**patch-or-append**
+lens 与 denoiseprofile（栈里有则原地、无则追加，§9.4d ②）。
 实测完整栈原样回灌与"无侧车导出"逐像素几乎一致（Δmean 0.002/255）→ 模板法可靠。
 
 **④ 四个模块的 `op_params` 结构（小端 hex，均无指针/变长，可安全手写）**
@@ -284,20 +286,22 @@ calibration**），结果 512px mean 128.1（无侧车默认 138.7）并随参�
 | 模块 | modversion / 大小 | 关键字段 |
 |---|---|---|
 | `lens` | v10 / 356B | 偏移 332 `has_been_set=0` → 走 EXIF+lensfun **自动匹配**（camera[]/lens[] 留空）。默认栈里没有，需追加 |
-| `exposure` | v7 / 28B | 偏移 8 = EV。**陷阱**：本机 ARW 机身曝光补偿 −1.3EV，默认 `comp_bias=1` 会补上 → 我们的 ΔEV 要写成 `exposure = 0.7 + Δ` 且**保持 comp_bias=1** |
+| `exposure` | v7 / 28B | 偏移 8 = EV。**陷阱**：本机 ARW 机身曝光补偿 −1.3EV，默认 `comp_bias=1` 会补上 → 我们的 ΔEV 要**原地读模板自带 EV 再加 Δ**（7M5 基线 0.7 / **6700 基线 1.2**，§9.4d ②），且**保持 comp_bias=1**。**不得硬编码 0.7** |
 | `denoiseprofile` | v12 / 416B | `a[0]` 必须 **−1.0f** = 按相机+ISO 自动取 profile（**写 0 实测导出几乎全黑**）；偏移 8 = `strength`；mode=4 为 wavelets-auto |
 | `temperature` | v4 / 20B | **没有 Kelvin/tint**，只有红绿蓝系数；`preset=2` 才用给定系数（`preset=0` as-shot 会被 EXIF 覆盖）；**必须原地替换**默认栈那条（追加会变两个实例叠加） |
 
-**⑤ 版本/相机强绑定 → 必须做防御性校验**
+**⑤ 版本强绑定（相机绑定已实测弱化）→ 必须做防御性校验**
 
-模板与 **darktable 版本 + 相机型号**强绑定（`rawprepare`/`colorin` 等 params 与相机相关，
-modversion 随版本变）。Rust 侧要用 `darktable-cli --version` 做模板键，
-并且**导出后必须校验非全黑**——版本或 params 长度写错时 darktable **不报错**，
-直接给黑图或未初始化内存（`modversion` 偏新 → params 是未初始化内存）。
+模板与 **darktable 版本**强绑定（modversion/params 长度随版本变），但 2026-09-18 实测
+7M5 与 6700 默认栈共有模块**逐字节相同**，机型相关值只有 exposure 的 EV 基线（§9.4d ②）
+→ 按机身+版本存模板保留（防升级），不必再为颜色矩阵担心跨机型。Rust 侧用
+`darktable-cli --version` 做模板键，并且**导出后必须校验非全黑**——版本或 params 长度写错时
+darktable **不报错**，直接给黑图或未初始化内存（`modversion` 偏新 → params 是未初始化内存）。
 
 **⑥ 仍待确认**：`firstcut:*` 在 GUI「改图→保存侧车」后是否 100% 保留（源码上会保留）；
 自定义 `iop_order_version`；Kelvin/tint → 相机 RGB 系数的精确换算（`wb_presets.json` 无 ILCE-7M5）；
-降噪强度分级最优值需目视；16bit TIFF 导出参数。
+降噪强度分级最优值需目视。~~16bit TIFF 导出参数~~ → 已解决（§9.4d ③：
+`--core --conf plugins/imageio/format/tiff/bpp=16`）；另新增 LR 对 darktable 16bit TIFF 的兼容性待测（§9.4d ④）。
 
 ### 9.4c P2-M2 编排器方案（已实测定案，2026-09-09）
 
@@ -356,21 +360,94 @@ spawn ：darktable-cli <输入正斜杠绝对路径> <输出目录正斜杠>/ --
 | 2048px JPG | ~3.7s | ~0.36GB | 736KB |
 
 内存是阶梯式：~70MB 解码 → ~360MB → **865MB 平台**。TIFF 已验证：4688×7032、16bit、3 通道、
-Compression=8 (Adobe Deflate)、内嵌 ICC 9012B。
+Compression=8 (Adobe Deflate)、内嵌 ICC 9012B。**产物体积随机身/内容差异大**：6700 全幅样片实测
+117–127MB（§9.4d ③）→ 磁盘预算按 **130MB/张**（8000 张 ≈ 1TB），45.5MB 只是下限参考。
 
 **⑥ 安全结论（重要）**：CLI **不写也不改 XMP 侧车**（前后 MD5 一致），源图无侧车也不新建
 → **`F:\PS_Process` 原库可以安全只读使用**。
 
-**⑦ 建议命令模板**
+**⑦ 建议命令模板（2026-09-18 更新，含 16bit 强制，见 §9.4d ③）**
 
 ```
-darktable-cli.exe <正斜杠输入绝对路径> <已创建的正斜杠输出目录>/ --out-ext tif --apply-custom-presets 0
-# 勿用 --style / --library / --bpp / --verbose
+darktable-cli.exe <正斜杠输入绝对路径> <已创建的正斜杠输出目录>/ --out-ext tif --apply-custom-presets 0 ^
+  --core --conf plugins/imageio/format/tiff/bpp=16
+# 勿用 --style / --library / --bpp / --verbose（--bpp 被 help 标 unsupported；
+# 位深只能经 --core --conf 覆盖，profile 默认 bpp=8 会静默出 8bit 图）
+# JPG 输出同理可带该参数（对 jpg 无效但无害），用于 P2-M2 验收交叉核对（§9.4d ⑤）
 ```
 
 **⑧ 待确认**：`--apply-custom-presets 0` 在"用户已配置自定义预设"时是否影响成像
 （本机无自定义预设，无法实测差异；P2 用预生成 XMP 正好规避该依赖）；OpenCL 是否真启用
 （`cltest` 跑 10 分钟未返回，本轮 CPU 时间占比像纯 CPU）。
+
+### 9.4d 动作 A 真图冒烟实录（2026-09-18，样片来自 ILCE-6700 机身，修订 §9.4b/§9.4c）
+
+> 执行人：DSH（qwen/qwen3.8 与用户结对）。样片从 `F:\PS_Process` **只读**挑出并拷入
+> `p2_notes/_smoke/input/`（全库 15,979 文件重扫 `_main_scan.csv` 复核镜头普查，与 §9.4 完全一致）。
+> 样片：**DSC02906**（20240324_机场，E 70-350 G，lensfun 命中路径）+ **DSC08051**
+> （20241006_家里随拍，Sigma 50/1.4 Art，lensfun 无条目兜底路径）。
+> **机身普查**：ILCE-6700 = 8360 ARW（97%）、ILCE-7M5 = 239、ILCE-7RM5 = 4 → 模板必须按机身备，6700 是主力。
+
+**① EV 补丁生效（隔离实验，同图同模板只变 delta）**
+
+| delta-ev | 写入 EV（6700 基线 1.2） | JPG mean/255 |
+|---|---|---|
+| 0 | 1.2 | 131.0 |
+| +0.5 | 1.7 | 154.6 |
+| +3.0 | 4.2 | 233.1（近裁剪，符合 3 档预期）|
+
+同 EV 下 16bit TIFF 与 JPG 像素对拍 5 点差 ≤2/255 → 侧车被读、EV 浮点补丁落地、管线非全黑。
+
+**② 模板发现（修订 §9.4b ③/④/⑤）**：7M5 与 6700 的默认栈**共有 11 个模块逐字节相同**
+（rawprepare/demosaic/colorin/colorout/temperature/gamma/highlights/channelmixerrgb/flip/sigmoid +
+exposure 的 black/percentile/comp 字段）。唯一机型相关值：**exposure 默认 EV 基线 7M5=0.7、6700=1.2**。
+且 6700 默认栈**自带** lens(v10, 356B) + denoiseprofile(v12, 416B)（共 13 条），7M5 不带（11 条）——
+6700 自带的两个 blob 与我们设计的 auto blob（`has_been_set=0` / `a[0]=-1.0f`）**逐字节一致**。
+→ 生成器逻辑定案为 **patch-or-append**（栈里有则原地补丁，无则追加，`history_end`=最终条数）；
+→ EV 补丁定案为"**原地读模板 EV 加 delta**"，**不得硬编码 0.7**（那是 7M5 的值）。
+→ 按机身+版本存模板的做法保留（防 darktable 升级），但实测机型相关面远小于预期。
+
+**③ 16bit TIFF 解锁（修订 §9.4b ⑥ 与 §9.4c ⑤/⑦）**：profile 默认
+`plugins/imageio/format/tiff/bpp=8`（此前导出全 8bit 的根因）；`--bpp` 被 help 标 unsupported。
+强制 16bit 的正式姿势（P2-M2 命令模板必须带）：
+
+```
+--core --conf plugins/imageio/format/tiff/bpp=16
+```
+
+实测 6700 全分辨率（6520×4176 = 27MP 全幅，**非降采样**，`--width/--height` 默认 0）16bit TIFF
+= **117–127MB/张**（§9.4c ⑤ 的 45.5MB 是另一机身的样片，压缩比随画面内容变化很大）
+→ **磁盘预算按 130MB/张**，8000 张 ≈ 1TB。
+
+**④ TIFF 压缩怪癖（进坑清单，待用户周末 LR 实测）**：darktable 5.6.1 写的 TIFF `Compression`
+tag = 8（TIFF 规范名义 = LZW），但 strip 流实际是 **zlib**（`78 9c` 魔数，4176 条 strip 逐条
+精确解压尺寸吻合）。GDI+/.NET 读取正常且像素正确；**严格 LZW 阅读器（Lightroom 是否算）未知**
+→ 验收项：周末 LR 导入 `p2_notes/_smoke/deliv/` 的 16bit TIFF。若打不开，杠杆是 profile 的
+`plugins/imageio/format/tiff/compress`（当前 =2，可试 0=不压缩/其他档）。
+
+**⑤ P2-M2 验收策略（修订 §9.4c ②）**：本轮自写 Python TIFF 解码器在 strip→行映射上有 bug
+（8bit 文件解出二值数据、16bit 文件中心像素与 GDI+ 不符，原因未定位，**不要再信任自解 TIFF
+像素**）。定案：每张图**另导一份同 EV 的 JPG**（darktable 自己当解码器），用 JPG 做
+mean/峰值/过曝率交叉核对；TIFF 本体只验"存在 + 大小 + BPS tag=16"。
+
+**⑥ 暗角实测**：70-350（lensfun 路径）JPG 3×3 网格 corner/center=**0.947**、
+edge/center=**0.968**（未校正约 0.7）→ 镜头校正生效；Sigma 50（兜底路径）导出干净无畸变，
+该场景光照不均（人物阴影）径向指标不适用，符合 §9.4 预期。
+
+**⑦ 默认栈重抓流程（新机身/darktable 升级时用）**：新目录放空 `library.db`（0 字节）→
+`darktable-cli <图> <out>/ --out-ext jpg --apply-custom-presets 0 --library <dir>/library.db`
+→ 读该 db 的
+`select num,module,operation,op_params,enabled,blendop_params,blendop_version,multi_priority,multi_name,multi_name_hand_edited from history where imgid=1 order by num`
+（6700 抓得 13 条，数据全在 library.db 本体，无独立 data.db）。
+
+**⑧ 产物与资产**（`p2_notes/_smoke/`，随 p2_notes 不入库）：`deliv/` 4 件待用户肉眼验收
+（DSC02906/DSC08051 各 16bit TIFF + 同 EV JPG，EV=1.7、降噪开）；`make_sidecar2.py`（v2
+机身感知生成器，**P2-M1 Rust 移植蓝本**：模板 JSON + 版本键 + patch-or-append + 双命名）、
+`stack6700.json`、`tiff_probe.py`/`probe16.py`/`cross_cmp.py`/`check_sidecar.py`（验收工具）、
+`lib6700/`（抓栈用临时库）。`reference/xmp_template_ILCE-6700_dt5.6.1.json` 已就位。
+
+**⑨ 仍未决**（沿用 §9.4b ⑥/⑧ + 本轮新增）：`firstcut:*` GUI 保存后保留性；OpenCL；
+Kelvin→RGB 换算；降噪强度分级目视；**LR 对本轮 16bit TIFF 的兼容性**。
 
 ### 9.5 里程碑追加（Phase 2 在 Phase 1 M5 之后）
 
@@ -383,18 +460,19 @@ darktable-cli.exe <正斜杠输入绝对路径> <已创建的正斜杠输出目�
 
 > 勾选项 = 还没做。请直接在上面增删，或告诉我哪几条要拆细。
 
-**P2-M0 环境与可行性（先做，决定后面能不能走）**
-- [ ] 装 darktable 5.x（Windows 官方构建），确认版本 ≥ 5.0（neural restore 需要）
-- [ ] `darktable-cli` 命令行跑通一张 ARW → TIFF/JPG
-- [ ] `darktable-cltest` 确认 OpenCL/GPU 状态；neural restore 的 ONNX 后端是否可用
-- [ ] 确认 neural restore 是否有 RAW 域降噪（Bayer 域 RawNIND 是否已合入正式版）
-- [ ] lensfun 对 4 支镜头（24-70 GM II / Sigma 50 DG DN / 70-350G / 200-600G）的覆盖实测
+**P2-M0 环境与可行性（先做，决定后面能不能走）——2026-09-09 全部完成（执行记录 `P2_M0.md` §0）**
+- [x] 装 darktable 5.x（Windows 官方构建），确认版本 ≥ 5.0（实装 5.6.1）
+- [x] `darktable-cli` 命令行跑通一张 ARW → TIFF/JPG（用法纠错见 `P2_M0.md` §0）
+- [x] `darktable-cltest` 确认 OpenCL/GPU 状态（10 分钟未返回 → 按纯 CPU 对待；neural restore CLI 批量不可用）
+- [x] 确认 neural restore 是否有 RAW 域降噪（实测不可用：GUI 面板非 iop，CLI 不执行 → 降噪改 rawdenoise + denoise profiled）
+- [x] lensfun 对 4 支镜头（24-70 GM II / Sigma 50 DG DN / 70-350G / 200-600G）的覆盖实测（已按实测重写 §9.4，并扩展为 8 支镜头全库普查）
 
-**P2-M1 侧车模板与字段映射**
-- [ ] 确定写哪些模块：lens correction(auto) / exposure(补偿) / neural restore(强度) / 白平衡
-- [ ] 手工造一份侧车，验证 darktable 确实读取并生效（**关键：确认字段名和写法**）
-- [ ] Phase 1 的 EV 偏移 → darktable exposure 模块参数换算（注意 darktable 用 EV，含黑电平补偿）
-- [ ] 降噪强度分级策略（按 ISO？按 Phase 1 噪点分？）
+**P2-M1 侧车模板与字段映射——方案已实测定案（2026-09-18 冒烟，见 §9.4d），Rust 未开工**
+- [x] 确定写哪些模块：lens(auto) / exposure / denoiseprofile；白平衡暂缓（preset=2 路径已调研，Kelvin 换算未决）
+- [x] 手工造一份侧车，验证 darktable 确实读取并生效（EV 阶梯隔离实验 + 同 EV TIFF/JPG 像素对拍，§9.4d ①）
+- [x] Phase 1 的 EV 偏移 → darktable exposure 模块参数换算（**原地读模板 EV 加 delta**，7M5=0.7/6700=1.2，§9.4d ②）
+- [ ] 降噪强度分级策略（按 ISO？按 Phase 1 噪点分？）——需目视
+- [ ] `src/sidecar.rs` Rust 移植（蓝本 `p2_notes/_smoke/make_sidecar2.py`）+ 四模块 blob 字节级单测 + 模板版本键校验
 
 **P2-M2 Rust 编排器**
 - [ ] 新子命令 `develop <目录>`：读 Phase 1 CSV → 写 XMP → 调 `darktable-cli` → 输出 `developed/`
@@ -413,7 +491,7 @@ darktable-cli.exe <正斜杠输入绝对路径> <已创建的正斜杠输出目�
 - [ ] 磁盘占用（16bit TIFF 体积）；上万张的排队/中断恢复
 
 **需要你拍板的开放项**
-- [ ] 输出只要 JPG，还是 TIFF 归档 + JPG 都要？
+- [x] 输出只要 JPG，还是 TIFF 归档 + JPG 都要？→ **16bit TIFF 归档 + JPG**（Phase 2 原始需求；TIFF 兼容性待 LR 周末实测，§9.4d ④）
 - [ ] 要不要保留 darktable 的 `.xmp` 调色参数（方便以后手改）？注意这会让目录多一批文件
 - [ ] 白平衡：完全自动 / 按场景预设 / 保留机内？
 - [ ] 降噪强度按 ISO 分级，还是按 Phase 1 的噪点分分级？
