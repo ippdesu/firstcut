@@ -43,11 +43,15 @@ pub struct PhotoEntry {
     pub suggested_ev: String,
     /// 星级（1-5；relative 模式为批次内相对排名，absolute 模式为总分阈值）
     pub stars: String,
+    /// algorithm 或 manual；空串表示尚未评分。
+    pub rating_source: String,
     /// 检测到的人脸数
     pub faces: String,
     /// 评分数据是否可用（score 子命令填充：JPG 解码成功/成功映射到配对结果；
     /// 解码失败、无配对 ARW 等为 false；scan 子命令为空）
     pub analysis_ok: String,
+    /// ai 或 pixel；未评分为空。
+    pub analysis_mode: String,
     // ---- 连拍去重字段（score 子命令填充）----
     /// 连拍组号（0 = 非连拍）
     pub burst_group: String,

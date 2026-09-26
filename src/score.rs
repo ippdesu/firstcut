@@ -62,6 +62,10 @@ impl AiEngine {
     pub fn none() -> Self {
         AiEngine { iqa: None, face: None, pose: None }
     }
+
+    pub fn is_enabled(&self) -> bool {
+        self.iqa.is_some() && self.face.is_some() && self.pose.is_some()
+    }
 }
 
 /// 单张照片的五维分数（0-100）
@@ -180,7 +184,7 @@ pub fn analyze_jpgs(
     let hits = AtomicUsize::new(0);
     let total = entries.iter().filter(|e| !e.is_raw).count().max(1);
     // 配置指纹参与缓存键：改了 --config 必须重算，否则会静默返回旧分数
-    let cfg_hash = crate::config::config_fingerprint(cfg);
+    let cfg_hash = crate::config::analysis_fingerprint(cfg, ai.is_enabled());
 
     let (results, new_rows): (HashMap<String, AnalysisResult>, Vec<(String, u64, i64, AnalysisResult)>) = entries
         .par_iter()
@@ -201,7 +205,14 @@ pub fn analyze_jpgs(
                     }
                 }
             }
-            let result = analyze_one(e, &cfg.metric, ai).ok().flatten()?;
+            let result = match analyze_one(e, &cfg.metric, ai) {
+                Ok(Some(result)) => result,
+                Ok(None) => return None,
+                Err(err) => {
+                    eprintln!("[score] 分析失败 {}: {err:#}", e.path);
+                    return None;
+                }
+            };
             let row = crate::cache::file_fingerprint(Path::new(&e.path))
                 .map(|(size, mtime)| (e.path.clone(), size, mtime, result));
             Some((e.pair_id().to_string(), result, row))
@@ -272,7 +283,7 @@ pub fn analyze_one(
     let mut subject_face: Option<crate::ai::facedetect::FaceBox> = None;
 
     if let Some(m) = &ai.iqa {
-        aesthetic = m.acquire().score(&img.rgb, img.width, img.height).unwrap_or(60.0);
+        aesthetic = m.acquire().score(&img.rgb, img.width, img.height)?;
     }
     if let Some(y) = &ai.face {
         match y.acquire().detect(&img.rgb, img.width, img.height) {
@@ -311,11 +322,7 @@ pub fn analyze_one(
                     subject_face = Some(*biggest);
                 }
             }
-            Err(err) => {
-                use std::sync::Once;
-                static LOGGED: Once = Once::new();
-                LOGGED.call_once(|| eprintln!("[score] SCRFD 检测失败（后续静默）: {err:#}"));
-            }
+            Err(err) => return Err(err),
         }
     }
 
@@ -338,11 +345,7 @@ pub fn analyze_one(
                         }
                     }
                 }
-                Err(err) => {
-                    use std::sync::Once;
-                    static LOGGED: Once = Once::new();
-                    LOGGED.call_once(|| eprintln!("[score] 姿态检测失败（后续静默）: {err:#}"));
-                }
+                Err(err) => return Err(err),
             }
         }
     }
@@ -436,6 +439,9 @@ pub fn run_score_job(
     if opts.gpu && !cfg!(feature = "gpu") {
         anyhow::bail!("GPU 推理需要启用 DirectML 构建：cargo build --release --features gpu");
     }
+    if opts.keep_override == Some(0) {
+        anyhow::bail!("连拍保留数 -k 必须至少为 1");
+    }
 
     on_event(ScoreEvent::Info(format!(
         "发现文件中…（目录 {}）",
@@ -464,7 +470,7 @@ pub fn run_score_job(
     let mut cache = if opts.no_cache {
         None
     } else {
-        match crate::cache::ScoreCache::open(&opts.cache_path, crate::config::config_fingerprint(cfg))
+        match crate::cache::ScoreCache::open(&opts.cache_path, crate::config::analysis_fingerprint(cfg, engine.is_enabled()))
         {
             Ok(c) => Some(c),
             Err(err) => {
@@ -495,11 +501,9 @@ pub fn run_score_job(
     }
 
     // 连拍去重（score/review 同一函数 + 同一参数合成）
-    let dedup_params = crate::config::effective_dedup(opts.keep_override, cfg);
     let analyzed_count = outcome.results.len();
-    let burst_map =
-        analyze_photo_bursts(&entries, &outcome.results, &dedup_params, &cfg.weights);
-    let burst_members = burst_map.values().filter(|i| i.group != 0).count();
+    let selection = crate::selection::build(dir, &entries, &outcome.results, cfg, opts.keep_override)?;
+    let burst_members = selection.bursts.values().filter(|i| i.group != 0).count();
     on_event(ScoreEvent::Info(format!(
         "连拍去重: {analyzed_count} 张 JPG 中 {burst_members} 张属于连拍组"
     )));
@@ -510,8 +514,9 @@ pub fn run_score_job(
         let key = e.pair_id().to_string();
         if let Some(r) = by_key.get(&key) {
             apply_scores(e, &r.scores, r.suggested_ev, r.faces, cfg);
+            e.analysis_mode = if engine.is_enabled() { "ai" } else { "pixel" }.into();
         }
-        if let Some(info) = burst_map.get(&key) {
+        if let Some(info) = selection.bursts.get(&key) {
             apply_burst(e, info);
         }
     }
@@ -538,14 +543,11 @@ pub fn run_score_job(
     }
 
     // 星级
-    let rated: Vec<(String, f64)> = by_key
-        .iter()
-        .map(|(k, r)| (k.clone(), total_score(&r.scores, &cfg.weights)))
-        .collect();
-    let ratings = crate::output::xmp::assign_ratings(&rated, &cfg.metric);
+    let ratings = &selection.ratings;
     for e in entries.iter_mut() {
         if let Some(st) = ratings.get(e.pair_id()) {
-            e.stars = st.to_string();
+            e.stars = st.stars.to_string();
+            e.rating_source = st.source.as_str().into();
         }
     }
 
@@ -566,7 +568,7 @@ pub fn run_score_job(
                 continue;
             }
             let total = total_score(&r.scores, &cfg.weights);
-            let rating = *ratings.get(key).unwrap_or(&3);
+            let rating = ratings.get(key).map(|r| r.stars).unwrap_or(3);
             match crate::output::xmp::write_sidecar(e, &r.scores, total, rating, r.suggested_ev) {
                 Ok(true) => written += 1,
                 Ok(false) => skipped += 1,

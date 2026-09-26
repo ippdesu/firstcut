@@ -146,7 +146,7 @@ fn group_by_time(times: &[Option<i64>], gap_secs: f64) -> Vec<usize> {
         match times[i] {
             Some(t) => {
                 if let Some(p) = prev {
-                    if (t - p) as f64 <= gap_secs {
+                    if t >= p && (t - p) as f64 <= gap_secs {
                         groups[i] = gid;
                     } else {
                         gid += 1;
@@ -193,11 +193,17 @@ pub fn analyze_bursts(
     assert_eq!(entries.len(), scores.len(), "scores 与 entries 长度不一致");
     assert_eq!(entries.len(), descs.len(), "descs 与 entries 长度不一致");
     let n = entries.len();
-    let times: Vec<Option<i64>> = entries
-        .iter()
-        .map(|e| parse_datetime(&e.date_time_original))
-        .collect();
-    let groups = group_by_time(&times, params.gap_secs);
+    // 扫描结果按路径排序；分组必须按拍摄时间排序，再映射回原输入顺序。
+    let times: Vec<Option<i64>> = entries.iter()
+        .map(|e| parse_datetime(&e.date_time_original)).collect();
+    let mut chronological: Vec<usize> = (0..n).collect();
+    chronological.sort_by_key(|&i| (times[i].is_none(), times[i].unwrap_or(0), i));
+    let ordered_times: Vec<_> = chronological.iter().map(|&i| times[i]).collect();
+    let ordered_groups = group_by_time(&ordered_times, params.gap_secs);
+    let mut groups = vec![0; n];
+    for (&original, &group) in chronological.iter().zip(&ordered_groups) {
+        groups[original] = group;
+    }
 
     let mut infos = vec![
         BurstInfo { group: 0, size: 0, rank: 0, keep: false, pose_cluster: 0 };
@@ -348,8 +354,10 @@ mod tests {
             total_score: String::new(),
             suggested_ev: String::new(),
             stars: String::new(),
+            rating_source: String::new(),
             faces: String::new(),
             analysis_ok: String::new(),
+            analysis_mode: String::new(),
             burst_group: String::new(),
             burst_size: String::new(),
             burst_rank: String::new(),
@@ -366,6 +374,21 @@ mod tests {
         assert!(a.is_some());
         // 2026-07-19 13:56:32 对应 epoch 1784469392（与本机交叉验证，UTC+8 时区不受影响）
         assert_eq!(a.unwrap(), 1784469392i64);
+    }
+
+    #[test]
+    fn chronological_grouping_is_independent_of_path_order() {
+        let entries = vec![
+            entry("z.jpg", "2026:09:27 12:00:01"),
+            entry("a.jpg", "2026:09:27 12:00:00"),
+            entry("other.jpg", "2025:01:01 12:00:00"),
+        ];
+        let params = DedupParams { keep_k: 1, ..Default::default() };
+        let infos = analyze_bursts(&entries, &[0; 3], &[80.0, 70.0, 90.0],
+            &[None; 3], &params);
+        assert_ne!(infos[0].group, 0);
+        assert_eq!(infos[0].group, infos[1].group);
+        assert_eq!(infos[2].group, 0);
     }
 
     #[test]

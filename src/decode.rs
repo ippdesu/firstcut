@@ -128,6 +128,10 @@ fn decode_jpeg_to_rgb(bytes: &[u8]) -> Option<image::RgbImage> {
     if w == 0 || h == 0 {
         return None;
     }
+    // jpeg-decoder 返回灰度或 CMYK 时不能按 RGB 三通道索引。
+    if info.pixel_format != jpeg_decoder::PixelFormat::RGB24 {
+        return None; // 交给 image crate 的通用解码路径
+    }
     if w.max(h) <= ANALYSIS_MAX_DIM {
         return image::RgbImage::from_raw(w, h, pixels);
     }
@@ -239,5 +243,15 @@ mod tests {
         assert_eq!(values(&apply_orientation(grid(), 6)), vec![3, 1, 4, 2], "6 = 顺时针 90°");
         assert_eq!(values(&apply_orientation(grid(), 7)), vec![4, 2, 3, 1], "7 = 反对角线");
         assert_eq!(values(&apply_orientation(grid(), 8)), vec![2, 4, 1, 3], "8 = 逆时针 90°");
+    }
+
+    #[test]
+    fn large_grayscale_jpeg_uses_safe_decoder() {
+        let path = std::env::temp_dir().join(format!("firstcut_gray_{}.jpg", std::process::id()));
+        image::GrayImage::from_pixel(2048, 1400, image::Luma([128])).save(&path).unwrap();
+        let result = load_analysis_image(&path).unwrap().unwrap();
+        assert!(result.width <= ANALYSIS_MAX_DIM);
+        assert_eq!(result.rgb.len(), (result.width * result.height * 3) as usize);
+        let _ = std::fs::remove_file(path);
     }
 }

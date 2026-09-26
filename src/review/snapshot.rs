@@ -10,7 +10,6 @@ use serde::Serialize;
 
 use crate::cache::{self, ScoreCache};
 use crate::config::ScoreConfig;
-use crate::output;
 use crate::scan;
 use crate::score::{self, AnalysisResult};
 
@@ -23,6 +22,8 @@ pub struct PhotoJson {
     pub ext: String,
     pub is_raw: bool,
     pub has_pair: bool,
+    #[serde(skip)]
+    pub pair_id: String,
     pub datetime: String,
     pub iso: String,
     pub f_number: String,
@@ -31,6 +32,8 @@ pub struct PhotoJson {
     /// 五维分 + 总分；缓存未命中（未评分）为 None
     pub scores: Option<ScoresJson>,
     pub stars: Option<u8>,
+    pub rating_source: Option<String>,
+    pub analysis_mode: Option<String>,
     pub faces: usize,
     pub burst: Option<BurstJson>,
 }
@@ -69,11 +72,14 @@ pub struct Snapshot {
 /// 缓存打不开（文件损坏/不存在）时降级为"全部未评分"，不阻塞浏览。
 pub fn build_snapshot(root: &Path, cfg: &ScoreConfig, cache_path: &Path) -> anyhow::Result<Snapshot> {
     let entries = scan::scan_directory(root)?;
-    let cfg_hash = crate::config::config_fingerprint(cfg);
+    let pixel_hash = crate::config::analysis_fingerprint(cfg, false);
+    let ai_hash = crate::config::analysis_fingerprint(cfg, true);
+    let models_available = crate::ai::ensure_models().is_ok();
 
     // 打开缓存并按「size+mtime+version+cfg_hash」过滤出本次可用的分析结果
     let mut analyzed: HashMap<String, AnalysisResult> = HashMap::new();
-    let cache = match ScoreCache::open(cache_path, cfg_hash) {
+    let mut mode_by_pair: HashMap<String, bool> = HashMap::new();
+    let cache = match ScoreCache::open(cache_path, pixel_hash) {
         Ok(c) => Some(c),
         Err(err) => {
             eprintln!("[review] 警告: 缓存不可用（{err:#}），全部照片将显示为未评分");
@@ -86,22 +92,16 @@ pub fn build_snapshot(root: &Path, cfg: &ScoreConfig, cache_path: &Path) -> anyh
                 continue;
             };
             let Some(row) = c.rows().get(&e.path) else { continue };
-            if row.matches(size, mtime, cache::CACHE_VERSION, cfg_hash) {
+            if row.matches(size, mtime, cache::CACHE_VERSION, pixel_hash)
+                || (models_available
+                    && row.matches(size, mtime, cache::CACHE_VERSION, ai_hash)) {
                 analyzed.insert(e.pair_id().to_string(), row.result);
+                mode_by_pair.insert(e.pair_id().to_string(), row.cfg_hash == ai_hash);
             }
         }
     }
 
-    // 星级：与 score 相同——对「有分析的 JPG 配对键集合」按当前配置分档
-    let rated: Vec<(String, f64)> = analyzed
-        .iter()
-        .map(|(k, r)| (k.clone(), score::total_score(&r.scores, &cfg.weights)))
-        .collect();
-    let ratings = output::xmp::assign_ratings(&rated, &cfg.metric);
-
-    // 连拍：与 score 同一函数 + 同一参数合成（V2-2，保证两处逐张一致）
-    let dedup_params = crate::config::effective_dedup(None, cfg);
-    let burst_map = score::analyze_photo_bursts(&entries, &analyzed, &dedup_params, &cfg.weights);
+    let selection = crate::selection::build(root, &entries, &analyzed, cfg, None)?;
 
     let mut photos: Vec<PhotoJson> = entries
         .iter()
@@ -114,6 +114,7 @@ pub fn build_snapshot(root: &Path, cfg: &ScoreConfig, cache_path: &Path) -> anyh
                 ext: e.extension.clone(),
                 is_raw: e.is_raw,
                 has_pair: e.has_pair,
+                pair_id: e.pair_id.clone(),
                 datetime: e.date_time_original.clone(),
                 iso: e.iso.clone(),
                 f_number: e.f_number.clone(),
@@ -128,9 +129,13 @@ pub fn build_snapshot(root: &Path, cfg: &ScoreConfig, cache_path: &Path) -> anyh
                     total: score::total_score(&r.scores, &cfg.weights),
                     suggested_ev: r.suggested_ev,
                 }),
-                stars: ratings.get(e.pair_id()).copied(),
+                stars: selection.ratings.get(e.pair_id()).map(|r| r.stars),
+                rating_source: selection.ratings.get(e.pair_id()).map(|r| r.source.as_str().to_string()),
+                analysis_mode: analyzed_result.map(|_| if mode_by_pair.get(e.pair_id()) == Some(&true) {
+                    "ai".to_string()
+                } else { "pixel".to_string() }),
                 faces: analyzed_result.map(|r| r.faces).unwrap_or(0),
-                burst: burst_map.get(e.pair_id()).map(|i| BurstJson {
+                burst: selection.bursts.get(e.pair_id()).map(|i| BurstJson {
                     group: i.group,
                     size: i.size,
                     rank: i.rank,
@@ -147,6 +152,7 @@ pub fn build_snapshot(root: &Path, cfg: &ScoreConfig, cache_path: &Path) -> anyh
         photos,
     })
 }
+
 
 /// 绝对/相对路径 → 相对 root 的正斜杠路径（越界时退回完整路径展示）
 fn rel_path(root: &Path, p: &Path) -> String {

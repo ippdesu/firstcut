@@ -7,7 +7,7 @@
 > 当前状态：**v1.1 已发布**，并已合入 M6 缺陷修复 + M7 交付兼容 + M8 评审修复 +
 > M9 自适应连拍保留（每个姿势簇各自保留）+ M-UI1 复核界面 + M-UI2 操作台
 > （`review` 子命令内跑批/改星/配置编辑）。
-> Phase 2 批量 RAW 开发规划中，详见 `DESIGN.md` §9。
+> 当前方向：本地初筛、人工复核、Lightroom 元数据交接。darktable 批量 RAW 开发路线已停止；历史调研保存在 `DESIGN.md` §9。
 
 ## 构建
 
@@ -42,7 +42,7 @@ cargo build --release --features gpu
 | `scrfd_10g_bnkps.onnx` | [RuteNL/SCRFD-face-detection-ONNX](https://huggingface.co/RuteNL/SCRFD-face-detection-ONNX)（InsightFace SCRFD 10g，小脸检测强） | 16.9MB |
 | `yolov8n_pose.onnx` | [Xenova/yolov8n-pose](https://huggingface.co/Xenova/yolov8n-pose)（人体姿态，人脸漏检时定位头部） | 13.5MB |
 
-模型缺失时 `score` 自动降级为纯像素评分并提示；`--no-ai` 可显式跳过。
+模型缺失时 `score` 自动降级为纯像素评分并提示；`--no-ai` 可显式跳过。CSV 的 `analysis_mode` 标明本次是 `ai` 还是 `pixel`；两种结果使用不同缓存指纹，模型文件变化也会使 AI 缓存失效。
 下载后放到 `models/` 即可，无需 `download-models` 子命令。
 
 ## 用法
@@ -105,8 +105,7 @@ pic_process score <目录> --config stage.toml
 
 > 配置是 **fail-fast** 的：`--config` 指向的文件不存在/解析失败会直接报错退出
 > （不再静默回退默认值），未知字段名也会被拒绝——防止手滑的字段名静默失效。
-> 但注意：改**权重**或**星级阈值**不会触发重算（它们不影响缓存里的五维子分），
-> 改曲线参数（`sharpness_k`/`noise_k0`/`exposure_*`）才会。
+> 但注意：改**权重**或**星级阈值**不会触发重新分析（它们不影响缓存里的五维子分），只会重新合成总分和星级；改曲线参数（`sharpness_k`/`noise_k0`/`exposure_*`）会重新分析。`NaN`、无穷值和越界参数会被拒绝。
 
 ## 输出说明
 
@@ -121,14 +120,16 @@ pic_process score <目录> --config stage.toml
 | `sharpness_score, exposure_score, noise_score, composition_score, aesthetic_score` | 五维子分（0-100） |
 | `total_score` | 加权总分（0-100，跨批次可比） |
 | `stars` | 星级 1-5（默认按**本批次相对排名**，见下） |
+| `rating_source` | `algorithm` 为算法建议；`manual` 为人工星级。人工决定优先，重跑不会覆盖 |
+| `analysis_mode` | `ai` 为完整模型分析；`pixel` 为纯像素分析或模型不可用时的降级结果 |
 | `faces` | SCRFD 检测到的人脸数 |
 | `analysis_ok` | 评分数据是否可用（解码失败/无配对 ARW 为 false，运行结束 stderr 也有失败清单） |
 | `burst_group, burst_size, burst_rank, burst_keep, burst_pose` | 连拍去重：组号、**保留单元内**张数、保留单元内排名、是否建议保留、M9 姿态簇号（`burst_keep` 只是建议标记，**工具永不删除/移动文件**） |
 
 **XMP 侧车**（`--xmp`）：写 `<stem>.xmp`（如 `DSC00001.xmp`），含
 `xmp:Rating`（1-5 星）+ `firstcut:` 命名空间（五维子分/人脸/连拍信息）。
-同一 stem 的 JPG/ARW 共用一个侧车（分数本来就映射自 JPG）。
-**已有其他软件写的侧车不会被覆盖**（只提示跳过）。
+同目录的 JPG/ARW 共用一个侧车；分放不同目录时各写一份同名侧车，使用相同的最终星级。
+**已有其他软件写的侧车不会被覆盖**（只提示跳过）。firstcut 创建的侧车若后来加入其他字段，重跑仅合并 firstcut 管理的分数、星级和曝光建议字段，保留其余 XML 内容；文件无法解析时保留原文件并报告写入失败。
 
 > 命名兼容性：`<stem>.xmp` 是 **Lightroom / Camera Raw** 的约定，**darktable 也读**
 > 这种格式（它自己的 `<stem>.<扩展名>.xmp` 也认）。所以一份侧车两边都能用。
@@ -177,8 +178,9 @@ pic_process score <目录> --config stage.toml
 
 > 注意：星级依赖"批次"——建议**整场照片一次跑完**。分批跑不同子目录会各自归一化，
 > 星级之间不可比。
+> 人工改星保存在照片根目录的 `.firstcut/decisions.sqlite`，优先于算法星级，并同步给配对的 JPG/ARW。此文件是用户决定，**备份照片目录时请保留**；评分缓存 `pic_process_cache.sqlite` 可删除后重建。旧版仅写入 XMP 的人工星级不会自动导入决定库，需要在复核界面重新确认。
 
-**连拍去重（M9 自适应保留，默认开启）**：拍摄时间间隔 ≤2s 成组 → 组内按 dHash
+**连拍去重（M9 自适应保留，默认开启）**：先按 EXIF 拍摄时间排序，再以间隔 ≤2s 成组 → 组内按 dHash
 汉明距离 ≤10 分**子簇**（近乎同一张）→ 子簇内再按 **SCRFD 关键点姿态描述子**
 聚类（距离 > 0.25 = 不同姿势）→ **每个姿势簇各自保留 top-3**（`-k` 可调），
 单组保留总量受上限 20 约束（超出按总分截断）。
@@ -202,11 +204,12 @@ pic_process review <目录> --port 9000 --config stage.toml
   （滚轮/拖拽作用于所有窗格），逐帧对比合焦位置。
 - **UI 内跑批**（M-UI2）：侧栏"重新评分"触发完整评分流水线（与 `score` 子命令
   同一实现），进度条 + 日志实时可见，完成后快照自动刷新，无需重启服务。
-- **UI 内改星**（M-UI2）：灯箱内点星级或按 `1~5` 快捷键 → 写入 XMP 侧车
-  （只改 `xmp:Rating`，firstcut 子分保留；他人侧车不覆盖）。
+- **UI 内改星**（M-UI2）：灯箱内点星级或按 `1~5` 快捷键 → 保存人工决定并同步 XMP。
+  重启复核界面、重新评分或导出后仍使用人工星级；他人侧车不覆盖。侧车同步失败时，界面会提示，人工决定仍然保存。
 - **配置编辑**（M-UI2）：权重/星级阈值/EV 容差/[dedup] 表单化编辑，
   保存保留 TOML 注释，非法值（权重和越界等）拒绝写盘。
-- 数据来源：扫描目录 + SQLite 缓存（星级/连拍与 `score` 同一逻辑在线计算）。
+- 默认 UI 配置位于照片根目录的 `.firstcut/config.toml`，再次打开 review 会自动加载；UI 跑批报告位于 `.firstcut/report.csv`。CLI 使用 UI 配置时传 `--config <照片目录>/.firstcut/config.toml`。
+- 数据来源：扫描目录 + SQLite 分析缓存 + 独立的人工决定库（星级/连拍与 `score` 同一逻辑在线计算）。
   未跑过评分的照片显示为未评分。
 
 ## 性能（16 核机器实测）
@@ -215,7 +218,7 @@ pic_process review <目录> --port 9000 --config stage.toml
 - **1447 张真实图库冷跑 2m55s（~121ms/张，88% 连拍）**；增量重跑 1447 张全命中 2.06s
 - 实验性 `--gpu`（DirectML）：119 张 16.7s vs CPU 17.4s——无显著收益，保持实验性
 - 纯像素冷缓存：约 **90ms/张**（`--no-ai`）
-- 增量重跑：秒级（SQLite 缓存，键 = `path` + `size` + `mtime` + `CACHE_VERSION` + 配置指纹）
+- 增量重跑：秒级（SQLite 缓存，键 = `path` + `size` + `mtime` + `CACHE_VERSION` + 配置/分析模式/模型文件指纹）
 - 评分参数/`--config` 变更会自动使缓存失效（配置指纹参与缓存键），无需手动换缓存文件
 
 ## 目录结构
@@ -230,6 +233,8 @@ src/
 ├── ai/            # CLIPIQA + SCRFD（含 kps）+ YOLOv8-pose（ort 推理）
 ├── dedup.rs       # 连拍分组 + dHash 聚类 + M9 姿态聚类 + 排序
 ├── cache.rs       # SQLite 增量缓存（键含配置指纹，含姿态描述子）
+├── decision.rs    # 独立的人工星级决定与最终星级合成
+├── selection.rs   # CLI/review 共用的星级与连拍结果合成
 ├── review/        # M-UI1 本地 Web 复核服务（axum + 内嵌前端）
 ├── output/        # csv / xmp 侧车
 ├── config.rs      # 权重与曲线参数 + [dedup] + 场景预设（TOML 可配）
@@ -248,40 +253,20 @@ presets/                  # 场景预设（编译进二进制，config-template 
 ## 测试
 
 ```bash
-cargo test --lib                    # 单元测试（51 项）
-cargo test --test integration_test  # 集成测试（6 项，需要 testpic/）
+cargo test --locked
+# 前端脚本检查：将 index.html 中的 <script> 内容提取到临时 .js 文件后执行 node --check
 ```
 
-- **单元测试** 51 项（`cargo test --lib`）：
-  - `dedup` 11 项（datetime 解析、闰年/平年、严格 dHash、连拍分组、dHash 距离切分、
-    空时间无连拍、无描述子退化 M2、M9 姿态分簇各自保留、阈值种子聚类、
-    组上限截断、姿态距离值）
-  - `metrics::composition` 4 项（无脸中性、三分法偏好、理想大小、微小人脸降分）
-  - `metrics::exposure` 7 项（sRGB↔EV 换算、容差带内满分、带外单调衰减、
-    两侧容差独立、主体感知单向修正、暗背景救回、剪裁惩罚）
-  - `output::xmp` 5 项（绝对阈值分档、XMP 关键字段、相对分档百分位、
-    同分并列同星、absolute 模式）
-  - `config` 8 项（预设可加载、未知预设名、未知字段拒绝、star_mode 校验、
-    百分位递增校验、权重和校验、指纹只覆盖缓存输入、-k 与 [dedup] 合成）
-  - `scan` 6 项（配对键含目录、侧车命名保留大小写、同目录配对、
-    跨目录配对、编号回绕不合并、歧义不配对）
-  - `decode` 1 项（8 种 EXIF Orientation 像素变换）
-  - `review` 10 项（路径越界拒绝、文件名含 `..` 放行、正斜杠相对路径、
-    缩略图缓存名稳定、JPG 白名单、单任务互斥与日志环形缓冲、
-    配置编辑保留注释/非法值拒绝写盘）
-- **集成测试** 6 项（`tests/integration_test.rs`）：端到端 pipeline 验证（扫描/配置/dedup/总分/星级映射/模板）
-  - 依赖 `testpic/` 真实照片目录（已 gitignore，私人照片不入库）
-  - testpic 缺失时跳过依赖它的用例，其余纯逻辑用例始终执行
+测试覆盖扫描和配对、分数与连拍、配置边界、灰度 JPEG、XMP 字段保留，以及“评分 → 人工改星 → 重跑 → CSV/XMP/快照”流程。少数旧集成测试依赖 gitignore 中的私人 `testpic/`；该目录不存在时会跳过这些用例。
 
 ## 相关文档
 
-- [`DESIGN.md`](DESIGN.md) — 设计文档（技术选型、评分引擎、Phase 2 规划）
+- [`DESIGN.md`](DESIGN.md) — 当前设计约定、技术选型及已停止路线的历史记录
 - [`release_notes.md`](release_notes.md) — 版本说明
 - [`REVIEW.md`](REVIEW.md) — 外部评审记录与处理状态（长期累积，每轮评审追加）
 - [`P2_M0.md`](P2_M0.md) — Phase 2 环境验证清单（darktable / neural restore / lensfun 实测）
 - [`M5_REVIEW.md`](M5_REVIEW.md) — M5 调参决策历史（已落地，存档备查）
 
-## Phase 2（规划中，未实现）
+## 方向与后续工作
 
-批量 RAW 开发：darktable-cli 引擎 + lensfun 镜头校正 + neural restore AI 降噪，
-详见 `DESIGN.md` §9。
+当前产品聚焦选片与复核；曝光补偿只作为 Lightroom 侧车建议输出。`DESIGN.md` §9 中的 darktable 批量开发方案已停止，属于历史调研。下一步是用用户真实选片结果校准“误删好片”和连拍候选覆盖率；这项校准尚未完成。

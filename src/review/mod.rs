@@ -15,7 +15,7 @@ use std::sync::{Arc, RwLock};
 
 use anyhow::Result;
 use axum::extract::{Query, State};
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{AppendHeaders, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
@@ -31,8 +31,10 @@ const INDEX_HTML: &[u8] = include_bytes!("assets/index.html");
 pub struct AppState {
     root: PathBuf,
     cache_path: PathBuf,
-    /// UI 配置编辑的目标文件（--config 指定；缺省 firstcut.toml）
+    /// UI 配置编辑的目标文件（--config 指定；缺省 <照片根>/.firstcut/config.toml）
     config_path: PathBuf,
+    config_explicit: bool,
+    port: u16,
     /// 当前快照；跑批完成后热替换
     snapshot: RwLock<Snapshot>,
     /// 全局单评分任务
@@ -60,12 +62,15 @@ pub fn serve(
         snapshot.photos.len() - scored
     );
 
-    let config_path =
-        config_path.map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("firstcut.toml"));
+    let config_explicit = config_path.is_some();
+    let config_path = config_path.map(|p| p.to_path_buf())
+        .unwrap_or_else(|| root.join(".firstcut").join("config.toml"));
     let state = Arc::new(AppState {
         root: root.to_path_buf(),
         cache_path: cache_path.to_path_buf(),
         config_path,
+        config_explicit,
+        port,
         snapshot: RwLock::new(snapshot),
         job: Arc::new(JobState::new()),
     });
@@ -172,7 +177,9 @@ struct ScoreRunParams {
 }
 
 /// POST /api/score/run：触发一次完整评分（单任务互斥；完成后热替换快照）
-async fn score_run(State(state): State<Arc<AppState>>, body: Option<axum::Json<ScoreRunParams>>) -> Response {
+async fn score_run(State(state): State<Arc<AppState>>, headers: HeaderMap,
+    body: Option<axum::Json<ScoreRunParams>>) -> Response {
+    if !valid_local_host(&headers, state.port) { return StatusCode::FORBIDDEN.into_response(); }
     let params = body.map(|axum::Json(p)| p).unwrap_or(ScoreRunParams { xmp: false, no_ai: false });
     if !state.job.begin() {
         return (
@@ -195,8 +202,8 @@ async fn score_run(State(state): State<Arc<AppState>>, body: Option<axum::Json<S
         let cfg_result = match crate::config::load_config(&config_path) {
             Ok(c) => Ok(c),
             Err(err) => {
-                // --config 未指定（firstcut.toml 不存在）时用内置默认
-                if !config_path.exists() {
+                // 未显式指定配置且默认文件不存在时用内置默认
+                if !config_path.exists() && !st.config_explicit {
                     Ok(ScoreConfig::default())
                 } else {
                     Err(err)
@@ -214,11 +221,11 @@ async fn score_run(State(state): State<Arc<AppState>>, body: Option<axum::Json<S
         job.log(if config_path.exists() {
             format!("[score] 配置已加载: {}", config_path.display())
         } else {
-            "[score] 使用内置默认配置（未找到 firstcut.toml）".into()
+            "[score] 使用内置默认配置（照片根目录尚无 UI 配置）".into()
         });
 
         let opts = crate::score::ScoreJobOptions {
-            output_csv: PathBuf::from("report.csv"),
+            output_csv: root.join(".firstcut").join("report.csv"),
             cache_path: cache_path.clone(),
             no_cache: false,
             no_ai,
@@ -226,6 +233,12 @@ async fn score_run(State(state): State<Arc<AppState>>, body: Option<axum::Json<S
             gpu: false,
             keep_override: None,
         };
+        if let Some(parent) = opts.output_csv.parent() {
+            if let Err(err) = std::fs::create_dir_all(parent) {
+                job.fail(format!("无法创建报告目录: {err}"));
+                return;
+            }
+        }
         match crate::score::run_score_job(&root, &cfg, &opts, &|ev| match ev {
             crate::score::ScoreEvent::Info(s) => job.log(format!("[score] {s}")),
             crate::score::ScoreEvent::Progress { done, total } => job.progress(done, total),
@@ -272,7 +285,9 @@ struct RateParams {
 
 /// POST /api/rate：UI 内改星——只改 `xmp:Rating`，firstcut 子分字段保留；
 /// 他人侧车（无 firstcut 命名空间）不覆盖（沿用 write_sidecar 保护）
-async fn rate(State(state): State<Arc<AppState>>, axum::Json(p): axum::Json<RateParams>) -> Response {
+async fn rate(State(state): State<Arc<AppState>>, headers: HeaderMap,
+    axum::Json(p): axum::Json<RateParams>) -> Response {
+    if !valid_local_host(&headers, state.port) { return StatusCode::FORBIDDEN.into_response(); }
     if !(1..=5).contains(&p.stars) {
         return (StatusCode::BAD_REQUEST, "星级必须是 1~5").into_response();
     }
@@ -280,7 +295,7 @@ async fn rate(State(state): State<Arc<AppState>>, axum::Json(p): axum::Json<Rate
         return (StatusCode::CONFLICT, "评分任务进行中，暂不能改星").into_response();
     }
     // 从当前快照取该照片的分数（未评分照片没有可写子分，拒绝）
-    let (scores, total, suggested_ev, entry) = {
+    let (scores, total, suggested_ev, pair_id, jpg_path, sidecar_entries) = {
         let guard = state.snapshot.read().unwrap();
         let Some(photo) = guard.photos.iter().find(|x| x.path == p.p) else {
             return (StatusCode::NOT_FOUND, "照片不在快照中").into_response();
@@ -302,7 +317,7 @@ async fn rate(State(state): State<Arc<AppState>>, axum::Json(p): axum::Json<Rate
             extension: photo.ext.clone(),
             is_raw: false,
             has_pair: photo.has_pair,
-            pair_id: String::new(),
+            pair_id: photo.pair_id.clone(),
             date_time_original: photo.datetime.clone(),
             camera_make: String::new(),
             camera_model: String::new(),
@@ -319,8 +334,10 @@ async fn rate(State(state): State<Arc<AppState>>, axum::Json(p): axum::Json<Rate
             total_score: format!("{:.1}", s.total),
             suggested_ev: String::new(),
             stars: String::new(),
+            rating_source: "manual".into(),
             faces: photo.faces.to_string(),
             analysis_ok: "true".into(),
+            analysis_mode: photo.analysis_mode.clone().unwrap_or_default(),
             burst_group: photo.burst.as_ref().map(|b| b.group.to_string()).unwrap_or_default(),
             burst_size: photo.burst.as_ref().map(|b| b.size.to_string()).unwrap_or_default(),
             burst_rank: photo.burst.as_ref().map(|b| b.rank.to_string()).unwrap_or_default(),
@@ -335,30 +352,39 @@ async fn rate(State(state): State<Arc<AppState>>, axum::Json(p): axum::Json<Rate
                 .map(|b| b.pose_cluster.to_string())
                 .unwrap_or_default(),
         };
-        (px, s.total, s.suggested_ev, entry)
+        let jpg_path = match guard.photos.iter().find(|x| x.pair_id == photo.pair_id && !x.is_raw) {
+            Some(jpg) => state.root.join(&jpg.path),
+            None => return (StatusCode::BAD_REQUEST, "该照片没有可评分 JPG").into_response(),
+        };
+        let sidecar_entries = guard.photos.iter().filter(|x| x.pair_id == photo.pair_id)
+            .map(|x| crate::scan::PhotoEntry {
+                path: state.root.join(&x.path).display().to_string(),
+                filename: x.filename.clone(),
+                ..entry.clone()
+            }).collect::<Vec<_>>();
+        (px, s.total, s.suggested_ev, photo.pair_id.clone(), jpg_path, sidecar_entries)
     };
-
-    match crate::output::xmp::write_sidecar(&entry, &scores, total, p.stars, suggested_ev) {
-        Ok(true) => {
-            // 内存快照同步（同 stem 的 JPG/ARW 行共享星级）
-            {
-                let mut guard = state.snapshot.write().unwrap();
-                let stem = crate::scan::stem_of(&p.p);
-                for photo in guard.photos.iter_mut() {
-                    if crate::scan::stem_of(&photo.path) == stem {
-                        photo.stars = Some(p.stars);
-                    }
-                }
-            }
-            json_response(serde_json::json!({ "ok": true, "stars": p.stars }))
-        }
-        Ok(false) => (
-            StatusCode::CONFLICT,
-            "该照片已有其他软件写的侧车（无 firstcut 标记），未覆盖",
-        )
-            .into_response(),
-        Err(err) => internal_error(err),
+    if let Err(err) = crate::decision::set(&state.root, &jpg_path, p.stars) {
+        return internal_error(err);
     }
+    let mut warnings = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for entry in &sidecar_entries {
+        let sidecar = Path::new(&entry.path)
+            .with_file_name(format!("{}.xmp", crate::scan::stem_raw_of(&entry.filename)));
+        if !seen.insert(sidecar) { continue; }
+        match crate::output::xmp::write_sidecar(entry, &scores, total, p.stars, suggested_ev) {
+            Ok(true) => {},
+            Ok(false) => warnings.push(format!("{} 已有其他软件的侧车，未覆盖", entry.path)),
+            Err(err) => warnings.push(format!("{} 侧车写入失败: {err:#}", entry.path)),
+        }
+    }
+    let mut guard = state.snapshot.write().unwrap();
+    for photo in guard.photos.iter_mut().filter(|x| x.pair_id == pair_id) {
+        photo.stars = Some(p.stars);
+        photo.rating_source = Some("manual".into());
+    }
+    json_response(serde_json::json!({ "ok": true, "stars": p.stars, "warnings": warnings }))
 }
 
 /// GET /api/config：当前可编辑配置值（文件不存在时为内置默认）
@@ -376,15 +402,13 @@ async fn config_get(State(state): State<Arc<AppState>>) -> Response {
 /// POST /api/config：保存编辑值（toml_edit 保留注释；非法值拒绝写盘）
 async fn config_save(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     axum::Json(values): axum::Json<config_edit::ConfigValues>,
 ) -> Response {
+    if !valid_local_host(&headers, state.port) { return StatusCode::FORBIDDEN.into_response(); }
     match config_edit::save(&state.config_path, &values) {
         Ok(()) => {
-            let note = if state.config_path.exists() {
-                "已保存；下一次跑批/评分即生效"
-            } else {
-                "已保存；下次启动 review 时用 --config 指定该文件生效"
-            };
+            let note = "已保存；下一次 UI 跑批生效";
             json_response(serde_json::json!({ "ok": true, "note": note }))
         }
         Err(err) => (StatusCode::BAD_REQUEST, format!("{err:#}")).into_response(),
@@ -435,6 +459,14 @@ fn internal_error(err: anyhow::Error) -> Response {
     (StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")).into_response()
 }
 
+fn valid_local_host(headers: &HeaderMap, port: u16) -> bool {
+    let expected_ip = format!("127.0.0.1:{port}");
+    let expected_name = format!("localhost:{port}");
+    headers.get(header::HOST).and_then(|v| v.to_str().ok())
+        .is_some_and(|host| host.eq_ignore_ascii_case(&expected_ip)
+            || host.eq_ignore_ascii_case(&expected_name))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -450,6 +482,8 @@ mod tests {
             root: dir.clone(),
             cache_path: dir.join("c.sqlite"),
             config_path: dir.join("firstcut.toml"),
+            config_explicit: true,
+            port: 8787,
             snapshot: RwLock::new(Snapshot { root: dir.display().to_string(), photos: vec![] }),
             job: Arc::new(JobState::new()),
         };

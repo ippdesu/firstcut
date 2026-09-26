@@ -1,11 +1,26 @@
 # 照片初筛评分工具（Rust）— 设计与实现文档
 
-> 状态：**Phase 1 已完成并发布 v1.1**（GitHub: ippdesu/firstcut，tag v1.0 / v1.1）；M6/M7/M8 缺陷修复 + M9 自适应连拍保留 + M-UI1 复核界面已实现（分支交付，未另发 Release）
+> 状态：**Phase 1 已发布 v1.1，后续 M6–M9 和 M-UI1/2 已实现；可靠性与数据模型统一在 `codex/Astra-review` 分支实施，尚未发布。**
 > 日期：2026 规划稿 / 2026 实施完成
 > 需求来源：索尼相机 JPG+ARW 连拍/风景/人像选片地狱，需要自动初步评分
 > 配套文档：`README.md`（用户手册）/ `release_notes.md`（版本说明）/ `REVIEW.md`（外部评审记录与处理状态）/ `M5_REVIEW.md`（M5 决策记录）/ `firstcut.toml`（配置模板）/ `P2_M0.md`（Phase 2 环境验证清单）
 
 ## 0. 目标（根据确认的需求）
+
+### 0.1 当前有效的设计约定（2026-09-27）
+
+本节优先于后文旧里程碑和实验记录。产品聚焦本地初筛、连拍候选、人工复核，以及给 Lightroom 的 XMP 星级和曝光建议。darktable 批量 RAW 开发已停止；§9.1–§9.6 是历史调研，不作为实施清单。
+
+数据分为四层：
+
+1. **照片资产**：JPG 文件路径是人工决定的持久身份；扫描器的 `pair_id` 在当前批次内将 JPG 映射到 ARW。跨目录无歧义配对仍按 §10 M8-1 规则。
+2. **分析结果**：五维分数、dHash、主体及曝光建议保存在可重建的 SQLite 缓存。缓存键区分 `ai` 与 `pixel`，并包含模型文件大小和修改时间。CSV 的 `analysis_mode` 显示来源；单张 AI 推理失败不伪装成中性分数，而是报告分析失败。
+3. **算法建议**：每次跑批根据分析结果、当前权重、连拍参数和本批照片集合，重新计算总分、星级与保留建议。相对星级仍只在本批次内可比。
+4. **人工决定与导出**：人工星级保存在 `<照片根>/.firstcut/decisions.sqlite`，独立于分析缓存。最终星级为人工值优先，否则用算法值；CLI、review 快照、CSV、XMP 均从这条规则合成。XMP 只合并 firstcut 管理字段，保留其他 XML 内容；无 firstcut 标记的侧车不改动。
+
+`PhotoEntry` 目前仍是扫描与 CSV 导出的共享结构，`AnalysisResult` 是内部数值结果，`selection::SelectionResult` 统一合成算法星级、人工覆盖与连拍候选，CLI/review 共用；`decision` 模块负责独立持久化人工决定。后续若扩展人工保留标记，应进入决定库和同一合成路径，避免复核界面独有状态。
+
+本轮暂不校准评分算法或选片效果。真实图库的“好片被排除率”、连拍最佳帧覆盖率及 Lightroom 导入效果仍需单独验收。
 
 一个 **Rust 编写的本地 CLI 工具**：扫描索尼相机的 JPG+ARW 照片目录 → 对 JPG 做 **5 维评分（清晰度/曝光/噪点/构图/美学）+ 连拍去重** → 把分数映射到同名 ARW → 输出 **XMP 星级 + CSV 报告**。目标吞吐：上万张照片可接受的处理时间（分钟级），增量重跑秒级（SQLite 缓存）。
 
@@ -67,25 +82,25 @@
 scan（读 EXIF 建索引，SQLite 增量）
   → analyze（解码+像素指标，rayon 并行，box 降采样 ~1024px）
   → detect（CLIPIQA + SCRFD + 姿态，ort 推理，缓存命中跳过）
-  → dedup（时间聚类 + dHash，组内排序）
-  → score（加权汇总）
-  → output（XMP 星级 + CSV）
+  → selection（时间聚类 + dHash + 姿态、加权总分、算法星级、人工覆盖）
+  → output（XMP 星级 + CSV；review 使用同一 selection 结果）
 ```
 
-- 缓存命中即跳过（SQLite，键 = path+size+mtime+CACHE_VERSION+**配置指纹**），重跑只处理新照片。
+- 缓存命中即跳过（SQLite，键 = path+size+mtime+CACHE_VERSION+**曲线/分析模式/模型文件指纹**），重跑只处理新照片或来源变化的照片。
   - 配置指纹（`config_fingerprint`）是 M6 修复的一个静默 bug：此前换 `--config` 后缓存仍然命中，用户改了权重/曲线却看到完全一样的结果。
   - 指纹**只覆盖影响缓存值的曲线参数**（`sharpness_k`/`noise_k0`/`exposure_*`）；权重与星级阈值在运行期合成总分/星级，改它们不会触发重算（M8 性能修正）。
   - `flush` 只写本次新增/更新的行（dirty set），不再每次重写全部行。
 - 实测吞吐：119 张 33MP（含 3 模型）约 17.4s（16 核，~146ms/张）；**M9 实测 1447 张真实图库（含 1272 张连拍）冷跑 2m55s（~121ms/张）**；增量重跑秒级（1447 张全命中 2.06s）。1 万张冷跑约 20 分钟。
-- 缓存行含姿态描述子（M9，`pose_desc BLOB`，10×f32）；`CACHE_VERSION` 13。
+- 缓存行含姿态描述子（M9，`pose_desc BLOB`，10×f32）；当前 `CACHE_VERSION` 15，旧行会重建。
 - 处理中不移动/删除任何文件，只写 XMP 侧车和 CSV（安全）。
 - CSV 含 `analysis_ok` 列（M8 遗留项，M9 落地）：解码失败/无配对 ARW 可过滤，运行结束 stderr 给失败清单。
+- CSV 另含 `analysis_mode`（`ai`/`pixel`）和 `rating_source`（`algorithm`/`manual`）；人工决定库应随照片备份，分析缓存可重建。
 
 ## 5. XMP 输出约定
 
-- 为每张照片写侧车 `<stem>.xmp`（`DSC00001.xmp`），含 `xmp:Rating`（1-5 星）+ `firstcut:` 命名空间（5 维子分/人脸/连拍信息）。同一 stem 的 JPG/ARW 共用一个侧车。
+- 为每张照片写侧车 `<stem>.xmp`（`DSC00001.xmp`），含 `xmp:Rating`（1-5 星）+ `firstcut:` 命名空间（5 维子分/人脸/连拍信息）。同目录的 JPG/ARW 共用一个侧车；分目录配对时两端各写一份。
 - **命名兼容性（M7 已解决）**：`<stem>.xmp` 是 **Lightroom/ACR** 的约定，**darktable 也读**该格式（它自己的 `<stem>.<ext>.xmp` 也认，见 [darktable 文档](https://docs.darktable.org/usermanual/4.2/en/overview/sidecar-files/sidecar-import/)）→ 一份侧车两边通用。此前写成 `<stem>.<ext>.xmp`，Lightroom 读不到。
-- 他人侧车（无 firstcut 命名空间，如 LR 写的调色参数）**不覆盖**，只提示跳过。
+- 他人侧车（无 firstcut 命名空间，如 LR 写的调色参数）**不覆盖**；已有 firstcut 侧车仅按 XML 节点合并受管理字段，未知字段保留，解析失败保留原文件。
 - **星级（M7）**：默认 `star_mode = "relative"`，按本次批次内百分位给星（10/30/65/90）。绝对阈值模式保留（`rating_5..2`）。理由见 §10。
 - CSV 每行：文件、拍摄时间、相机、ISO/光圈/快门、5 维子分、总分、**星级**、人脸数、连拍组号、组内排名、建议操作。
 
@@ -457,14 +472,14 @@ edge/center=**0.968**（未校正约 0.7）→ 镜头校正生效；Sigma 50（�
 **⑨ 仍未决**（沿用 §9.4b ⑥/⑧ + 本轮新增）：`firstcut:*` GUI 保存后保留性；OpenCL；
 Kelvin→RGB 换算；降噪强度分级目视；**LR 对本轮 16bit TIFF 的兼容性**。
 
-### 9.5 里程碑追加（Phase 2 在 Phase 1 M5 之后）
+### 9.5 历史里程碑（已停止，不实施）
 
 - **P2-M1**：环境验证 —— 安装 darktable，darktable-cli 手动跑通一张 ARW 全流程（校正+降噪+导出 TIFF/JPG）
 - **P2-M2**：Rust 编排器 —— 生成 XMP 侧车 + 调用 darktable-cli + 并发批处理 + 进度/日志
 - **P2-M3**：联动 Phase 1 —— 曝光补偿值写入侧车、按评分阈值决定开发名单
 - **P2-M4**：实测调优 —— 你的镜头跑一轮，调 lensfun 覆盖、降噪强度分级、输出验证
 
-### 9.6 实施清单（待你补充/确认）
+### 9.6 历史实施清单（已停止，不实施）
 
 > 勾选项 = 还没做。请直接在上面增删，或告诉我哪几条要拆细。
 
@@ -535,7 +550,7 @@ Kelvin→RGB 换算；降噪强度分级目视；**LR 对本轮 16bit TIFF 的�
 
 ## 11. 交付方式
 
-Phase 1 已交付（v1.0/v1.1 已发布 Release）；Phase 2 规划经确认后再开工。
+Phase 1 已交付（v1.0/v1.1 已发布 Release）；当前开发以 §0.1 为准。§9 的 darktable Phase 2 已停止。
 每次改动必须同步更新 `README.md` / `DESIGN.md`，不允许文档与实现状态不一致。
 
 ## 12. UI 规划（M-UI1 复核 + M-UI2 操作台，已实现）
@@ -578,4 +593,4 @@ Phase 1 已交付（v1.0/v1.1 已发布 Release）；Phase 2 规划经确认后�
 
 ### 12.4 后续里程碑
 
-- **M-UI3 Phase 2 集成**：develop 编排（P2-M2）的可视化——开发名单、进度、结果对比。
+- **后续**：用用户真实选片结果验证候选覆盖率与误删率，再决定是否扩展复核工作流；darktable develop 操作台不再计划实施。

@@ -87,13 +87,13 @@ pub fn load(path: &Path) -> Result<ConfigValues> {
 /// 保存配置值：不存在先落模板（带注释），再以 toml_edit 做数值替换（保留注释），
 /// 最后用 `load_config` 全量校验写回内容合法才落盘。
 pub fn save(path: &Path, values: &ConfigValues) -> Result<()> {
-    if !path.exists() {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(path, crate::config::config_template())?;
+    for (name, value) in [("keep_k", values.dedup_keep_k),
+        ("burst_group_cap", values.dedup_burst_group_cap)] {
+        anyhow::ensure!(value.is_finite() && value >= 0.0 && value.fract() == 0.0
+            && value <= i64::MAX as f64, "{name} 必须是非负整数");
     }
-    let text = std::fs::read_to_string(path)?;
+    let text = if path.exists() { std::fs::read_to_string(path)? }
+        else { crate::config::config_template() };
     let mut doc = text
         .parse::<toml_edit::DocumentMut>()
         .with_context(|| format!("解析配置失败（{}）", path.display()))?;
@@ -106,7 +106,7 @@ pub fn save(path: &Path, values: &ConfigValues) -> Result<()> {
     }
 
     // (key, value) 对：与 ConfigValues 字段一一对应
-    let mut set_f64 = |doc: &mut toml_edit::DocumentMut, table: &str, key: &str, v: f64| {
+    let set_f64 = |doc: &mut toml_edit::DocumentMut, table: &str, key: &str, v: f64| {
         if let Some(t) = doc[table].as_table_mut() {
             t[key] = toml_edit::value(v);
         }
@@ -145,7 +145,8 @@ pub fn save(path: &Path, values: &ConfigValues) -> Result<()> {
     // 写回前校验：非法配置不落盘（权重和/容差嵌套/star_mode 等）
     crate::config::load_config_text(&new_text, &path.display().to_string())?;
 
-    // 原子替换：先写临时文件再改名
+    // 原子替换：验证通过后才创建文件
+    if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
     let tmp = path.with_extension("toml.tmp");
     std::fs::write(&tmp, new_text)?;
     std::fs::rename(&tmp, path)?;

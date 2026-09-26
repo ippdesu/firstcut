@@ -144,6 +144,9 @@
 
 <script>
 "use strict";
+function escapeHtml(v){
+  return String(v).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
 // ---------- 数据 ----------
 let SNAPSHOT = null;        // {root, photos}
 let jpgs = [];              // 只展示非 RAW 行（分数与 JPG 相同）
@@ -263,7 +266,7 @@ function apply(){
       ${p.stars ? `<span class="b stars">${"★".repeat(p.stars)}</span>` : ""}
       ${p.scores ? `<span class="b total">${p.scores.total.toFixed(1)}</span>` : `<span class="b total">未评分</span>`}
       ${p.burst && p.burst.group ? `<span class="b burst ${p.burst.keep?"":"drop"}">组${p.burst.group} #${p.burst.rank}/${p.burst.size} ${p.burst.keep?"✓":"✗"}</span>` : ""}
-      <span class="b name">${p.filename}</span>`;
+      <span class="b name">${escapeHtml(p.filename)}</span>`;
     d.addEventListener("click", ()=> openLightbox(p, list));
     grid.appendChild(d);
   }
@@ -321,7 +324,7 @@ function renderLB(){
     const pane = document.createElement("div");
     pane.className = "pane"; pane.dataset.path = p.path;
     pane.innerHTML = `<img src="/image?p=${encodeURIComponent(p.path)}">
-      <span class="tag">${p.filename}${p.scores ? " · "+p.scores.total.toFixed(1) : ""}</span>
+      <span class="tag">${escapeHtml(p.filename)}${p.scores ? " · "+p.scores.total.toFixed(1) : ""}</span>
       <span class="hint">滚轮缩放 · 拖拽平移 · 双击复位</span>`;
     bindPane(pane);
     panes.appendChild(pane);
@@ -457,8 +460,7 @@ function pollJob(){
       const pct = j.total ? Math.round(j.done/j.total*100) : 0;
       barIn.style.width = pct + '%';
       st.style.display = 'block'; st.textContent = `进度 ${j.done}/${j.total}（${pct}%）`;
-      log.textContent = (j.log||[]).join('
-');
+      log.textContent = (j.log||[]).join('\n');
       log.scrollTop = log.scrollHeight;
     } else {
       bar.style.display = 'none'; btn.disabled = false; btn.textContent = '▶ 重新评分';
@@ -468,8 +470,7 @@ function pollJob(){
         st.style.color = j.state==='done' ? 'var(--acc)' : '#f44336';
       }
       log.style.display = (j.log||[]).length ? 'block' : 'none';
-      if((j.log||[]).length) log.textContent = j.log.join('
-');
+      if((j.log||[]).length) log.textContent = j.log.join('\n');
       // 完成瞬间刷新数据
       if(j.state === 'done' && jobPolling){ loadData(); }
     }
@@ -509,10 +510,10 @@ function setStars(photo, n){
   }).then(async r=>{
     const j = await r.json().catch(()=>({}));
     if(r.ok && j.ok){
-      toast(`已写入 ${n} 星侧车`);
+      toast(j.warnings?.length ? `已保存 ${n} 星；${j.warnings.length} 个侧车未同步` : `已保存 ${n} 星`);
       // 本地数据同步（同 stem 共享星级）
       const stem = photo.path.replace(/\.[^.]+$/,'').toLowerCase();
-      jpgs.forEach(p=>{ if(p.path.replace(/\.[^.]+$/,'').toLowerCase() === stem) p.stars = n; });
+      jpgs.forEach(p=>{ if(p.path.replace(/\.[^.]+$/,'').toLowerCase() === stem){ p.stars = n; p.rating_source = 'manual'; } });
       renderLB(); apply();
     } else {
       toast(j && typeof j === 'string' ? j : (j.error || r.statusText || '写入失败'));

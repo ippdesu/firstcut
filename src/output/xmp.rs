@@ -21,6 +21,9 @@ use crate::score::PixelScores;
 
 /// 自定义命名空间 URI
 pub const NS_FIRSTCUT: &str = "http://firstcut.local/ns/";
+const NS_RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
+const NS_XMP: &str = "http://ns.adobe.com/xap/1.0/";
+const NS_CRS: &str = "http://ns.adobe.com/camera-raw-settings/1.0/";
 
 /// 总分 → 星级映射（绝对阈值模式，默认 75/60/45/30）
 pub fn rating_from_total(total: f64, m: &MetricParams) -> u8 {
@@ -164,18 +167,127 @@ pub fn write_sidecar(
     let stem = crate::scan::stem_raw_of(&e.filename);
     let sidecar = path.with_file_name(format!("{stem}.xmp"));
 
-    if sidecar.exists() {
-        if let Ok(content) = std::fs::read_to_string(&sidecar) {
-            if !content.contains(NS_FIRSTCUT) {
-                eprintln!("[xmp] 跳过 {}（侧车为其他软件所写，未覆盖）", sidecar.display());
-                return Ok(false);
+    let xml = if sidecar.exists() {
+        let content = std::fs::read_to_string(&sidecar)?;
+        if !content.contains(NS_FIRSTCUT) {
+            eprintln!("[xmp] 跳过 {}（侧车为其他软件所写，未覆盖）", sidecar.display());
+            return Ok(false);
+        }
+        merge_xmp(&content, e, s, total, rating, suggested_ev)?
+    } else {
+        render_xmp(e, s, total, rating, suggested_ev)
+    };
+    // 临时文件写完后替换，避免中断时留下半截侧车。
+    let temp = sidecar.with_extension(format!("xmp.tmp.{}.{}", std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos()));
+    std::fs::write(&temp, xml)?;
+    if let Err(err) = std::fs::rename(&temp, &sidecar) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(err.into());
+    }
+    Ok(true)
+}
+
+/// 仅替换 firstcut 拥有的字段，其他软件增加的元素、属性、处理指令均原样保留。
+fn merge_xmp(content: &str, e: &PhotoEntry, s: &PixelScores, total: f64,
+    rating: u8, suggested_ev: Option<f64>) -> anyhow::Result<String> {
+    use anyhow::{anyhow, Context};
+    use roxmltree::{Document, NodeType};
+    let doc = Document::parse(content).context("现有 XMP 无法解析，已保护原文件")?;
+    let desc = doc.descendants().find(|n| n.has_tag_name((NS_RDF, "Description"))
+        && n.lookup_prefix(NS_FIRSTCUT).is_some())
+        .ok_or_else(|| anyhow!("未找到 firstcut RDF Description，已保护原文件"))?;
+    let mut edits: Vec<(std::ops::Range<usize>, String)> = Vec::new();
+    // Lightroom 可能把 Rating 写成 RDF 属性或子元素，两种形式都接受。
+    let rating_attr = desc.attributes().find(|a| a.namespace() == Some(NS_XMP) && a.name() == "Rating");
+    if let Some(attr) = rating_attr {
+        edits.push((attr.range_value(), rating.to_string()));
+    }
+    let mut set_child = |namespace: &str, name: &str, value: String| -> anyhow::Result<()> {
+        let child = desc.children().find(|n| n.has_tag_name((namespace, name)))
+            .ok_or_else(|| anyhow!("XMP 缺少 {name}，已保护原文件"))?;
+        if child.children().any(|n| n.is_element()) {
+            return Err(anyhow!("XMP {name} 含嵌套字段，已保护原文件"));
+        }
+        if let Some(text) = child.children().find(|n| n.node_type() == NodeType::Text) {
+            edits.push((text.range(), value));
+        } else if child.children().next().is_none() {
+            let raw = &content[child.range()];
+            let close = raw.rfind("</")
+                .ok_or_else(|| anyhow!("XMP {name} 是空标签，已保护原文件"))?;
+            let at = child.range().start + close;
+            edits.push((at..at, value));
+        } else {
+            return Err(anyhow!("XMP {name} 不是文本字段，已保护原文件"));
+        }
+        Ok(())
+    };
+    if desc.children().any(|n| n.has_tag_name((NS_XMP, "Rating"))) {
+        set_child(NS_XMP, "Rating", rating.to_string())?;
+    } else if rating_attr.is_none() {
+        return Err(anyhow!("XMP 缺少 Rating，已保护原文件"));
+    }
+    for (name, value) in [
+        ("sharpness", format!("{:.1}", s.sharpness)),
+        ("exposure", format!("{:.1}", s.exposure)),
+        ("noise", format!("{:.1}", s.noise)),
+        ("composition", format!("{:.1}", s.composition)),
+        ("aesthetic", format!("{:.1}", s.aesthetic)),
+        ("faces", e.faces.parse::<usize>().unwrap_or(0).to_string()),
+        ("total", format!("{total:.1}")),
+        ("burstGroup", e.burst_group.clone()),
+        ("burstRank", e.burst_rank.clone()),
+        ("burstKeep", e.burst_keep.clone()),
+    ] {
+        set_child(NS_FIRSTCUT, name, value)?;
+    }
+    drop(set_child);
+    let ev_child = desc.children().find(|n| n.has_tag_name((NS_FIRSTCUT, "suggestedEV")));
+    let crs_attr = desc.attributes().find(|a| a.namespace() == Some(NS_CRS) && a.name() == "Exposure2");
+    match suggested_ev {
+        Some(ev) => {
+            if let Some(child) = ev_child {
+                let text = child.children().find(|n| n.node_type() == NodeType::Text)
+                    .ok_or_else(|| anyhow!("suggestedEV 不是文本字段，已保护原文件"))?;
+                edits.push((text.range(), format!("{ev:+.2}")));
+            } else {
+                let prefix = desc.lookup_prefix(NS_FIRSTCUT).unwrap();
+                let raw = &content[desc.range()];
+                let close = raw.rfind("</").ok_or_else(|| anyhow!("XMP Description 无结束标签"))?;
+                let at = desc.range().start + close;
+                edits.push((at..at, format!("<{prefix}:suggestedEV>{ev:+.2}</{prefix}:suggestedEV>")));
+            }
+            if let Some(attr) = crs_attr {
+                edits.push((attr.range_value(), format!("{ev:.2}")));
+            } else {
+                if desc.lookup_namespace_uri(Some("crs"))
+                    .is_some_and(|uri| uri != NS_CRS) {
+                    return Err(anyhow!("现有 crs 前缀指向其他命名空间，已保护原文件"));
+                }
+                let raw = &content[desc.range()];
+                let name_end = raw.find(|c: char| c.is_whitespace() || c == '>')
+                    .ok_or_else(|| anyhow!("XMP Description 起始标签无效"))?;
+                let at = desc.range().start + name_end;
+                let namespace = if desc.lookup_namespace_uri(Some("crs")) == Some(NS_CRS) {
+                    String::new()
+                } else {
+                    format!(" xmlns:crs=\"{NS_CRS}\"")
+                };
+                edits.push((at..at, format!("{namespace} crs:Exposure2=\"{ev:.2}\"")));
             }
         }
+        None => {
+            if let Some(child) = ev_child { edits.push((child.range(), String::new())); }
+            if let Some(attr) = crs_attr { edits.push((attr.range(), String::new())); }
+        }
     }
-
-    let xml = render_xmp(e, s, total, rating, suggested_ev);
-    std::fs::write(&sidecar, xml)?;
-    Ok(true)
+    let mut output = content.to_string();
+    edits.sort_by(|a, b| b.0.start.cmp(&a.0.start));
+    for (range, replacement) in edits {
+        output.replace_range(range, &replacement);
+    }
+    Document::parse(&output).context("合并后的 XMP 无效，已保护原文件")?;
+    Ok(output)
 }
 
 #[cfg(test)]
@@ -206,8 +318,10 @@ mod tests {
             total_score: "66.0".into(),
             suggested_ev: String::new(),
             stars: "4".into(),
+            rating_source: "algorithm".into(),
             faces: "1".into(),
             analysis_ok: "true".into(),
+            analysis_mode: "ai".into(),
             burst_group: "3".into(),
             burst_size: "2".into(),
             burst_rank: "1".into(),
@@ -331,5 +445,33 @@ mod tests {
         let xml_some = render_xmp(&e, &s, 66.0, 4, Some(1.0));
         assert!(xml_some.contains(r#"<firstcut:suggestedEV>+1.00</firstcut:suggestedEV>"#));
         assert!(xml_some.contains(r#"crs:Exposure2="1.00""#));
+    }
+
+    #[test]
+    fn merge_preserves_unrelated_xmp_and_adds_exposure() {
+        let e = entry();
+        let s = PixelScores { sharpness: 75.0, exposure: 80.0, noise: 60.0,
+            composition: 60.0, aesthetic: 45.0 };
+        let original = render_xmp(&e, &s, 66.0, 4, None)
+            .replace("xmlns:firstcut=\"http://firstcut.local/ns/\"",
+                "xmlns:firstcut=\"http://firstcut.local/ns/\" xmlns:other=\"urn:other\" other:flag=\"keep\"")
+            .replace("</rdf:Description>", "<other:note>untouched</other:note></rdf:Description>");
+        let updated = merge_xmp(&original, &e, &s, 66.0, 2, Some(0.67)).unwrap();
+        assert!(updated.contains("other:flag=\"keep\""));
+        assert!(updated.contains("<other:note>untouched</other:note>"));
+        assert!(updated.contains("<xmp:Rating>2</xmp:Rating>"));
+        assert!(updated.contains("crs:Exposure2=\"0.67\""));
+        assert!(updated.contains("<firstcut:suggestedEV>+0.67</firstcut:suggestedEV>"));
+        let cleared = merge_xmp(&updated, &e, &s, 66.0, 3, None).unwrap();
+        assert!(!cleared.contains("crs:Exposure2="));
+        assert!(!cleared.contains("<firstcut:suggestedEV>"));
+        assert!(cleared.contains("other:flag=\"keep\""));
+        let duplicate_rating = original.replace(
+            "xmlns:firstcut=\"http://firstcut.local/ns/\"",
+            "xmp:Rating=\"4\" xmlns:firstcut=\"http://firstcut.local/ns/\"",
+        );
+        let normalized = merge_xmp(&duplicate_rating, &e, &s, 66.0, 2, None).unwrap();
+        assert!(normalized.contains("xmp:Rating=\"2\""));
+        assert!(normalized.contains("<xmp:Rating>2</xmp:Rating>"));
     }
 }

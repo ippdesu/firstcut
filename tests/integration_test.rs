@@ -213,3 +213,36 @@ fn test_config_template_contains_all_fields() {
     assert!(template.contains("人像") || template.contains("打鸟") || template.contains("夜景"),
         "模板应包含场景示例说明");
 }
+
+/// 人工决定贯穿重跑、CSV、XMP 与复核快照；不依赖私人 testpic。
+#[test]
+fn manual_rating_survives_rescore_and_export() {
+    let root = std::env::temp_dir().join(format!("firstcut_flow_{}_{}", std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    std::fs::create_dir_all(&root).unwrap();
+    let jpg = root.join("sample.jpg");
+    image::RgbImage::from_pixel(64, 64, image::Rgb([100, 120, 140])).save(&jpg).unwrap();
+    let csv_path = root.join("report.csv");
+    let cache_path = root.join("cache.sqlite");
+    let cfg = ScoreConfig::default();
+    let opts = score::ScoreJobOptions {
+        output_csv: csv_path.clone(), cache_path: cache_path.clone(), no_cache: false,
+        no_ai: true, xmp: true, gpu: false, keep_override: None,
+    };
+    score::run_score_job(&root, &cfg, &opts, &|_| {}).unwrap();
+    pic_process::decision::set(&root, &jpg, 1).unwrap();
+    score::run_score_job(&root, &cfg, &opts, &|_| {}).unwrap();
+    let csv = std::fs::read_to_string(&csv_path).unwrap();
+    let mut reader = csv::Reader::from_reader(csv.as_bytes());
+    let headers = reader.headers().unwrap().clone();
+    let row = reader.records().next().unwrap().unwrap();
+    assert_eq!(row.get(headers.iter().position(|h| h == "stars").unwrap()), Some("1"));
+    assert_eq!(row.get(headers.iter().position(|h| h == "rating_source").unwrap()), Some("manual"));
+    assert_eq!(row.get(headers.iter().position(|h| h == "analysis_mode").unwrap()), Some("pixel"));
+    let sidecar = std::fs::read_to_string(jpg.with_extension("xmp")).unwrap();
+    assert!(sidecar.contains("<xmp:Rating>1</xmp:Rating>"));
+    let snap = pic_process::review::snapshot::build_snapshot(&root, &cfg, &cache_path).unwrap();
+    assert_eq!(snap.photos[0].stars, Some(1));
+    assert_eq!(snap.photos[0].rating_source.as_deref(), Some("manual"));
+    let _ = std::fs::remove_dir_all(root);
+}

@@ -149,7 +149,11 @@ fn main() -> Result<()> {
                 Some(path) => pic_process::config::load_config(path).map_err(|err| {
                     anyhow::anyhow!("配置加载失败: {}\n{err:#}", path.display())
                 })?,
-                None => ScoreConfig::default(),
+                None => {
+                    let saved = dir.join(".firstcut").join("config.toml");
+                    if saved.exists() { pic_process::config::load_config(&saved)? }
+                    else { ScoreConfig::default() }
+                },
             };
             if config.is_some() {
                 eprintln!("[review] 配置已加载: {}", config.as_ref().unwrap().display());

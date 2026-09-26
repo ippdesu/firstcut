@@ -2,6 +2,7 @@
 
 pub mod ai;
 pub mod cache;
+pub mod decision;
 pub mod config;
 pub mod decode;
 pub mod dedup;
@@ -9,4 +10,5 @@ pub mod metrics;
 pub mod output;
 pub mod review;
 pub mod scan;
+pub mod selection;
 pub mod score;

@@ -14,7 +14,7 @@ use crate::score::{AnalysisResult, PixelScores};
 /// 缓存分析版本：评分参数（k 值/权重/模型）变化时递增
 ///
 /// 13 = M9：缓存行增加姿态描述子（SCRFD 关键点），旧行全部失效重建
-pub const CACHE_VERSION: i64 = 14;
+pub const CACHE_VERSION: i64 = 15;
 
 /// 照片分析缓存
 pub struct ScoreCache {

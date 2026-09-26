@@ -221,12 +221,44 @@ pub fn load_config_text(text: &str, source: &str) -> Result<ScoreConfig> {
 /// 配置合法性校验（权重和 / EV 容差嵌套 / 主体混合权重 / star_mode / 百分位单调）
 fn validate_config(cfg: &ScoreConfig, source: &str) -> Result<()> {
     let w = &cfg.weights;
+    for (name, value) in [
+        ("sharpness", w.sharpness), ("exposure", w.exposure),
+        ("noise", w.noise), ("composition", w.composition),
+        ("aesthetic", w.aesthetic),
+    ] {
+        if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+            anyhow::bail!("权重 {name} 必须是 0~1 的有限数（{source}）");
+        }
+    }
     let sum = w.sharpness + w.exposure + w.noise + w.composition + w.aesthetic;
     if (sum - 1.0).abs() > 0.05 {
         anyhow::bail!("权重之和应约为 1.0，当前为 {sum:.3}（{source}）");
     }
     // 曝光容差带必须严格嵌套，否则衰减区间宽度为 0，分数会出现断崖
     let m = &cfg.metric;
+    for (name, value) in [
+        ("sharpness_k", m.sharpness_k), ("noise_k0", m.noise_k0),
+        ("exposure_target", m.exposure_target),
+        ("exposure_ev_full_lo", m.exposure_ev_full_lo),
+        ("exposure_ev_full_hi", m.exposure_ev_full_hi),
+        ("exposure_ev_lo", m.exposure_ev_lo),
+        ("exposure_ev_hi", m.exposure_ev_hi),
+        ("exposure_subject_blend", m.exposure_subject_blend),
+        ("exposure_suggest_cap", m.exposure_suggest_cap),
+        ("star_five_pct", m.star_five_pct),
+        ("star_four_pct", m.star_four_pct),
+        ("star_three_pct", m.star_three_pct),
+        ("star_two_pct", m.star_two_pct),
+        ("rating_5", m.rating_5), ("rating_4", m.rating_4),
+        ("rating_3", m.rating_3), ("rating_2", m.rating_2),
+    ] {
+        if !value.is_finite() {
+            anyhow::bail!("参数 {name} 必须是有限数（{source}）");
+        }
+    }
+    if m.sharpness_k <= 0.0 || m.noise_k0 <= 0.0 || !(1.0..255.0).contains(&m.exposure_target) {
+        anyhow::bail!("sharpness_k/noise_k0 必须为正，exposure_target 必须在 1~254（{source}）");
+    }
     if m.exposure_ev_full_lo < 0.0 || m.exposure_ev_full_hi < 0.0 {
         anyhow::bail!("曝光满分容差不能为负（{source}）");
     }
@@ -273,7 +305,40 @@ fn validate_config(cfg: &ScoreConfig, source: &str) -> Result<()> {
             m.star_two_pct
         );
     }
+    for pct in [m.star_five_pct, m.star_four_pct, m.star_three_pct, m.star_two_pct] {
+        if !(0.0..=100.0).contains(&pct) {
+            anyhow::bail!("星级百分位必须在 0~100（{source}）");
+        }
+    }
+    if !(0.0 <= m.rating_2 && m.rating_2 <= m.rating_3
+        && m.rating_3 <= m.rating_4 && m.rating_4 <= m.rating_5 && m.rating_5 <= 100.0) {
+        anyhow::bail!("绝对星级阈值必须在 0~100 且逐级递增（{source}）");
+    }
+    let d = &cfg.dedup;
+    if !d.gap_secs.is_finite() || d.gap_secs < 0.0 || d.dhash_threshold > 64
+        || d.keep_k == 0 || !d.pose_cluster_threshold.is_finite()
+        || d.pose_cluster_threshold <= 0.0 {
+        anyhow::bail!("连拍参数无效：间隔需非负、dHash 阈值≤64、keep_k≥1、姿态阈值为正（{source}）");
+    }
     Ok(())
+}
+
+/// 缓存分析来源：像素预览与完整 AI 分析必须使用不同的键。
+/// 模型文件的大小及修改时间变化时，也必须重新推理。
+pub fn analysis_fingerprint(cfg: &ScoreConfig, with_ai: bool) -> i64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    config_fingerprint(cfg).hash(&mut h);
+    with_ai.hash(&mut h);
+    if with_ai {
+        for name in ["clipiqa_model.onnx", "clipiqa_model.onnx.data",
+            "scrfd_10g_bnkps.onnx", "yolov8n_pose.onnx"] {
+            name.hash(&mut h);
+            crate::cache::file_fingerprint(std::path::Path::new("models").join(name).as_path())
+                .hash(&mut h);
+        }
+    }
+    h.finish() as i64
 }
 
 /// 生成默认配置模板文本（供 `pic_process config-template` 输出）
@@ -511,6 +576,22 @@ mod tests {
         let mut e = ScoreConfig::default();
         e.metric.exposure_target = 130.0;
         assert_ne!(config_fingerprint(&e), fp, "改曝光目标应改变指纹");
+        assert_ne!(analysis_fingerprint(&base, false), analysis_fingerprint(&base, true),
+            "AI 与纯像素缓存不可互相命中");
+    }
+
+    #[test]
+    fn non_finite_and_out_of_range_values_are_rejected() {
+        for text in [
+            "[weights]\nsharpness=-1.0\nexposure=1.55\n",
+            "[weights]\nsharpness=nan\n",
+            "[metric]\nsharpness_k=0.0\n",
+            "[metric]\nexposure_suggest_cap=nan\n",
+            "[metric]\nstar_five_pct=200.0\nstar_four_pct=201.0\nstar_three_pct=202.0\nstar_two_pct=203.0\n",
+            "[dedup]\nkeep_k=0\n",
+        ] {
+            assert!(load_config_text(text, "test").is_err(), "意外接受: {text}");
+        }
     }
 
     /// -k 与 [dedup] 的合成：显式 -k 覆盖 keep_k，缺省用配置（V2-2 死配置修复）
