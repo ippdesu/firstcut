@@ -264,8 +264,7 @@ cargo test --locked
 - [`DESIGN.md`](DESIGN.md) — 当前设计约定、技术选型及已停止路线的历史记录
 - [`release_notes.md`](release_notes.md) — 版本说明
 - [`REVIEW.md`](REVIEW.md) — 外部评审记录与处理状态（长期累积，每轮评审追加）
-- [`P2_M0.md`](P2_M0.md) — Phase 2 环境验证清单（darktable / neural restore / lensfun 实测）
-- [`M5_REVIEW.md`](M5_REVIEW.md) — M5 调参决策历史（已落地，存档备查）
+- [`ASTRA_REVIEW.md`](ASTRA_REVIEW.md) — 本轮评审的过程、实施结果、验证和后续建议
 
 ## 方向与后续工作
 
