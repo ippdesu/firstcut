@@ -446,11 +446,11 @@ window.addEventListener("scroll", hidePhotoContextMenu, true);
 window.addEventListener("resize", hidePhotoContextMenu);
 
 // ---------- 灯箱（1:1 缩放 / 并排同步对比） ----------
-let LB = null; // {list, idx, compare, sel:Set, view:{s, ax, ay}}
+let LB = null; // {list, idx, compare, sel:Set, view:{s, ax, ay, fx, fy}}
 const lbEl = document.getElementById("lb");
 
 function openLightbox(p, list){
-  LB = { list, idx: list.indexOf(p), compare:false, sel:new Set([p.path]), view:{s:1, ax:.5, ay:.5}, detailsOpen:true };
+  LB = { list, idx: list.indexOf(p), compare:false, sel:new Set([p.path]), view:{s:1, ax:.5, ay:.5, fx:.5, fy:.5}, detailsOpen:true };
   lbEl.style.display = "flex";
   renderLB();
 }
@@ -603,45 +603,40 @@ document.getElementById("lbCompare").addEventListener("click", function(){
   renderLB();
 });
 
-// 窗格缩放/平移（单图与并排共用：共享 {s, ax, ay}，s=1 为适应窗格）
+// 窗格缩放/平移：所有窗格将同一图像相对位置 (ax, ay) 放在同一窗格相对位置 (fx, fy)。
 function bindPane(pane){
   pane.addEventListener("wheel", e=>{
     e.preventDefault();
     const img = pane.querySelector("img");
+    if(!img.naturalWidth || !img.naturalHeight) return;
+    if(pane.ox === undefined) layoutPanes();
     const rect = pane.getBoundingClientRect();
     const k = curK(pane);
-    // 光标下的图像归一化坐标
-    const ix = (e.clientX - rect.left - pane.ox) / k / img.naturalWidth;
-    const iy = (e.clientY - rect.top - pane.oy) / k / img.naturalHeight;
+    const fx = (e.clientX - rect.left) / rect.width;
+    const fy = (e.clientY - rect.top) / rect.height;
+    const ix = (e.clientX - rect.left - pane.ox) / (k * img.naturalWidth);
+    const iy = (e.clientY - rect.top - pane.oy) / (k * img.naturalHeight);
     const factor = e.deltaY < 0 ? 1.25 : 1/1.25;
-    LB.view.s = Math.min(16, Math.max(1, LB.view.s * factor));
-    // 保持光标下的点不动 → 反推新的共享锚点
-    const k2 = curK(pane);
-    pane.ox = e.clientX - rect.left - ix * k2 * img.naturalWidth;
-    pane.oy = e.clientY - rect.top - iy * k2 * img.naturalHeight;
-    LB.view.ax = (rect.width/2 - pane.ox) / (k2 * img.naturalWidth);
-    LB.view.ay = (rect.height/2 - pane.oy) / (k2 * img.naturalHeight);
+    LB.view = {s:Math.min(16, Math.max(1, LB.view.s * factor)), ax:ix, ay:iy, fx, fy};
     layoutPanes();
   }, {passive:false});
   let drag = null;
   pane.addEventListener("mousedown", e=>{
-    drag = {x:e.clientX, y:e.clientY, ox:pane.ox, oy:pane.oy};
+    drag = {x:e.clientX, y:e.clientY, ax:LB.view.ax, ay:LB.view.ay};
     pane.classList.add("dragging");
   });
   window.addEventListener("mousemove", e=>{
     if(!drag) return;
-    const k = curK(pane);
-    pane.ox = drag.ox + (e.clientX - drag.x);
-    pane.oy = drag.oy + (e.clientY - drag.y);
     const img = pane.querySelector("img");
-    LB.view.ax = (pane.getBoundingClientRect().width/2 - pane.ox) / (k * img.naturalWidth);
-    LB.view.ay = (pane.getBoundingClientRect().height/2 - pane.oy) / (k * img.naturalHeight);
+    if(!LB || !img.naturalWidth || !img.naturalHeight) return;
+    const k = curK(pane);
+    LB.view.ax = drag.ax - (e.clientX - drag.x) / (k * img.naturalWidth);
+    LB.view.ay = drag.ay - (e.clientY - drag.y) / (k * img.naturalHeight);
     layoutPanes();
   });
   window.addEventListener("mouseup", ()=>{ drag = null; pane.classList.remove("dragging"); });
   pane.addEventListener("dblclick", ()=>{
-    LB.view = {s:1, ax:.5, ay:.5};
-    document.querySelectorAll(".pane").forEach(p=>{ p.ox = undefined; p.oy = undefined; });
+    LB.view = {s:1, ax:.5, ay:.5, fx:.5, fy:.5};
     layoutPanes();
   });
 }
@@ -652,15 +647,13 @@ function curK(pane){
   return fit * LB.view.s;
 }
 function layoutPanes(){
+  if(!LB) return;
   document.querySelectorAll(".pane").forEach(pane=>{
     const img = pane.querySelector("img");
     if(!img.naturalWidth) { img.onload = layoutPanes; return; }
     const k = curK(pane);
-    if(pane.ox === undefined){
-      // 首次：以共享锚点居中
-      pane.ox = pane.clientWidth/2 - LB.view.ax * k * img.naturalWidth;
-      pane.oy = pane.clientHeight/2 - LB.view.ay * k * img.naturalHeight;
-    }
+    pane.ox = LB.view.fx * pane.clientWidth - LB.view.ax * k * img.naturalWidth;
+    pane.oy = LB.view.fy * pane.clientHeight - LB.view.ay * k * img.naturalHeight;
     img.style.transform = `translate(${pane.ox}px,${pane.oy}px) scale(${k})`;
   });
 }
