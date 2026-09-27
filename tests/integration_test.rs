@@ -228,6 +228,7 @@ fn manual_rating_survives_rescore_and_export() {
     let opts = score::ScoreJobOptions {
         output_csv: csv_path.clone(), cache_path: cache_path.clone(), no_cache: false,
         no_ai: true, xmp: true, gpu: false, keep_override: None,
+        include_raw: true, skip_processed: false,
     };
     score::run_score_job(&root, &cfg, &opts, &|_| {}).unwrap();
     pic_process::decision::set(&root, &jpg, 1).unwrap();

@@ -5,11 +5,14 @@ edition = "2021"
 description = "索尼照片初筛与本地复核工具"
 autobins = false  # 关闭 src/bin/ 的自动发现，统一由下方 [[bin]] 列表控制
 
-# 二进制名统一以 pic_process- 为前缀（main 例外），
-# 避免多个子工具与主命令混淆
+# CLI 子工具统一以 pic_process- 为前缀；firstcut-ui 是面向双击启动的 Windows UI 启动器。
 [[bin]]
 name = "pic_process"
 path = "src/main.rs"
+
+[[bin]]
+name = "firstcut-ui"
+path = "src/bin/firstcut_ui.rs"
 
 [[bin]]
 name = "pic_process-tune"
@@ -57,6 +60,9 @@ walkdir = "2"
 jpeg-decoder = "0.3"
 axum = "0.8"
 serde_json = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync"] }
 toml_edit = "0.22"
 roxmltree = "0.20"
+
+[target.'cfg(windows)'.dependencies]
+rfd = { version = "0.17.2", default-features = false }

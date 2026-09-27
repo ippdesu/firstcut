@@ -36,4 +36,4 @@ jobs:
       - name: Run tests
         run: cargo test --locked --all-targets
       - name: Build release programs
-        run: cargo build --release --locked --bin pic_process --bin pic_process-gallery --bin pic_process-tune
+        run: cargo build --release --locked --bin pic_process --bin firstcut-ui --bin pic_process-gallery --bin pic_process-tune

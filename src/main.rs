@@ -131,6 +131,8 @@ fn main() -> Result<()> {
                 xmp,
                 gpu,
                 keep_override: keep,
+                include_raw: true,
+                skip_processed: false,
             };
             score::run_score_job(&dir, &cfg, &opts, &|ev| match ev {
                 score::ScoreEvent::Info(s) => eprintln!("[score] {s}"),

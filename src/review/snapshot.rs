@@ -92,13 +92,40 @@ pub struct Snapshot {
     pub photos: Vec<PhotoJson>,
 }
 
+impl Snapshot {
+    pub fn empty(root: &Path, cfg: &ScoreConfig) -> Self {
+        Self {
+            root: root.display().to_string(),
+            weights: WeightsJson {
+                sharpness: cfg.weights.sharpness,
+                exposure: cfg.weights.exposure,
+                noise: cfg.weights.noise,
+                composition: cfg.weights.composition,
+                aesthetic: cfg.weights.aesthetic,
+            },
+            photos: Vec::new(),
+        }
+    }
+}
+
 /// 构建快照：扫描 + 打开缓存 + 按当前配置过滤命中 + 星级/连拍在线计算。
 ///
 /// 缓存打不开（文件损坏/不存在）时降级为"全部未评分"，不阻塞浏览。
 pub fn build_snapshot(root: &Path, cfg: &ScoreConfig, cache_path: &Path,
     manual_keep: &HashMap<String, bool>,
     scene_feedback: &HashMap<String, SceneFeedbackRecord>) -> anyhow::Result<Snapshot> {
-    let entries = scan::scan_directory(root)?;
+    build_snapshot_with_options(root, cfg, cache_path, manual_keep, scene_feedback, true, false,
+        &|_, _, _| {})
+}
+
+pub fn build_snapshot_with_options(root: &Path, cfg: &ScoreConfig, cache_path: &Path,
+    manual_keep: &HashMap<String, bool>,
+    scene_feedback: &HashMap<String, SceneFeedbackRecord>, include_raw: bool,
+    skip_processed: bool,
+    progress: &dyn Fn(&str, usize, usize)) -> anyhow::Result<Snapshot> {
+    let entries = scan::scan_review_directory(
+        root, &root.join(".firstcut").join("report.csv"), include_raw, skip_processed, progress)?;
+    progress("匹配评分缓存", 0, entries.len());
     let pixel_hash = crate::config::analysis_fingerprint(cfg, false);
     let ai_hash = crate::config::analysis_fingerprint(cfg, true);
     let models_available = crate::ai::ensure_models().is_ok();
@@ -109,12 +136,13 @@ pub fn build_snapshot(root: &Path, cfg: &ScoreConfig, cache_path: &Path,
     let cache = match ScoreCache::open(cache_path, pixel_hash) {
         Ok(c) => Some(c),
         Err(err) => {
-            eprintln!("[review] 警告: 缓存不可用（{err:#}），全部照片将显示为未评分");
+            super::quiet_log(format!("[review] 警告: 缓存不可用（{err:#}），全部照片将显示为未评分"));
             None
         }
     };
     if let Some(c) = &cache {
-        for e in entries.iter().filter(|e| !e.is_raw) {
+        for (index, e) in entries.iter().filter(|e| !e.is_raw).enumerate() {
+            if index % 50 == 0 { progress("匹配评分缓存", index, entries.len()); }
             let Some((size, mtime)) = cache::file_fingerprint(Path::new(&e.path)) else {
                 continue;
             };
@@ -128,6 +156,7 @@ pub fn build_snapshot(root: &Path, cfg: &ScoreConfig, cache_path: &Path,
         }
     }
 
+    progress("计算星级与连拍", 0, entries.len());
     let selection = crate::selection::build(root, &entries, &analyzed, cfg, None)?;
 
     let mut photos: Vec<PhotoJson> = entries
@@ -178,6 +207,7 @@ pub fn build_snapshot(root: &Path, cfg: &ScoreConfig, cache_path: &Path,
         })
         .collect();
     photos.sort_by(|a, b| a.path.cmp(&b.path));
+    progress("准备页面数据", entries.len(), entries.len());
 
     Ok(Snapshot {
         root: root.display().to_string(),

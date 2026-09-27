@@ -46,7 +46,7 @@ pub fn load_latest(path: &Path) -> Result<HashMap<String, SceneFeedbackRecord>> 
         if line.trim().is_empty() { continue; }
         match serde_json::from_str::<SceneFeedbackRecord>(&line) {
             Ok(record) => { latest.insert(record.photo_path.clone(), record); }
-            Err(err) => eprintln!("[review] 场景反馈第 {} 行无效，已跳过：{err}", index + 1),
+            Err(err) => super::quiet_log(format!("[review] 场景反馈第 {} 行无效，已跳过：{err}", index + 1)),
         }
     }
     Ok(latest)

@@ -16,6 +16,7 @@ pub enum JobStatus {
 #[derive(Debug)]
 struct JobInner {
     status: JobStatus,
+    stopping: bool,
     /// 最近日志（含时间不必要；截断到 200 行防万张跑批撑爆内存）
     log: Vec<String>,
 }
@@ -30,7 +31,7 @@ const LOG_CAP: usize = 200;
 impl JobState {
     pub fn new() -> Self {
         JobState {
-            inner: Mutex::new(JobInner { status: JobStatus::Idle, log: Vec::new() }),
+            inner: Mutex::new(JobInner { status: JobStatus::Idle, stopping: false, log: Vec::new() }),
         }
     }
 
@@ -45,11 +46,21 @@ impl JobState {
     /// 尝试占坑：Idle/Done/Failed 时进入 Running 并清空日志；已在跑则返回 false
     pub fn begin(&self) -> bool {
         let mut g = self.inner.lock().unwrap();
-        if matches!(g.status, JobStatus::Running { .. }) {
+        if g.stopping || matches!(g.status, JobStatus::Running { .. }) {
             return false;
         }
         g.status = JobStatus::Running { done: 0, total: 0 };
         g.log.clear();
+        true
+    }
+
+    /// 只有评分空闲时才能关闭服务；与 begin 共用锁，避免关闭与新跑批竞态。
+    pub fn begin_shutdown(&self) -> bool {
+        let mut g = self.inner.lock().unwrap();
+        if g.stopping || matches!(g.status, JobStatus::Running { .. }) {
+            return false;
+        }
+        g.stopping = true;
         true
     }
 
@@ -120,5 +131,16 @@ mod tests {
         assert_eq!(log.len(), LOG_CAP);
         assert_eq!(log.last().unwrap(), &format!("l{}", LOG_CAP + 49));
         assert_eq!(log.first().unwrap(), &"l50".to_string(), "最老的被挤出");
+    }
+
+    #[test]
+    fn shutdown_waits_for_scoring_and_blocks_new_jobs() {
+        let job = JobState::new();
+        assert!(job.begin());
+        assert!(!job.begin_shutdown());
+        job.finish("完成".into());
+        assert!(job.begin_shutdown());
+        assert!(!job.begin());
+        assert!(!job.begin_shutdown());
     }
 }

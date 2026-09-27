@@ -569,14 +569,15 @@ Kelvin→RGB 换算；降噪强度分级目视；**LR 对本轮 16bit TIFF 的�
 
 | 候选 | 结论 |
 |---|---|
-| **axum + 浏览器**（选定） | 纯 cargo、零 npm 工具链、单 exe 交付不变；图片密集体验是浏览器主场；HTML/JS 对 AI 协作开发最友好；HTTP API 将来可平移进 Tauri |
-| Tauri 2（Rust+WebView2） | 若将来要"双击即开的桌面壳"再包一层（前端资产可复用）；本轮为它引入 Node 工具链不值得 |
+| **axum + 浏览器**（选定） | 纯 cargo、零 npm 工具链；图片密集体验是浏览器主场；HTML/JS 对 AI 协作开发最友好；HTTP API 将来可平移进 Tauri |
+| **Windows 原生选目录启动器** | 已实现为 `firstcut-ui.exe`：双击弹出目录选择器，先启动 axum 与浏览器，再异步构建快照；页面显示扫描阶段和文件计数，并可随时换目录、切换 JPG/RAW 关联。未命中评分可选择原评分目录或继续未评分浏览。复核页面提供重启服务/退出程序入口，评分期间拒绝关闭；再次双击可找回仍在运行的页面。启动器会从 exe 邻近目录定位模型，避免工作目录变化导致 AI 缓存指纹失效；扫描根目录使用缓存兼容的普通 Windows 绝对路径，避免 `\\?\` 前缀造成静默缓存未命中。保留 CLI 主程序，不引入 WebView 或 Node 工具链 |
+| Tauri 2（Rust+WebView2） | 当前不需要桌面壳；前端资产仍可在未来复用 |
 | egui / Slint | 立即模式/声明式 GUI 做大图缩略图墙+自由缩放对比的开发成本高，弃 |
 | Dioxus | Rust 写 UI心智成本高，生态不如直接写 JS，弃 |
 
 ### 12.2 M-UI1 已实现范围（复核视图）
 
-- **形态**：`pic_process review <目录> [--config x.toml] [--cache x.sqlite] [--port 8787]` → 本地服务（绑 127.0.0.1）+ 自动开浏览器。
+- **形态**：CLI `pic_process review <目录> [--config x.toml] [--cache x.sqlite] [--port 8787]`，或 Windows 双击 `firstcut-ui.exe` 选择目录；两者都启动仅绑定 127.0.0.1 的本地服务并自动开浏览器。图像位于 `JPG/`、`RAW/` 子目录时应选择它们的共同上级目录。UI 可随时重新选目录；RAW 关联是每个照片根目录单独保存的偏好，关闭后扫描和跑批均只处理 JPG。UI 默认跳过所选根目录下的 `Processed/` 输出子树；需要复核成片时可直接选择该目录。CLI 扫描行为保持原样。
 - **数据流**：不依赖 CSV——`scan_directory` + 按当前配置指纹过滤缓存行 → 内存快照；**星级/连拍信息在启动时用当前配置现算**（与 `score` 同一函数，保证逐张一致）；缓存未命中的照片显示"未评分"。
 - **API**：`GET /`（内嵌前端）、`GET /api/photos`（JSON 快照）、`GET /thumb?p=`（320px 缩略图，按需生成落盘 `<照片根>/.firstcut/thumbs/`，已存在按 size+mtime 跳过）、`GET /image?p=`（原图直读，100% 预览零预生成成本）。
 - **安全**：仅 127.0.0.1；所有 `p` 参数 canonicalize 后强制在扫描根目录内（越界 403）；扩展名白名单。

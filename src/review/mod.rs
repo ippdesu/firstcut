@@ -13,7 +13,8 @@ pub mod thumb;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
 use anyhow::Result;
 use axum::extract::{Query, State};
@@ -21,7 +22,8 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{AppendHeaders, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use tokio::sync::Notify;
 
 use crate::config::ScoreConfig;
 use crate::review::job::{JobState, JobStatus};
@@ -30,6 +32,61 @@ use snapshot::Snapshot;
 
 /// 内嵌前端（单文件 HTML，内联 CSS/JS）
 const INDEX_HTML: &[u8] = include_bytes!("assets/index.html");
+
+static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum UiAction {
+    Exit,
+    Restart,
+    Choose,
+    Rawon,
+    Rawoff,
+}
+
+#[derive(Clone, Serialize)]
+struct LoadProgress {
+    phase: String,
+    done: usize,
+    total: usize,
+}
+
+#[derive(Deserialize, Serialize)]
+struct UiPreferences { include_raw: bool }
+
+fn load_ui_preferences(root: &Path) -> bool {
+    std::fs::read(root.join(".firstcut/ui-preferences.json"))
+        .ok().and_then(|bytes| serde_json::from_slice::<UiPreferences>(&bytes).ok())
+        .map(|prefs| prefs.include_raw).unwrap_or(true)
+}
+
+fn save_ui_preferences(root: &Path, include_raw: bool) -> Result<()> {
+    std::fs::write(root.join(".firstcut/ui-preferences.json"),
+        serde_json::to_vec_pretty(&UiPreferences { include_raw })?)?;
+    Ok(())
+}
+
+/// Windows 的 `canonicalize` 会加上 `\\?\`，与原有缓存中的普通绝对路径不相等。
+pub fn normal_photo_root(root: &Path) -> Result<PathBuf> {
+    let absolute = root.canonicalize()?;
+    #[cfg(windows)] {
+        let value = absolute.to_string_lossy();
+        if let Some(rest) = value.strip_prefix(r"\\?\UNC\") {
+            return Ok(PathBuf::from(format!(r"\\{}", rest)));
+        }
+        if let Some(rest) = value.strip_prefix(r"\\?\") {
+            return Ok(PathBuf::from(rest));
+        }
+    }
+    Ok(absolute)
+}
+
+struct UiControl {
+    action: Mutex<Option<UiAction>>,
+    notify: Notify,
+    session_id: u64,
+}
 
 pub struct AppState {
     root: PathBuf,
@@ -45,8 +102,13 @@ pub struct AppState {
     port: u16,
     /// 当前快照；跑批完成后热替换
     snapshot: RwLock<Snapshot>,
+    loading: AtomicBool,
+    load_error: Mutex<Option<String>>,
+    load_progress: Mutex<LoadProgress>,
+    include_raw: bool,
     /// 全局单评分任务
     job: Arc<JobState>,
+    control: Option<Arc<UiControl>>,
 }
 
 /// 构建快照并启动服务（阻塞直到服务退出/出错）。
@@ -60,23 +122,71 @@ pub fn serve(
     open_browser: bool,
     config_path: Option<&Path>,
 ) -> Result<()> {
-    eprintln!("[review] 正在构建快照（扫描 + 缓存）……");
+    serve_once(root, cfg, cache_path, port, open_browser, config_path, false, true)?;
+    Ok(())
+}
+
+/// Windows 双击启动器：在同一进程中重启服务，退出时正常释放端口。
+pub fn serve_ui(root: &Path, pick_root: impl Fn() -> Option<PathBuf>) -> Result<()> {
+    let mut root = normal_photo_root(root)?;
+    let mut open_browser = true;
+    loop {
+        let state_dir = root.join(".firstcut");
+        std::fs::create_dir_all(&state_dir)?;
+        let cache_path = state_dir.join("cache.sqlite");
+        let config_path = root.join(".firstcut").join("config.toml");
+        let config = if config_path.exists() {
+            crate::config::load_config(&config_path)?
+        } else {
+            ScoreConfig::default()
+        };
+        let include_raw = load_ui_preferences(&root);
+        match serve_once(&root, &config, &cache_path, 8787, open_browser, None, true, include_raw)? {
+            Some(UiAction::Restart) => open_browser = false,
+            Some(UiAction::Choose) => {
+                if let Some(next) = pick_root() {
+                    root = normal_photo_root(&next)?;
+                }
+                open_browser = false;
+            }
+            Some(UiAction::Rawon) => { save_ui_preferences(&root, true)?; open_browser = false; }
+            Some(UiAction::Rawoff) => { save_ui_preferences(&root, false)?; open_browser = false; }
+            _ => return Ok(()),
+        }
+    }
+}
+
+fn serve_once(
+    root: &Path,
+    cfg: &ScoreConfig,
+    cache_path: &Path,
+    port: u16,
+    open_browser: bool,
+    config_path: Option<&Path>,
+    ui_control: bool,
+    include_raw: bool,
+) -> Result<Option<UiAction>> {
     let burst_overrides_path = root.join(".firstcut").join("burst-overrides.json");
     let burst_overrides = load_burst_overrides(&burst_overrides_path);
     let scene_feedback_path = scene_feedback::store_path(root);
     let feedback = scene_feedback::load_latest(&scene_feedback_path)?;
-    let snapshot = snapshot::build_snapshot(root, cfg, cache_path, &burst_overrides, &feedback)?;
-    let scored = snapshot.photos.iter().filter(|p| p.scores.is_some()).count();
-    eprintln!(
-        "[review] 快照就绪：{} 张照片（已评分 {}，未评分 {}）",
-        snapshot.photos.len(),
-        scored,
-        snapshot.photos.len() - scored
-    );
+    let initial_snapshot = if ui_control {
+        Snapshot::empty(root, cfg)
+    } else {
+        build_review_snapshot(root, cfg, cache_path, &burst_overrides, &feedback,
+            include_raw, false, &|_, _, _| {})?
+    };
+    let load_overrides = burst_overrides.clone();
+    let load_feedback = feedback.clone();
 
     let config_explicit = config_path.is_some();
     let config_path = config_path.map(|p| p.to_path_buf())
         .unwrap_or_else(|| root.join(".firstcut").join("config.toml"));
+    let control = ui_control.then(|| Arc::new(UiControl {
+        action: Mutex::new(None),
+        notify: Notify::new(),
+        session_id: NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed),
+    }));
     let state = Arc::new(AppState {
         root: root.to_path_buf(),
         cache_path: cache_path.to_path_buf(),
@@ -87,14 +197,27 @@ pub fn serve(
         scene_feedback: RwLock::new(feedback),
         scene_feedback_path,
         port,
-        snapshot: RwLock::new(snapshot),
+        snapshot: RwLock::new(initial_snapshot),
+        loading: AtomicBool::new(ui_control),
+        load_error: Mutex::new(None),
+        load_progress: Mutex::new(LoadProgress {
+            phase: "准备读取照片".into(), done: 0, total: 0,
+        }),
+        include_raw,
         job: Arc::new(JobState::new()),
+        control: control.clone(),
     });
+    let load_state = Arc::clone(&state);
+    let load_root = root.to_path_buf();
+    let load_cfg = cfg.clone();
+    let load_cache = cache_path.to_path_buf();
+    let shutdown_control = control.clone();
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     runtime.block_on(async move {
         let app = Router::new()
             .route("/", get(index))
             .route("/api/photos", get(photos))
+            .route("/api/load", get(load_status))
             .route("/thumb", get(thumb))
             .route("/image", get(image))
             .route("/api/job", get(job_status))
@@ -103,28 +226,92 @@ pub fn serve(
             .route("/api/burst/keep", post(burst_keep))
             .route("/api/scene-feedback", post(scene_feedback_save))
             .route("/api/config", get(config_get).post(config_save))
+            .route("/api/control", get(control_status).post(control_post))
             .with_state(state);
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
+        if ui_control {
+            std::thread::spawn(move || {
+                let on_progress = |phase: &str, done: usize, total: usize| {
+                    *load_state.load_progress.lock().unwrap() = LoadProgress {
+                        phase: phase.into(), done, total,
+                    };
+                };
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    build_review_snapshot(&load_root, &load_cfg, &load_cache,
+                        &load_overrides, &load_feedback, include_raw, true, &on_progress)
+                }));
+                match result {
+                    Ok(Ok(snapshot)) => *load_state.snapshot.write().unwrap() = snapshot,
+                    Ok(Err(err)) => *load_state.load_error.lock().unwrap() = Some(format!("{err:#}")),
+                    Err(_) => *load_state.load_error.lock().unwrap() =
+                        Some("读取照片时发生内部错误；请重新选择目录或重启服务。".into()),
+                }
+                load_state.loading.store(false, Ordering::Release);
+            });
+        }
         let url = format!("http://127.0.0.1:{port}/");
-        eprintln!("[review] 就绪: {url}（Ctrl+C 退出）");
+        if ui_control {
+            quiet_log(format!("[review] 就绪: {url}（页面右上角退出）"));
+        } else {
+            quiet_log(format!("[review] 就绪: {url}（Ctrl+C 退出）"));
+        }
         if open_browser {
             // Windows：start 的第一个引号参数是窗口标题，占位空串
             let _ = std::process::Command::new("cmd").args(["/C", "start", "", &url]).spawn();
         }
-        axum::serve(listener, app).await
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                if let Some(control) = shutdown_control {
+                    control.notify.notified().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            })
+            .await
     })?;
-    Ok(())
+    Ok(control.and_then(|control| control.action.lock().unwrap().take()))
+}
+
+fn build_review_snapshot(
+    root: &Path, cfg: &ScoreConfig, cache_path: &Path,
+    overrides: &HashMap<String, bool>,
+    feedback: &HashMap<String, SceneFeedbackRecord>,
+    include_raw: bool,
+    skip_processed: bool,
+    progress: &dyn Fn(&str, usize, usize),
+) -> Result<Snapshot> {
+    quiet_log("[review] 正在构建快照（扫描 + 缓存）……");
+    let snapshot = snapshot::build_snapshot_with_options(root, cfg, cache_path,
+        overrides, feedback, include_raw, skip_processed, progress)?;
+    let scored = snapshot.photos.iter().filter(|p| p.scores.is_some()).count();
+    quiet_log(format!("[review] 快照就绪：{} 张照片（已评分 {}，未评分 {}）",
+        snapshot.photos.len(), scored, snapshot.photos.len() - scored));
+    Ok(snapshot)
+}
+
+fn quiet_log(message: impl AsRef<str>) {
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr(), "{}", message.as_ref());
 }
 
 async fn index() -> Response {
     (
-        AppendHeaders([(header::CONTENT_TYPE, "text/html; charset=utf-8")]),
+        AppendHeaders([
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+        ]),
         INDEX_HTML,
     )
         .into_response()
 }
 
 async fn photos(State(state): State<Arc<AppState>>) -> Response {
+    if state.loading.load(Ordering::Acquire) {
+        return (StatusCode::SERVICE_UNAVAILABLE, "正在读取照片和评分").into_response();
+    }
+    if let Some(error) = state.load_error.lock().unwrap().as_ref() {
+        return (StatusCode::INTERNAL_SERVER_ERROR, error.clone()).into_response();
+    }
     let guard = state.snapshot.read().unwrap();
     match serde_json::to_vec(&*guard) {
         Ok(bytes) => (
@@ -184,6 +371,48 @@ async fn job_status(State(state): State<Arc<AppState>>) -> Response {
     json_response(body)
 }
 
+async fn load_status(State(state): State<Arc<AppState>>) -> Response {
+    let progress = state.load_progress.lock().unwrap().clone();
+    let error = state.load_error.lock().unwrap().clone();
+    json_response(serde_json::json!({
+        "loading": state.loading.load(Ordering::Acquire),
+        "phase": progress.phase, "done": progress.done, "total": progress.total,
+        "error": error,
+    }))
+}
+
+async fn control_status(State(state): State<Arc<AppState>>) -> Response {
+    json_response(match &state.control {
+        Some(control) => serde_json::json!({ "enabled": true, "session": control.session_id,
+            "include_raw": state.include_raw }),
+        None => serde_json::json!({ "enabled": false }),
+    })
+}
+
+#[derive(Deserialize)]
+struct ControlRequest {
+    action: UiAction,
+}
+
+async fn control_post(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::Json(request): axum::Json<ControlRequest>,
+) -> Response {
+    if !valid_local_host(&headers, state.port) || !valid_control_origin(&headers, state.port) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let Some(control) = &state.control else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if !state.job.begin_shutdown() {
+        return (StatusCode::CONFLICT, "评分正在运行或服务已在关闭，请稍后再试").into_response();
+    }
+    *control.action.lock().unwrap() = Some(request.action);
+    control.notify.notify_one();
+    json_response(serde_json::json!({ "ok": true }))
+}
+
 #[derive(Deserialize)]
 struct ScoreRunParams {
     /// 跑批后写 XMP 星级侧车
@@ -198,6 +427,9 @@ struct ScoreRunParams {
 async fn score_run(State(state): State<Arc<AppState>>, headers: HeaderMap,
     body: Option<axum::Json<ScoreRunParams>>) -> Response {
     if !valid_local_host(&headers, state.port) { return StatusCode::FORBIDDEN.into_response(); }
+    if state.loading.load(Ordering::Acquire) {
+        return (StatusCode::CONFLICT, "照片仍在加载，请稍后再评分").into_response();
+    }
     let params = body.map(|axum::Json(p)| p).unwrap_or(ScoreRunParams { xmp: false, no_ai: false });
     if !state.job.begin() {
         return (
@@ -250,6 +482,8 @@ async fn score_run(State(state): State<Arc<AppState>>, headers: HeaderMap,
             xmp,
             gpu: false,
             keep_override: None,
+            include_raw: st.include_raw,
+            skip_processed: st.control.is_some(),
         };
         if let Some(parent) = opts.output_csv.parent() {
             if let Err(err) = std::fs::create_dir_all(parent) {
@@ -268,7 +502,8 @@ async fn score_run(State(state): State<Arc<AppState>>, headers: HeaderMap,
                 // 快照热替换：新分数立即可见，无需重启服务
                 let overrides = st.burst_overrides.read().unwrap().clone();
                 let feedback = st.scene_feedback.read().unwrap().clone();
-                match snapshot::build_snapshot(&root, &cfg, &cache_path, &overrides, &feedback) {
+                match snapshot::build_snapshot_with_options(&root, &cfg, &cache_path,
+                    &overrides, &feedback, st.include_raw, st.control.is_some(), &|_, _, _| {}) {
                     Ok(snap) => {
                         *st.snapshot.write().unwrap() = snap;
                         job.log("[review] 快照已刷新");
@@ -604,9 +839,79 @@ fn valid_local_host(headers: &HeaderMap, port: u16) -> bool {
             || host.eq_ignore_ascii_case(&expected_name))
 }
 
+fn valid_control_origin(headers: &HeaderMap, port: u16) -> bool {
+    if !valid_local_host(headers, port) {
+        return false;
+    }
+    let Some(host) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    let expected = format!("http://{host}");
+    headers.get(header::ORIGIN).and_then(|v| v.to_str().ok())
+        .is_some_and(|origin| origin.eq_ignore_ascii_case(&expected))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn photo_root_uses_cache_compatible_windows_path() {
+        let root = std::env::temp_dir().join(format!("firstcut_path_identity_{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let selected = normal_photo_root(&root).unwrap();
+        assert!(!selected.to_string_lossy().starts_with(r"\\?\"));
+        assert_eq!(selected, root);
+        let verbatim = root.canonicalize().unwrap();
+        assert_eq!(normal_photo_root(&verbatim).unwrap(), selected);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn ui_control_checks_origin_and_waits_for_scoring() {
+        let control = Arc::new(UiControl {
+            action: Mutex::new(None), notify: Notify::new(), session_id: 1,
+        });
+        let state = Arc::new(AppState {
+            root: PathBuf::new(), cache_path: PathBuf::new(), config_path: PathBuf::new(),
+            config_explicit: false, burst_overrides: RwLock::new(HashMap::new()),
+            burst_overrides_path: PathBuf::new(), scene_feedback: RwLock::new(HashMap::new()),
+            scene_feedback_path: PathBuf::new(), port: 8787,
+            snapshot: RwLock::new(Snapshot {
+                root: String::new(), weights: snapshot::WeightsJson {
+                    sharpness: 0.3, exposure: 0.25, noise: 0.15,
+                    composition: 0.15, aesthetic: 0.15,
+                }, photos: vec![],
+            }),
+            loading: AtomicBool::new(false), load_error: Mutex::new(None),
+            load_progress: Mutex::new(LoadProgress { phase: String::new(), done: 0, total: 0 }),
+            include_raw: true,
+            job: Arc::new(JobState::new()), control: Some(Arc::clone(&control)),
+        });
+        state.loading.store(true, Ordering::Release);
+        assert_eq!(photos(State(Arc::clone(&state))).await.status(), StatusCode::SERVICE_UNAVAILABLE);
+        state.loading.store(false, Ordering::Release);
+        assert_eq!(photos(State(Arc::clone(&state))).await.status(), StatusCode::OK);
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "127.0.0.1:8787".parse().unwrap());
+        headers.insert(header::ORIGIN, "http://untrusted.example".parse().unwrap());
+        let response = control_post(State(Arc::clone(&state)), headers.clone(),
+            axum::Json(ControlRequest { action: UiAction::Exit })).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(control.action.lock().unwrap().is_none());
+
+        headers.insert(header::ORIGIN, "http://127.0.0.1:8787".parse().unwrap());
+        assert!(state.job.begin());
+        let response = control_post(State(Arc::clone(&state)), headers.clone(),
+            axum::Json(ControlRequest { action: UiAction::Exit })).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        state.job.finish("完成".into());
+        let response = control_post(State(state), headers,
+            axum::Json(ControlRequest { action: UiAction::Restart })).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(*control.action.lock().unwrap(), Some(UiAction::Restart));
+    }
 
     #[tokio::test]
     async fn jpeg_whitelist_blocks_arw() {
@@ -629,6 +934,10 @@ mod tests {
                 weights: snapshot::WeightsJson { sharpness: 0.3, exposure: 0.25, noise: 0.15,
                     composition: 0.15, aesthetic: 0.15 }, photos: vec![] }),
             job: Arc::new(JobState::new()),
+            loading: AtomicBool::new(false), load_error: Mutex::new(None),
+            load_progress: Mutex::new(LoadProgress { phase: String::new(), done: 0, total: 0 }),
+            include_raw: true,
+            control: None,
         };
         let ok = resolve_jpeg(&state, "d/a.jpg");
         assert!(ok.is_ok(), "jpg 应放行");
@@ -664,6 +973,10 @@ mod tests {
                 weights: snapshot::WeightsJson { sharpness: 0.3, exposure: 0.25, noise: 0.15,
                     composition: 0.15, aesthetic: 0.15 }, photos: vec![photo] }),
             job: Arc::new(JobState::new()),
+            loading: AtomicBool::new(false), load_error: Mutex::new(None),
+            load_progress: Mutex::new(LoadProgress { phase: String::new(), done: 0, total: 0 }),
+            include_raw: true,
+            control: None,
         });
         let mut headers = HeaderMap::new();
         headers.insert(header::HOST, "127.0.0.1:8787".parse().unwrap());
@@ -718,6 +1031,10 @@ mod tests {
                 weights: snapshot::WeightsJson { sharpness: 0.3, exposure: 0.25, noise: 0.15,
                     composition: 0.15, aesthetic: 0.15 }, photos: vec![photo] }),
             job: Arc::new(JobState::new()),
+            loading: AtomicBool::new(false), load_error: Mutex::new(None),
+            load_progress: Mutex::new(LoadProgress { phase: String::new(), done: 0, total: 0 }),
+            include_raw: true,
+            control: None,
         });
         let mut headers = HeaderMap::new();
         headers.insert(header::HOST, "127.0.0.1:8787".parse().unwrap());

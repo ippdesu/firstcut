@@ -20,6 +20,7 @@ cargo build --release --features gpu
 | 二进制 | 用途 |
 |---|---|
 | `pic_process` | 主命令（`scan` / `score` / `config-template` / `review`） |
+| `firstcut-ui` | Windows 无控制台启动器：双击选目录，自动启动本地复核 UI；页面内可重启或退出服务 |
 | `pic_process-tune` | 调参工具：导出原始指标 CSV |
 | `pic_process-gallery` | HTML 联系表生成器（缩略图 + 分数） |
 | `pic_process-debug-pose` | 诊断工具：YOLOv8-pose 检测验证 |
@@ -30,9 +31,19 @@ cargo build --release --features gpu
 > `pic_process.exe` 主二进制已静态链接 onnxruntime，单文件免 DLL；
 > 辅助二进制也随 release 一同构建，可按需取用。
 
+### 双击启动复核 UI（Windows）
+
+运行发行包里的 `firstcut-ui.exe`，在目录窗口中选择照片根目录后会自动启动本地服务并打开浏览器。若 JPG 和 RAW 分放在 `JPG/`、`RAW/` 子目录，请选择同时包含这两个目录的活动根目录；只有 JPG 时可直接选择 JPG 目录。复核 UI 会递归扫描所选目录，但默认跳过其中名为 `Processed/` 的输出子目录；若要看成片，可直接选择 `Processed/` 本身。放在活动根目录顶层的 JPG 无法与原片自动区分，也会进入列表，建议把成片放进 `Processed/`。取消选目录会直接退出。侧栏的“选择照片目录…”可随时换目录；“关联同名 RAW 照片”开关可决定是否载入 RAW、把 JPG 分数映射到 RAW 并在评分或改星时写其 XMP 侧车。关闭后只处理 JPG，该偏好保存在所选根目录的 `.firstcut/ui-preferences.json`；CLI 默认仍关联 RAW。启动器使用所选根目录下的 `.firstcut/config.toml` 和 `.firstcut/cache.sqlite`；首次评分可在 UI 侧栏点击“重新评分”。
+
+浏览器会在启动后立即显示实际扫描阶段、已发现或已读取文件数，以及有总数时的进度条；完成后自动切换照片列表。若目录已有 `.firstcut/report.csv`，复核会复用其中未变照片的 EXIF 元数据来加快扫描，评分仍以 `cache.sqlite` 中的文件指纹和分析记录为准。Windows 启动器把系统返回的 `\\?\` 路径规范化为缓存中的普通绝对路径，以免同一目录被误判为不同目录。未找到可用评分时，页面会提示重新选择之前评分的照片目录，或继续按未评分照片浏览。启动器会从可执行文件所在目录及其上级目录寻找 `models/`，因此在项目内双击 `target/release/firstcut-ui.exe` 也能命中原有 AI 评分缓存。GitHub Release 不包含模型文件；独立使用发行包时，请把模型放在可执行文件同级的 `models/` 目录。
+
+页面右上角的“重启服务”会重新读取配置与照片快照，“退出程序”会关闭本地服务并释放 8787 端口。评分运行时这两项操作会被拒绝，需等评分完成。仅关闭浏览器标签页不会停止服务；再次双击 `firstcut-ui.exe` 会重新打开仍在运行的页面。CLI 的 `review` 模式继续使用终端里的 Ctrl+C 退出。
+
+命令行用户继续运行 `pic_process review <照片目录>`，原有 CLI 流程保持不变。
+
 ## 自动检查与发布
 
-GitHub Actions 的 [CI 工作流](.github/workflows/ci.yml) 在提交到 `main`、向 `main` 提交 PR 时运行 Windows 测试和发行构建，也可手动运行。[Release 工作流](.github/workflows/release.yml) 在推送版本标签时重新测试、构建三个发行程序，生成 SHA-256 校验文件并创建 GitHub Release。手动运行 Release 工作流只构建并保存 14 天的临时工件，不会发布新版本。
+GitHub Actions 的 [CI 工作流](.github/workflows/ci.yml) 在提交到 `main`、向 `main` 提交 PR 时运行 Windows 测试和发行构建，也可手动运行。[Release 工作流](.github/workflows/release.yml) 在推送版本标签时重新测试、构建发行程序，生成 SHA-256 校验文件并创建 GitHub Release。手动运行 Release 工作流只构建并保存 14 天的临时工件，不会发布新版本。
 
 发布新版本时，先将 `Cargo.toml` 中的版本号和 `Cargo.lock` 更新并合入 `main`，确认 CI 通过，然后推送对应标签。例如 `1.3.0` 使用 `v1.3` 或 `v1.3.0`。发布任务会核对标签与版本号，GitHub 自动生成发行说明。`v1.2` 是此前手动发布的版本；这套自动流程从下一个标签开始使用。模型文件和本地照片不会进入发行包。
 

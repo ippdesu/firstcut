@@ -405,6 +405,10 @@ pub struct ScoreJobOptions {
     pub gpu: bool,
     /// CLI `-k` 显式覆盖（None = 用 `[dedup] keep_k` 配置）
     pub keep_override: Option<usize>,
+    /// UI 可关闭 RAW 关联；CLI 默认开启。
+    pub include_raw: bool,
+    /// UI 选择活动根目录时忽略其中的 Processed/ 输出子树。
+    pub skip_processed: bool,
 }
 
 /// 跑批事件（CLI 转成 stderr 行，review 转成进度状态）
@@ -447,7 +451,7 @@ pub fn run_score_job(
         "发现文件中…（目录 {}）",
         dir.display()
     )));
-    let mut entries = scan::scan_directory(dir)?;
+    let mut entries = scan::scan_directory_with_options(dir, opts.include_raw, opts.skip_processed)?;
     on_event(ScoreEvent::Info(format!("发现 {} 个文件（JPG/ARW）", entries.len())));
 
     // AI 引擎（加载失败降级为纯像素评分，不中断）

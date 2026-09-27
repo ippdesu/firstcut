@@ -7,10 +7,10 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// 单张照片的索引条目（CSV 行）
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct PhotoEntry {
     pub path: String,
     pub filename: String,
@@ -21,7 +21,7 @@ pub struct PhotoEntry {
     /// 配对/索引键：同一张照片的 JPG/ARW 共享同一个值。
     /// 同目录配对为 `目录|主干`；无歧义的跨目录配对为 `cross|目录|主干`。
     /// 不写进 CSV（仅内部使用）。
-    #[serde(skip_serializing)]
+    #[serde(skip)]
     pub pair_id: String,
     pub date_time_original: String,
     pub camera_make: String,
@@ -127,8 +127,49 @@ const CACHE_DIR_NAME: &str = ".firstcut";
 
 /// 递归扫描目录，返回排序后的照片索引
 pub fn scan_directory(dir: &Path) -> Result<Vec<PhotoEntry>> {
+    scan_directory_inner(dir, None, true, false, &|_, _, _| {})
+}
+
+/// 复核启动可沿用最近报告中的 EXIF；照片在报告之后被修改时仍重新读取。
+pub fn scan_directory_with_exif_cache(dir: &Path, report: &Path) -> Result<Vec<PhotoEntry>> {
+    scan_directory_inner(dir, load_report_exif(report), true, false, &|_, _, _| {})
+}
+
+/// 复核界面专用：可关闭 RAW 关联，并报告真实扫描阶段和文件进度。
+pub fn scan_review_directory(
+    dir: &Path, report: &Path, include_raw: bool, skip_processed: bool,
+    progress: &dyn Fn(&str, usize, usize),
+) -> Result<Vec<PhotoEntry>> {
+    progress("读取已有报告", 0, 0);
+    scan_directory_inner(dir, load_report_exif(report), include_raw, skip_processed, progress)
+}
+
+/// 评分跑批可复用相同的照片范围；CLI 默认仍扫描 JPG 与 RAW。
+pub fn scan_directory_with_options(dir: &Path, include_raw: bool, skip_processed: bool) -> Result<Vec<PhotoEntry>> {
+    scan_directory_inner(dir, None, include_raw, skip_processed, &|_, _, _| {})
+}
+
+fn load_report_exif(report: &Path) -> Option<(std::time::SystemTime, HashMap<String, PhotoEntry>)> {
+    let report_time = report.metadata().ok()?.modified().ok()?;
+    let mut reader = csv::Reader::from_path(report).ok()?;
+    let mut rows = HashMap::new();
+    for row in reader.deserialize::<PhotoEntry>() {
+        let row = row.ok()?;
+        rows.insert(row.path.clone(), row);
+    }
+    Some((report_time, rows))
+}
+
+fn scan_directory_inner(
+    dir: &Path,
+    exif_cache: Option<(std::time::SystemTime, HashMap<String, PhotoEntry>)>,
+    include_raw: bool,
+    skip_processed: bool,
+    progress: &dyn Fn(&str, usize, usize),
+) -> Result<Vec<PhotoEntry>> {
     let mut files: Vec<PathBuf> = Vec::new();
     let mut walker = walkdir::WalkDir::new(dir).follow_links(false).into_iter();
+    progress("查找照片文件", 0, 0);
     while let Some(entry) = walker.next() {
         let entry = entry?;
         if entry.file_type().is_dir() && entry.file_name().to_string_lossy() == CACHE_DIR_NAME {
@@ -136,14 +177,21 @@ pub fn scan_directory(dir: &Path) -> Result<Vec<PhotoEntry>> {
             walker.skip_current_dir();
             continue;
         }
+        if skip_processed && entry.depth() > 0 && entry.file_type().is_dir()
+            && entry.file_name().to_string_lossy().eq_ignore_ascii_case("Processed") {
+            walker.skip_current_dir();
+            continue;
+        }
         if entry.file_type().is_file() {
             let name = entry.file_name().to_string_lossy().to_string();
-            if is_supported_file(&name) {
+            if is_supported_file(&name) && (include_raw || !is_raw_file(&name)) {
                 files.push(entry.path().to_path_buf());
+                if files.len() % 100 == 0 { progress("查找照片文件", files.len(), 0); }
             }
         }
     }
     files.sort();
+    progress("读取照片元数据", 0, files.len());
 
     // ---- 配对解析（两步：同目录优先，无歧义时跨目录兜底）----
     //
@@ -186,8 +234,27 @@ pub fn scan_directory(dir: &Path) -> Result<Vec<PhotoEntry>> {
     let entries = infos
         .iter()
         .zip(resolved.iter())
-        .map(|(f, (pair_id, paired))| {
-            let exif = read_exif(&f.path);
+        .enumerate()
+        .map(|(index, (f, (pair_id, paired)))| {
+            let exif = exif_cache.as_ref().and_then(|(report_time, rows)| {
+                let modified = f.path.metadata().ok()?.modified().ok()?;
+                if modified > *report_time { return None; }
+                let old = rows.get(&f.path.display().to_string())?;
+                Some(PhotoEntry {
+                    date_time_original: old.date_time_original.clone(),
+                    camera_make: old.camera_make.clone(),
+                    camera_model: old.camera_model.clone(),
+                    lens_model: old.lens_model.clone(),
+                    iso: old.iso.clone(),
+                    f_number: old.f_number.clone(),
+                    shutter_speed: old.shutter_speed.clone(),
+                    focal_length: old.focal_length.clone(),
+                    ..Default::default()
+                })
+            }).unwrap_or_else(|| read_exif(&f.path));
+            if (index + 1) % 25 == 0 || index + 1 == infos.len() {
+                progress("读取照片元数据", index + 1, infos.len());
+            }
             PhotoEntry {
                 path: f.path.display().to_string(),
                 filename: f.name.clone(),
@@ -356,5 +423,54 @@ mod tests {
         assert_eq!(stem_raw_of("DSC00001.ARW"), "DSC00001");
         assert_eq!(stem_of("DSC00001.ARW"), "dsc00001");
         assert_eq!(stem_raw_of("noext"), "noext");
+    }
+
+    #[test]
+    fn review_reuses_recent_report_exif() {
+        let dir = std::env::temp_dir().join(format!("firstcut_exif_cache_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let jpg = dir.join("a.jpg");
+        std::fs::write(&jpg, b"not a real jpeg").unwrap();
+        let report = dir.join("report.csv");
+        let mut writer = csv::Writer::from_path(&report).unwrap();
+        writer.serialize(PhotoEntry {
+            path: jpg.display().to_string(), filename: "a.jpg".into(),
+            extension: "jpg".into(), date_time_original: "2025:08:28 10:00:00".into(),
+            ..Default::default()
+        }).unwrap();
+        writer.flush().unwrap();
+
+        let entries = scan_directory_with_exif_cache(&dir, &report).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].date_time_original, "2025:08:28 10:00:00");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn review_can_disable_raw_pairing_and_reports_progress() {
+        let dir = std::env::temp_dir().join(format!("firstcut_raw_option_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("JPG")).unwrap();
+        std::fs::create_dir_all(dir.join("RAW")).unwrap();
+        std::fs::create_dir_all(dir.join("Processed")).unwrap();
+        std::fs::write(dir.join("JPG/a.jpg"), b"jpg").unwrap();
+        std::fs::write(dir.join("RAW/a.ARW"), b"raw").unwrap();
+        std::fs::write(dir.join("Processed/export.jpg"), b"jpg").unwrap();
+        let stages = std::sync::Mutex::new(Vec::new());
+        let progress = |phase: &str, done, total| {
+            stages.lock().unwrap().push((phase.to_string(), done, total));
+        };
+        let jpg_only = scan_review_directory(&dir, &dir.join("none.csv"), false, true, &progress).unwrap();
+        assert_eq!(jpg_only.len(), 1);
+        assert!(!jpg_only[0].has_pair);
+        assert!(stages.lock().unwrap().iter().any(|(phase, done, total)|
+            phase == "读取照片元数据" && *done == 1 && *total == 1));
+        let paired = scan_review_directory(&dir, &dir.join("none.csv"), true, true, &progress).unwrap();
+        assert_eq!(paired.len(), 2);
+        assert!(paired.iter().all(|entry| entry.has_pair));
+        let with_outputs = scan_review_directory(&dir, &dir.join("none.csv"), true, false, &progress).unwrap();
+        assert_eq!(with_outputs.len(), 3);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

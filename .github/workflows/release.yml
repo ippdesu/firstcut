@@ -44,12 +44,12 @@ jobs:
       - name: Run tests
         run: cargo test --locked --all-targets
       - name: Build release programs
-        run: cargo build --release --locked --bin pic_process --bin pic_process-gallery --bin pic_process-tune
+        run: cargo build --release --locked --bin pic_process --bin firstcut-ui --bin pic_process-gallery --bin pic_process-tune
       - name: Package programs and checksums
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Path dist -Force | Out-Null
-          $names = @('pic_process.exe', 'pic_process-gallery.exe', 'pic_process-tune.exe')
+          $names = @('pic_process.exe', 'firstcut-ui.exe', 'pic_process-gallery.exe', 'pic_process-tune.exe')
           foreach ($name in $names) {
             Copy-Item -LiteralPath "target/release/$name" -Destination "dist/$name"
           }
@@ -87,6 +87,7 @@ jobs:
         run: |
           gh release create "$RELEASE_TAG" \
             dist/pic_process.exe \
+            dist/firstcut-ui.exe \
             dist/pic_process-gallery.exe \
             dist/pic_process-tune.exe \
             dist/SHA256SUMS.txt \
