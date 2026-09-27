@@ -1,6 +1,6 @@
 # 照片初筛评分工具（Rust）— 设计与实现文档
 
-> 状态：**Phase 1 已发布 v1.1，后续 M6–M9 和 M-UI1/2 已实现；可靠性与数据模型统一在 `codex/Astra-review` 分支实施，尚未发布。**
+> 状态：**v1.2 已发布**，覆盖本地复核界面、评分解释、人工决定持久化与分析可靠性改进。产品当前聚焦本地初筛、人工复核和 Lightroom 元数据交接。
 > 日期：2026 规划稿 / 2026 实施完成
 > 需求来源：索尼相机 JPG+ARW 连拍/风景/人像选片地狱，需要自动初步评分
 > 配套文档：`README.md`（用户手册）/ `release_notes.md`（版本说明）/ `REVIEW.md`（历次评审记录）/ `ASTRA_REVIEW.md`（本轮过程与结果）/ `firstcut.toml`（配置模板）
@@ -554,7 +554,7 @@ Kelvin→RGB 换算；降噪强度分级目视；**LR 对本轮 16bit TIFF 的�
 
 ## 11. 交付方式
 
-Phase 1 已交付（v1.0/v1.1 已发布 Release）；当前开发以 §0.1 为准。§9 的 darktable Phase 2 已停止。
+初筛和复核工具已通过 v1.0–v1.2 Release 交付；当前产品约定以 §0.1 为准。§9 的 darktable Phase 2 已停止。
 每次改动必须同步更新 `README.md` / `DESIGN.md`，不允许文档与实现状态不一致。
 
 ## 12. UI 规划（M-UI1 复核 + M-UI2 操作台，已实现）
