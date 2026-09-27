@@ -18,7 +18,9 @@
 3. **算法建议**：每次跑批根据分析结果、当前权重、连拍参数和本批照片集合，重新计算总分、星级与保留建议。相对星级仍只在本批次内可比。
 4. **人工决定与导出**：人工星级保存在 `<照片根>/.firstcut/decisions.sqlite`，独立于分析缓存。最终星级为人工值优先，否则用算法值；CLI、review 快照、CSV、XMP 均从这条规则合成。XMP 只合并 firstcut 管理字段，保留其他 XML 内容；无 firstcut 标记的侧车不改动。
 
-`PhotoEntry` 目前仍是扫描与 CSV 导出的共享结构，`AnalysisResult` 是内部数值结果，`selection::SelectionResult` 统一合成算法星级、人工覆盖与连拍候选，CLI/review 共用；`decision` 模块负责独立持久化人工决定。后续若扩展人工保留标记，应进入决定库和同一合成路径，避免复核界面独有状态。
+`PhotoEntry` 目前仍是扫描与 CSV 导出的共享结构，`AnalysisResult` 是内部数值结果，`selection::SelectionResult` 统一合成算法星级、人工星级覆盖与连拍候选，CLI/review 共用；`decision` 模块负责持久化人工星级。人工连拍保留标记目前单独保存在 `.firstcut/burst-overrides.json`，只覆盖 review 中的建议结果；后续需接入统一决定与导出路径，避免 CLI/CSV 与复核界面不一致。
+
+场景预设是用户选择的评分配置，不是逐张照片的自动场景识别。复核面板目前只依据已检测到的人脸给出“人像候选”，其他照片显示“未识别”；面板同时展示实际五维权重和分数贡献。用户标注的场景、备注及当时评分线索追加到 `.firstcut/scene-feedback.jsonl`，用于后续训练与校准。场景初判不自动修改评分权重。
 
 本轮暂不校准评分算法或选片效果。真实图库的“好片被排除率”、连拍最佳帧覆盖率及 Lightroom 导入效果仍需单独验收。
 

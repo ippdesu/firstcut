@@ -11,7 +11,7 @@
   header h1{font-size:16px;margin:0}
   header .info{color:var(--dim);font-size:12px}
   #layout{display:flex}
-  aside{width:230px;flex:none;background:var(--panel);border-right:1px solid var(--line);padding:12px;font-size:13px;height:calc(100vh - 41px);overflow-y:auto}
+  aside{position:sticky;top:41px;align-self:flex-start;width:230px;flex:none;background:var(--panel);border-right:1px solid var(--line);padding:12px;font-size:13px;height:calc(100vh - 41px);overflow-y:auto;z-index:6}
   aside h3{font-size:12px;color:var(--dim);margin:14px 0 6px;text-transform:letter-spacing}
   aside label{display:flex;align-items:center;gap:6px;margin:4px 0;cursor:pointer}
   aside input[type=text]{width:100%;background:#111;border:1px solid var(--line);color:var(--fg);padding:4px 6px;border-radius:4px}
@@ -39,6 +39,18 @@
   #lb .top button{background:#222;border:1px solid var(--line);color:var(--fg);padding:4px 12px;border-radius:4px;cursor:pointer}
   #lb .top button.on{background:var(--acc);color:#000;border-color:var(--acc)}
   #lb .top .close{margin-left:auto;font-size:18px}
+  #lbDetails{position:absolute;top:50px;right:12px;bottom:96px;width:min(360px,calc(100vw - 24px));z-index:22;display:none;overflow-y:auto;background:rgba(30,30,30,.97);border:1px solid #444;border-radius:8px;box-shadow:0 8px 28px rgba(0,0,0,.6);padding:14px;font-size:12px}
+  #lbDetails .head{display:flex;align-items:center;justify-content:space-between;font-weight:600;font-size:14px}
+  #lbDetails .head button{background:none;border:0;color:var(--fg);font-size:20px;cursor:pointer}
+  #lbDetails h4{margin:14px 0 6px;color:var(--acc);font-size:12px}
+  #lbDetails .detail-note{color:var(--dim);font-size:11px;line-height:1.45;margin:5px 0}
+  #lbDetails .score-row{padding:6px 0;border-bottom:1px solid #333}
+  #lbDetails .score-line{display:flex;justify-content:space-between;gap:8px}
+  #lbDetails .score-track{height:5px;background:#333;border-radius:4px;margin-top:5px;overflow:hidden}
+  #lbDetails .score-track span{display:block;height:100%;background:var(--acc)}
+  #lbDetails select,#lbDetails textarea{width:100%;background:#111;border:1px solid #444;color:var(--fg);border-radius:4px;padding:6px;margin-top:5px;font:inherit}
+  #lbDetails textarea{min-height:60px;resize:vertical}
+  #lbDetails .detail-save{margin-top:8px;background:#2e6b30;border:0;border-radius:4px;color:#fff;padding:7px 12px;cursor:pointer}
   #panes{flex:1;display:flex;gap:2px;min-height:0}
   .pane{flex:1;position:relative;overflow:hidden;background:#000;cursor:grab}
   .pane.dragging{cursor:grabbing}
@@ -64,15 +76,27 @@
   .starbtns button{background:none;border:1px solid var(--line);color:#ffc107;font-size:14px;padding:2px 7px;border-radius:4px;cursor:pointer}
   .starbtns button:hover{background:#333}
   #modal{position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:30;display:none;align-items:center;justify-content:center}
-  #modal .box{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:18px;width:560px;max-height:85vh;overflow-y:auto;font-size:13px}
+  #modal .box{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:18px;width:min(720px,calc(100vw - 24px));max-height:85vh;overflow-y:auto;font-size:13px}
   #modal h3{margin:0 0 4px;font-size:15px}
   #modal .grp{margin-top:10px;padding-top:8px;border-top:1px solid var(--line)}
   #modal .grp b{color:var(--acc);font-size:12px}
-  #modal label{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:4px 0}
+  #modal .cfg-field{padding:7px 0;border-bottom:1px solid #292929}
+  #modal .cfg-line{display:flex;align-items:center;justify-content:space-between;gap:12px}
+  #modal .cfg-name{font-weight:500}
+  #modal .cfg-help{color:var(--dim);font-size:11px;line-height:1.45;margin-top:3px}
+  #modal .cfg-range{display:flex;align-items:center;gap:8px;margin-top:4px;color:var(--dim);font-size:10px}
+  #modal input[type=range]{flex:1;min-width:120px;accent-color:var(--acc)}
+  #modal .cfg-range span{white-space:nowrap}
+  #modal .cfg-number{width:110px;background:#111;border:1px solid var(--line);color:var(--fg);padding:3px 6px;border-radius:4px}
+  #modal .cfg-check{display:flex;align-items:center;gap:8px}
   #modal input[type=number]{width:110px;background:#111;border:1px solid var(--line);color:var(--fg);padding:3px 6px;border-radius:4px}
   #modal select{background:#111;border:1px solid var(--line);color:var(--fg);padding:3px;border-radius:4px}
   #modal .foot{display:flex;gap:8px;justify-content:flex-end;margin-top:14px}
   #toast{position:fixed;top:52px;right:16px;z-index:40;display:none;background:#2e6b30;color:#fff;padding:8px 14px;border-radius:6px;font-size:13px}
+  #contextMenu{position:fixed;z-index:50;display:none;min-width:190px;padding:5px;background:var(--panel);border:1px solid var(--line);border-radius:6px;box-shadow:0 8px 24px rgba(0,0,0,.55)}
+  #contextMenu button{display:block;width:100%;border:0;border-radius:4px;background:transparent;color:var(--fg);padding:8px 10px;text-align:left;font:inherit;cursor:pointer;white-space:nowrap}
+  #contextMenu button:hover{background:#333}
+  #contextMenu button:disabled{color:var(--dim);cursor:default}
 </style>
 </head>
 <body>
@@ -89,8 +113,14 @@
     <h3>连拍保留</h3>
     <select id="fKeep">
       <option value="all">全部</option>
-      <option value="keep">仅建议保留</option>
-      <option value="drop">仅建议舍弃</option>
+      <option value="keep">仅保留</option>
+      <option value="drop">仅舍弃</option>
+    </select>
+    <h3>连拍组</h3>
+    <select id="fGroup">
+      <option value="all">所有照片</option>
+      <option value="burst">仅连拍照片</option>
+      <option value="single">仅非连拍照片</option>
     </select>
     <h3>有人脸</h3>
     <label><input type="checkbox" id="fFaces"> 仅看有人脸的照片</label>
@@ -104,7 +134,7 @@
       <option value="time">拍摄时间 新→旧</option>
       <option value="path">文件名</option>
     </select>
-    <h3>评分（M-UI2）</h3>
+    <h3>评分</h3>
     <div id="runBlock">
       <label><input type="checkbox" id="runXmp" checked> 跑批后写 XMP 侧车</label>
       <label><input type="checkbox" id="runNoAi"> 跳过 AI（纯像素快速）</label>
@@ -136,11 +166,29 @@
     <span class="meta" id="lbMeta"></span>
     <span class="starbtns" id="lbStars" title="点击改星（快捷键 1~5），写入 XMP 侧车"></span>
     <button id="lbCompare">并排对比</button>
+    <button id="lbDetailsToggle" aria-expanded="false">评分说明</button>
     <button class="close" id="lbClose">✕ Esc</button>
   </div>
   <div id="panes"></div>
+  <div id="lbDetails" aria-label="照片评分与场景">
+    <div class="head">评分与场景 <button id="lbDetailsClose" title="关闭面板">×</button></div>
+    <div id="lbDetailsBody"></div>
+  </div>
   <div id="strip"></div>
 </div>
+
+<div id="modal">
+  <div class="box">
+    <h3>评分配置 <span class="dim" id="cfgPath" style="font-weight:normal;font-size:11px"></span></h3>
+    <div id="cfgBody"></div>
+    <div class="foot">
+      <button class="btn" id="cfgCancel">取消</button>
+      <button class="btn primary" id="cfgSave">保存</button>
+    </div>
+  </div>
+</div>
+<div id="toast"></div>
+<div id="contextMenu" role="menu" aria-label="照片快捷筛选"></div>
 
 <script>
 "use strict";
@@ -157,7 +205,7 @@ const DIMS = ["sharpness","exposure","noise","composition","aesthetic"];
 const DIM_NAMES = {sharpness:"清晰",exposure:"曝光",noise:"噪点",composition:"构图",aesthetic:"美学"};
 
 const f = {
-  search: "", stars: new Set(), keep: "all", faces: false,
+  search: "", stars: new Set(), keep: "all", group: "all", faces: false,
   min: {total:0, sharpness:0, exposure:0, noise:0, composition:0, aesthetic:0},
   sort: "total",
 };
@@ -178,7 +226,17 @@ async function boot(){
   document.querySelectorAll("aside input, aside select").forEach(el => el.addEventListener("input", onFilter));
 }
 function loadData(){
-  fetch("/api/photos").then(r=>r.json()).then(j=>{ SNAPSHOT = j; ingest(); renderLB && LB && renderLB(); });
+  fetch("/api/photos").then(r=>r.json()).then(j=>{
+    const currentPath = LB && LB.list[LB.idx].path;
+    SNAPSHOT = j;
+    ingest();
+    if(currentPath){
+      const list = visible();
+      const idx = list.findIndex(p=>p.path===currentPath);
+      if(idx < 0) closeLightbox();
+      else { LB.list = list; LB.idx = idx; renderLB(); }
+    }
+  });
 }
 function buildFilters(){
   const starBox = document.getElementById("fStars");
@@ -197,11 +255,24 @@ function buildFilters(){
     wrap.appendChild(r);
     dims.appendChild(wrap);
   }
+  const groupCounts = new Map();
+  for(const p of jpgs){
+    const group = p.burst && p.burst.group;
+    if(group) groupCounts.set(group, (groupCounts.get(group) || 0) + 1);
+  }
+  const groupBox = document.getElementById("fGroup");
+  for(const [group, count] of [...groupCounts].sort((a,b)=>a[0]-b[0])){
+    const option = document.createElement("option");
+    option.value = `group:${group}`;
+    option.textContent = `组 ${group}（${count} 张）`;
+    groupBox.appendChild(option);
+  }
 }
 function onFilter(e){
   f.search = document.getElementById("fSearch").value.trim().toLowerCase();
   f.stars = new Set([...document.querySelectorAll("#fStars input:checked")].map(i=>+i.dataset.star));
   f.keep = document.getElementById("fKeep").value;
+  f.group = document.getElementById("fGroup").value || "all";
   f.faces = document.getElementById("fFaces").checked;
   document.querySelectorAll("#fDims input").forEach(r=>{
     f.min[r.dataset.dim] = +r.value;
@@ -209,13 +280,14 @@ function onFilter(e){
   });
   f.sort = document.getElementById("fSort").value;
   if(e && e.target.dataset.star) return; // 星级变化也要 apply，下面统一
-  localStorage.setItem("fc_filters", JSON.stringify({search:f.search,stars:[...f.stars],keep:f.keep,faces:f.faces,min:f.min,sort:f.sort}));
+  localStorage.setItem("fc_filters", JSON.stringify({search:f.search,stars:[...f.stars],keep:f.keep,group:f.group,faces:f.faces,min:f.min,sort:f.sort}));
   apply();
 }
 function resetFilters(){
   document.getElementById("fSearch").value = "";
   document.querySelectorAll("#fStars input").forEach(i=>i.checked=false);
   document.getElementById("fKeep").value = "all";
+  document.getElementById("fGroup").value = "all";
   document.getElementById("fFaces").checked = false;
   document.querySelectorAll("#fDims input").forEach(r=>{ r.value = 0; });
   document.getElementById("fSort").value = "total";
@@ -232,6 +304,10 @@ function visible(){
       if(f.keep === "keep" && !p.burst.keep) return false;
       if(f.keep === "drop" && p.burst.keep) return false;
     }
+    const group = p.burst && p.burst.group;
+    if(f.group === "burst" && !group) return false;
+    if(f.group === "single" && group) return false;
+    if(f.group.startsWith("group:") && String(group || "") !== f.group.slice(6)) return false;
     if(f.faces && !(p.faces > 0)) return false;
     if(!p.scores) return !(f.min.total>0 || DIMS.some(d=>f.min[d]>0) || f.stars.size);
     if(p.scores.total < f.min.total) return false;
@@ -239,14 +315,14 @@ function visible(){
     return true;
   });
   const by = f.sort;
-  const mul = by.startsWith("-") ? -1 : 1;
   const key = by.replace("-","");
+  const descending = key === "total" ? !by.startsWith("-") : key === "time";
   list.sort((a,b)=>{
     let va, vb;
     if(key === "total"){ va = a.scores?a.scores.total:-1; vb = b.scores?b.scores.total:-1; }
     else if(key === "time"){ va = a.datetime || ""; vb = b.datetime || ""; }
     else { va = a.path; vb = b.path; }
-    return va < vb ? -mul : va > vb ? mul : 0;
+    return va < vb ? (descending ? 1 : -1) : va > vb ? (descending ? -1 : 1) : 0;
   });
   return list;
 }
@@ -261,13 +337,18 @@ function apply(){
   for(const p of slice){
     const d = document.createElement("div");
     d.className = "card" + (p.scores ? "" : " noscore");
+    d.dataset.path = p.path;
     const t = `/thumb?p=${encodeURIComponent(p.path)}`;
     d.innerHTML = `<img loading="lazy" decoding="async" src="${t}">
       ${p.stars ? `<span class="b stars">${"★".repeat(p.stars)}</span>` : ""}
       ${p.scores ? `<span class="b total">${p.scores.total.toFixed(1)}</span>` : `<span class="b total">未评分</span>`}
-      ${p.burst && p.burst.group ? `<span class="b burst ${p.burst.keep?"":"drop"}">组${p.burst.group} #${p.burst.rank}/${p.burst.size} ${p.burst.keep?"✓":"✗"}</span>` : ""}
+      ${p.burst && p.burst.group ? `<span class="b burst ${p.burst.keep?"":"drop"}">组${p.burst.group} #${p.burst.rank}/${p.burst.size} ${p.burst.manual_keep!=null?(p.burst.keep?"手动保留":"手动舍弃"):(p.burst.keep?"✓":"✗")}</span>` : ""}
       <span class="b name">${escapeHtml(p.filename)}</span>`;
     d.addEventListener("click", ()=> openLightbox(p, list));
+    d.addEventListener("contextmenu", e=>{
+      e.preventDefault();
+      showPhotoContextMenu(p, e.clientX, e.clientY);
+    });
     grid.appendChild(d);
   }
   document.getElementById("pgInfo").textContent = `${list.length ? page*PAGE+1 : 0}–${Math.min((page+1)*PAGE, list.length)} / ${list.length}`;
@@ -278,12 +359,98 @@ document.getElementById("pgPrev").addEventListener("click", ()=>{ page--; apply(
 document.getElementById("pgNext").addEventListener("click", ()=>{ page++; apply(); });
 document.getElementById("fReset").addEventListener("click", resetFilters);
 
+function hidePhotoContextMenu(){
+  const menu = document.getElementById("contextMenu");
+  menu.style.display = "none";
+  menu.replaceChildren();
+}
+function showPhotoContextMenu(photo, x, y){
+  const menu = document.getElementById("contextMenu");
+  menu.replaceChildren();
+  const addAction = (label, action, disabled=false)=>{
+    const button = document.createElement("button");
+    button.type = "button";
+    button.role = "menuitem";
+    button.textContent = label;
+    button.disabled = disabled;
+    button.addEventListener("click", e=>{
+      e.stopPropagation();
+      hidePhotoContextMenu();
+      action();
+    });
+    menu.appendChild(button);
+  };
+  const group = photo.burst && photo.burst.group;
+  if(group){
+    const count = jpgs.filter(p=>p.burst && p.burst.group === group).length;
+    addAction(`只看第 ${group} 组（${count} 张）`, ()=>{
+      document.getElementById("fGroup").value = `group:${group}`;
+      page = 0;
+      onFilter();
+    });
+    addAction("只看连拍照片", ()=>{
+      document.getElementById("fGroup").value = "burst";
+      page = 0;
+      onFilter();
+    });
+    addAction(`手动设为保留${photo.burst.keep ? " ✓" : ""}`, ()=>setBurstKeep(photo, true));
+    addAction(`手动设为舍弃${!photo.burst.keep ? " ✓" : ""}`, ()=>setBurstKeep(photo, false));
+    if(photo.burst.manual_keep != null){
+      addAction(`恢复自动建议（${photo.burst.suggested_keep ? "保留" : "舍弃"}）`, ()=>setBurstKeep(photo, null));
+    }
+  } else {
+    addAction("只看非连拍照片", ()=>{
+      document.getElementById("fGroup").value = "single";
+      page = 0;
+      onFilter();
+    });
+  }
+  if(f.group !== "all") addAction("清除组筛选", ()=>{
+    document.getElementById("fGroup").value = "all";
+    page = 0;
+    onFilter();
+  });
+  menu.style.display = "block";
+  const rect = menu.getBoundingClientRect();
+  menu.style.left = `${Math.max(8, Math.min(x, innerWidth - rect.width - 8))}px`;
+  menu.style.top = `${Math.max(8, Math.min(y, innerHeight - rect.height - 8))}px`;
+}
+async function setBurstKeep(photo, keep){
+  try{
+    const response = await fetch('/api/burst/keep', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({p:photo.path, keep})
+    });
+    const text = await response.text();
+    if(!response.ok) throw new Error(text || response.statusText);
+    const result = JSON.parse(text);
+    for(const item of jpgs){
+      if(item.path === photo.path && item.burst){
+        item.burst.keep = result.keep == null ? item.burst.suggested_keep : result.keep;
+        item.burst.manual_keep = result.keep;
+      }
+    }
+    apply();
+    toast(keep == null ? '已恢复自动保留建议' : (keep ? '已手动标记为保留' : '已手动标记为舍弃'));
+  }catch(error){
+    toast('连拍标记保存失败：'+error.message);
+  }
+}
+document.addEventListener("click", e=>{
+  if(!e.target.closest("#contextMenu")) hidePhotoContextMenu();
+});
+document.addEventListener("keydown", e=>{
+  if(e.key === "Escape") hidePhotoContextMenu();
+});
+window.addEventListener("scroll", hidePhotoContextMenu, true);
+window.addEventListener("resize", hidePhotoContextMenu);
+
 // ---------- 灯箱（1:1 缩放 / 并排同步对比） ----------
 let LB = null; // {list, idx, compare, sel:Set, view:{s, ax, ay}}
 const lbEl = document.getElementById("lb");
 
 function openLightbox(p, list){
-  LB = { list, idx: list.indexOf(p), compare:false, sel:new Set([p.path]), view:{s:1, ax:.5, ay:.5} };
+  LB = { list, idx: list.indexOf(p), compare:false, sel:new Set([p.path]), view:{s:1, ax:.5, ay:.5}, detailsOpen:true };
   lbEl.style.display = "flex";
   renderLB();
 }
@@ -312,7 +479,7 @@ function renderLB(){
   document.getElementById("lbName").textContent = cur.filename;
   document.getElementById("lbMeta").textContent =
     `${cur.stars ? "★".repeat(cur.stars)+" " : ""}${cur.scores ? "总分 "+cur.scores.total.toFixed(1) : "未评分"}`
-    + (cur.burst && cur.burst.group ? ` · 组${cur.burst.group} 第${cur.burst.rank}/${cur.burst.size}名（姿势簇${cur.burst.pose_cluster}）${cur.burst.keep?" ✓保留":" ✗舍弃"}` : "")
+    + (cur.burst && cur.burst.group ? ` · 组${cur.burst.group} 第${cur.burst.rank}/${cur.burst.size}名（姿势簇${cur.burst.pose_cluster}）${cur.burst.manual_keep!=null?" 手动":""}${cur.burst.keep?" ✓保留":" ✗舍弃"}` : "")
     + ` · ${cur.iso? "ISO"+cur.iso : ""} ${cur.f_number||""} ${cur.shutter||""} ${cur.focal||""}`;
   document.getElementById("lbCompare").classList.toggle("on", LB.compare);
 
@@ -359,7 +526,76 @@ function renderLB(){
     });
     strip.appendChild(d);
   }
+  renderLBDetails();
 }
+const SCENE_OPTIONS = [
+  ['portrait','人像 / 人物'],['stage','舞台 / 演出'],['highkey','高调 / 雪景'],
+  ['sports','运动 / 飞鸟'],['lowlight','夜景 / 暗光'],['landscape','风光'],
+  ['still_life','静物 / 展品'],['documentary','纪实 / 街拍'],['other','其他']
+];
+function sceneLabel(id){ return (SCENE_OPTIONS.find(([key])=>key===id)||[])[1] || id; }
+function renderLBDetails(){
+  const panel = document.getElementById('lbDetails');
+  panel.style.display = LB.detailsOpen ? 'block' : 'none';
+  document.getElementById('lbDetailsToggle').classList.toggle('on', LB.detailsOpen);
+  document.getElementById('lbDetailsToggle').setAttribute('aria-expanded', String(LB.detailsOpen));
+  if(!LB.detailsOpen) return;
+  const photo = LB.list[LB.idx];
+  const weights = SNAPSHOT.weights || {};
+  const body = document.getElementById('lbDetailsBody');
+  const scores = photo.scores;
+  const rows = scores ? DIMS.map(key=>{
+    const score = Number(scores[key] || 0);
+    const weight = Number(weights[key] || 0);
+    const contribution = score * weight;
+    return `<div class="score-row"><div class="score-line"><strong>${DIM_NAMES[key]}</strong><span>${score.toFixed(1)} × ${(weight*100).toFixed(0)}% = ${contribution.toFixed(2)} 分</span></div>
+      <div class="score-track"><span style="width:${Math.max(0,Math.min(100,score))}%"></span></div></div>`;
+  }).join('') : '<div class="detail-note">本张尚未评分，暂无分项与权重贡献。</div>';
+  const hint = photo.scene_hint || {id:'unknown',label:'未识别',reason:'缺少场景数据。'};
+  const feedback = photo.scene_feedback;
+  const selected = feedback ? feedback.selected_scene : (hint.id==='unknown' ? '' : hint.id);
+  body.innerHTML = `<h4>总分构成</h4>
+    ${scores ? `<div><strong>${scores.total.toFixed(1)} 分</strong> · 五项子分乘以当前权重后相加，结果保留 1 位小数。</div>` : ''}
+    ${rows}
+    <p class="detail-note">这里显示当前快照实际使用的权重；编辑配置后需重新评分才能更新总分。</p>
+    <h4>场景初判</h4>
+    <div>${escapeHtml(hint.label)} <span class="detail-note">（规则线索）</span></div>
+    <p class="detail-note">${escapeHtml(hint.reason)} 当前尚无通用场景分类模型，初判不会自动改变评分权重。</p>
+    ${feedback ? `<p>已记录的实际场景：<strong>${escapeHtml(sceneLabel(feedback.selected_scene))}</strong></p>` : ''}
+    <label for="lbSceneSelect">实际场景</label>
+    <select id="lbSceneSelect"><option value="">请选择</option>${SCENE_OPTIONS.map(([id,label])=>`<option value="${id}" ${id===selected?'selected':''}>${label}</option>`).join('')}</select>
+    <label for="lbSceneNote">补充说明（可选）</label>
+    <textarea id="lbSceneNote" maxlength="1000" placeholder="例如：这是舞台演出，不是普通人像">${escapeHtml(feedback?.note || '')}</textarea>
+    <button class="detail-save" id="lbSceneSave">保存场景记录</button>
+    <p class="detail-note">记录会保存到照片目录的 .firstcut/scene-feedback.jsonl，供后续改进识别与评分。</p>`;
+  document.getElementById('lbSceneSave').addEventListener('click', ()=>saveSceneFeedback(photo));
+}
+async function saveSceneFeedback(photo){
+  const selected_scene = document.getElementById('lbSceneSelect').value;
+  const note = document.getElementById('lbSceneNote').value.trim();
+  if(!selected_scene){ toast('请先选择实际场景'); return; }
+  try{
+    const response = await fetch('/api/scene-feedback', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({p:photo.path, selected_scene, note})
+    });
+    const text = await response.text();
+    if(!response.ok) throw new Error(text || response.statusText);
+    photo.scene_feedback = JSON.parse(text).record;
+    renderLBDetails();
+    toast('场景记录已保存');
+  }catch(error){ toast('场景记录保存失败：'+error.message); }
+}
+document.getElementById('lbDetailsToggle').addEventListener('click', ()=>{
+  if(!LB) return;
+  LB.detailsOpen = !LB.detailsOpen;
+  renderLBDetails();
+});
+document.getElementById('lbDetailsClose').addEventListener('click', ()=>{
+  if(!LB) return;
+  LB.detailsOpen = false;
+  renderLBDetails();
+});
 document.getElementById("lbCompare").addEventListener("click", function(){
   LB.compare = !LB.compare;
   const cur = LB.list[LB.idx];
@@ -403,7 +639,11 @@ function bindPane(pane){
     layoutPanes();
   });
   window.addEventListener("mouseup", ()=>{ drag = null; pane.classList.remove("dragging"); });
-  pane.addEventListener("dblclick", ()=>{ LB.view = {s:1, ax:.5, ay:.5}; layoutPanes(); });
+  pane.addEventListener("dblclick", ()=>{
+    LB.view = {s:1, ax:.5, ay:.5};
+    document.querySelectorAll(".pane").forEach(p=>{ p.ox = undefined; p.oy = undefined; });
+    layoutPanes();
+  });
 }
 function curK(pane){
   const img = pane.querySelector("img");
@@ -426,9 +666,11 @@ function layoutPanes(){
 }
 
 // 键盘
+function isTypingTarget(target){ return target instanceof Element && !!target.closest('input,textarea,select,[contenteditable="true"]'); }
 window.addEventListener("keydown", e=>{
   if(lbEl.style.display !== "flex") return;
   if(e.key === "Escape"){ LB && LB.compare ? (LB.compare = false, renderLB()) : closeLightbox(); }
+  else if(isTypingTarget(e.target)) return;
   else if(e.key === "ArrowRight" || e.key === "ArrowLeft"){
     const set = lbNavSet();
     const cur = LB.list[LB.idx];
@@ -522,7 +764,7 @@ function setStars(photo, n){
 }
 // 快捷键 1~5（灯箱打开时）
 window.addEventListener('keydown', e=>{
-  if(lbEl.style.display !== 'flex') return;
+  if(lbEl.style.display !== 'flex' || isTypingTarget(e.target)) return;
   if(e.key >= '1' && e.key <= '5'){
     const cur = LB && LB.list[LB.idx];
     if(cur && cur.scores) setStars(cur, +e.key);
@@ -534,8 +776,35 @@ const FIELDS = [
   ['权重（和 ≈ 1.0）', [['w_sharpness','清晰度'],['w_exposure','曝光'],['w_noise','噪点'],['w_composition','构图'],['w_aesthetic','美学']]],
   ['星级', [['star_mode','分档模式（select:relative/absolute）'],['star_five_pct','5★ 百分位'],['star_four_pct','4★ 百分位'],['star_three_pct','3★ 百分位'],['star_two_pct','2★ 百分位'],['rating_5','5★ 阈值'],['rating_4','4★ 阈值'],['rating_3','3★ 阈值'],['rating_2','2★ 阈值']]],
   ['曝光 EV 容差带', [['exposure_target','目标亮度'],['exposure_ev_full_lo','暗侧满分'],['exposure_ev_full_hi','亮侧满分'],['exposure_ev_lo','暗侧归零'],['exposure_ev_hi','亮侧归零'],['exposure_subject_blend','主体混合权重'],['exposure_suggest_cap','建议EV上限']]],
-  ['连拍 [dedup]', [['dedup_keep_k','每姿势簇保留'],['dedup_pose_cluster_threshold','姿态阈值'],['dedup_burst_group_cap','单组上限']]],
+  ['连拍去重', [['dedup_adaptive_keep','按姿态分组保留'],['dedup_keep_k','每姿势簇保留'],['dedup_pose_cluster_threshold','姿态阈值'],['dedup_burst_group_cap','单组上限']]],
 ];
+const FIELD_GUIDE = {
+  w_sharpness:{help:'清晰度维度对总分的占比；调高后更偏向合焦、细节清楚的照片。五项权重总和必须约为 1.0。',min:0,max:1,step:.01,recommended:'常用 0.15–0.40'},
+  w_exposure:{help:'曝光维度对总分的占比；调高后更偏好主体曝光合适的照片。五项权重总和必须约为 1.0。',min:0,max:1,step:.01,recommended:'常用 0.15–0.35'},
+  w_noise:{help:'暗部噪点维度的占比；调高后更严格地惩罚高 ISO 或暗部颗粒。五项权重总和必须约为 1.0。',min:0,max:1,step:.01,recommended:'常用 0.05–0.25'},
+  w_composition:{help:'构图维度的占比；调高后 AI 构图评价对总分影响更大。五项权重总和必须约为 1.0。',min:0,max:1,step:.01,recommended:'常用 0.05–0.25'},
+  w_aesthetic:{help:'美学维度的占比；调高后 AI 美学评价对总分影响更大。五项权重总和必须约为 1.0。',min:0,max:1,step:.01,recommended:'常用 0.05–0.25'},
+  star_mode:{help:'relative 按本批次排名分星，适合每批照片质量差异较大的情况；absolute 按固定总分阈值分星，适合跨批次比较。'},
+  star_five_pct:{help:'relative 模式下进入 5 星的前百分位比例；数值越小，5 星越少。',min:0,max:100,step:1,recommended:'常用 5–15%'},
+  star_four_pct:{help:'relative 模式下 4 星及以上的累计百分位边界；必须不小于 5 星边界。',min:0,max:100,step:1,recommended:'常用 20–40%'},
+  star_three_pct:{help:'relative 模式下 3 星及以上的累计百分位边界；必须不小于 4 星边界。',min:0,max:100,step:1,recommended:'常用 50–75%'},
+  star_two_pct:{help:'relative 模式下 2 星及以上的累计百分位边界；其余照片为 1 星，且必须不小于 3 星边界。',min:0,max:100,step:1,recommended:'常用 80–95%'},
+  rating_5:{help:'absolute 模式下获得 5 星的最低总分；需满足 2★ ≤ 3★ ≤ 4★ ≤ 5★。',min:0,max:100,step:1,recommended:'常用 70–90 分'},
+  rating_4:{help:'absolute 模式下获得 4 星及以上的最低总分；需低于或等于 5 星阈值。',min:0,max:100,step:1,recommended:'常用 55–75 分'},
+  rating_3:{help:'absolute 模式下获得 3 星及以上的最低总分；需低于或等于 4 星阈值。',min:0,max:100,step:1,recommended:'常用 40–60 分'},
+  rating_2:{help:'absolute 模式下获得 2 星及以上的最低总分；低于此值为 1 星。',min:0,max:100,step:1,recommended:'常用 20–45 分'},
+  exposure_target:{help:'理想主体亮度，单位为 8 位亮度值（0–255）；舞台暗调可降低，雪景或高调场景可提高。',min:32,max:224,step:1,recommended:'常用 96–160；有效范围 1–254'},
+  exposure_ev_full_lo:{help:'曝光比目标偏暗多少 EV 以内仍给满分；增大可减少对轻微欠曝的惩罚，且必须小于暗侧归零值。',min:0,max:2,step:.05,recommended:'常用 0.5–1.5 EV'},
+  exposure_ev_full_hi:{help:'曝光比目标偏亮多少 EV 以内仍给满分；增大可减少对轻微过曝的惩罚，且必须小于亮侧归零值。',min:0,max:2,step:.05,recommended:'常用 0.5–1.5 EV'},
+  exposure_ev_lo:{help:'暗侧偏离达到该 EV 时曝光分降到 0；数值越大，对欠曝越宽容，必须大于暗侧满分容差。',min:1,max:8,step:.1,recommended:'常用 3–5 EV'},
+  exposure_ev_hi:{help:'亮侧偏离达到该 EV 时曝光分降到 0；通常设得比暗侧更严格，必须大于亮侧满分容差。',min:1,max:6,step:.1,recommended:'常用 1.5–3 EV'},
+  exposure_subject_blend:{help:'有主体脸时，主体亮度参与曝光判断的比例；0 只看全图，1 只看主体。',min:0,max:1,step:.05,recommended:'常用 0.3–0.7'},
+  exposure_suggest_cap:{help:'写入 XMP/CSV 的曝光修正建议最大绝对值（EV）；设为 0 可关闭建议。',min:0,max:4,step:.1,recommended:'常用 1–2 EV'},
+  dedup_adaptive_keep:{help:'按人脸姿态把连拍拆成多个瞬间分别保留；关闭后退回按画面相似度分簇。'},
+  dedup_keep_k:{help:'每个姿势簇保留分数最高的前 K 张；调大可保留更多表情或动作备选。',min:1,max:10,step:1,recommended:'常用 2–5 张；必须至少 1 张'},
+  dedup_pose_cluster_threshold:{help:'姿态描述子的聚类距离阈值；调低会拆出更多姿态组，调高会合并相近姿势。',min:.05,max:.6,step:.01,recommended:'常用 0.15–0.40；默认 0.25'},
+  dedup_burst_group_cap:{help:'单个连拍组最终保留照片总数上限，超过时按总分截断。',min:1,max:60,step:1,recommended:'常用 10–30 张'},
+};
 document.getElementById('cfgBtn').addEventListener('click', async ()=>{
   const r = await fetch('/api/config'); const j = await r.json();
   document.getElementById('cfgPath').textContent = '→ ' + j.path + (j.exists ? '' : '（文件尚不存在，保存时创建）');
@@ -545,20 +814,38 @@ document.getElementById('cfgBtn').addEventListener('click', async ()=>{
     const g = document.createElement('div'); g.className = 'grp';
     g.innerHTML = `<b>${title}</b>`;
     for(const [k, label] of fields){
-      const row = document.createElement('label');
+      const row = document.createElement('div'); row.className = 'cfg-field';
+      const guide = FIELD_GUIDE[k];
+      const line = document.createElement('div'); line.className = 'cfg-line';
+      const name = document.createElement('span'); name.className = 'cfg-name'; name.textContent = label;
+      line.appendChild(name);
+      row.appendChild(line);
       if(k === 'star_mode'){
-        row.innerHTML = `<span>${label}</span>`;
         const sel = document.createElement('select'); sel.dataset.k = k;
         sel.innerHTML = `<option value="relative" ${v[k]==='relative'?'selected':''}>relative 批次内相对</option><option value="absolute" ${v[k]==='absolute'?'selected':''}>absolute 总分阈值</option>`;
-        row.appendChild(sel);
+        line.appendChild(sel);
       } else if(k === 'dedup_adaptive_keep'){
-        row.innerHTML = `<span>M9 自适应保留</span><input type="checkbox" data-k="${k}" ${v[k]?'checked':''}>`;
+        const checkWrap = document.createElement('label'); checkWrap.className = 'cfg-check';
+        const check = document.createElement('input'); check.type = 'checkbox'; check.dataset.k = k; check.checked = !!v[k];
+        checkWrap.appendChild(check); line.appendChild(checkWrap);
       } else {
-        row.innerHTML = `<span>${label}</span>`;
         const inp = document.createElement('input');
-        inp.type = 'number'; inp.step = 'any'; inp.dataset.k = k; inp.value = v[k];
-        row.appendChild(inp);
+        inp.type = 'number'; inp.step = String(guide.step); inp.dataset.k = k; inp.value = v[k]; inp.className = 'cfg-number';
+        line.appendChild(inp);
+        const rangeLine = document.createElement('div'); rangeLine.className = 'cfg-range';
+        const minLabel = document.createElement('span'); minLabel.textContent = guide.min;
+        const range = document.createElement('input'); range.type = 'range'; range.min = guide.min; range.max = guide.max; range.step = guide.step; range.value = Math.min(guide.max, Math.max(guide.min, Number(v[k])));
+        range.setAttribute('aria-label', `${label}滑块`);
+        const maxLabel = document.createElement('span'); maxLabel.textContent = guide.max;
+        rangeLine.append(minLabel, range, maxLabel);
+        const syncRange = ()=>{ range.value = Math.min(guide.max, Math.max(guide.min, Number(inp.value)||0)); };
+        range.addEventListener('input', ()=>{ inp.value = range.value; });
+        inp.addEventListener('input', syncRange);
+        row.appendChild(rangeLine);
       }
+      const help = document.createElement('div'); help.className = 'cfg-help';
+      help.textContent = guide.help + (guide.recommended ? ` 建议：${guide.recommended}。滑块展示常用调节区间，仍可在输入框填写其他值。` : ' 具体有效范围与参数间约束会在保存时校验。');
+      row.appendChild(help);
       g.appendChild(row);
     }
     body.appendChild(g);
@@ -577,7 +864,8 @@ document.getElementById('cfgSave').addEventListener('click', ()=>{
       const t = await r.text();
       toast(r.ok ? (JSON.parse(t).note || '已保存') : t);
       if(r.ok) document.getElementById('modal').style.display='none';
-    });
+    })
+    .catch(err=>toast('保存失败：'+err));
 });
 
 // 恢复上次的筛选条件
@@ -585,6 +873,7 @@ try{
   const saved = JSON.parse(localStorage.getItem("fc_filters") || "null");
   if(saved){
     f.search = saved.search || ""; f.keep = saved.keep || "all";
+    f.group = saved.group || "all";
     f.faces = !!saved.faces; f.sort = saved.sort || "total";
     f.min = Object.assign(f.min, saved.min || {});
     f.stars = new Set(saved.stars || []);
@@ -593,6 +882,11 @@ try{
 boot().then(()=>{
   document.getElementById("fSearch").value = f.search;
   document.getElementById("fKeep").value = f.keep;
+  document.getElementById("fGroup").value = f.group;
+  if(!document.getElementById("fGroup").value){
+    f.group = "all";
+    document.getElementById("fGroup").value = "all";
+  }
   document.getElementById("fFaces").checked = f.faces;
   document.getElementById("fSort").value = f.sort;
   document.querySelectorAll("#fStars input").forEach(i=> i.checked = f.stars.has(+i.dataset.star));
@@ -603,16 +897,5 @@ boot().then(()=>{
   apply();
 });
 </script>
-<div id="modal">
-  <div class="box">
-    <h3>评分配置 <span class="dim" id="cfgPath" style="font-weight:normal;font-size:11px"></span></h3>
-    <div id="cfgBody"></div>
-    <div class="foot">
-      <button class="btn" id="cfgCancel">取消</button>
-      <button class="btn primary" id="cfgSave">保存</button>
-    </div>
-  </div>
-</div>
-<div id="toast"></div>
 </body>
 </html>

@@ -241,7 +241,9 @@ fn manual_rating_survives_rescore_and_export() {
     assert_eq!(row.get(headers.iter().position(|h| h == "analysis_mode").unwrap()), Some("pixel"));
     let sidecar = std::fs::read_to_string(jpg.with_extension("xmp")).unwrap();
     assert!(sidecar.contains("<xmp:Rating>1</xmp:Rating>"));
-    let snap = pic_process::review::snapshot::build_snapshot(&root, &cfg, &cache_path).unwrap();
+    let snap = pic_process::review::snapshot::build_snapshot(
+        &root, &cfg, &cache_path, &std::collections::HashMap::new(),
+        &std::collections::HashMap::new()).unwrap();
     assert_eq!(snap.photos[0].stars, Some(1));
     assert_eq!(snap.photos[0].rating_source.as_deref(), Some("manual"));
     let _ = std::fs::remove_dir_all(root);

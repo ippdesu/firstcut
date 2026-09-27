@@ -4,9 +4,7 @@
 **五维评分**（清晰度 / 曝光 / 噪点 / 构图 / 美学），连拍去重排序，输出
 **CSV 报告**和 **XMP 星级侧车**。全程本地运行、照片不上传。
 
-> 当前状态：**v1.1 已发布**，并已合入 M6 缺陷修复 + M7 交付兼容 + M8 评审修复 +
-> M9 自适应连拍保留（每个姿势簇各自保留）+ M-UI1 复核界面 + M-UI2 操作台
-> （`review` 子命令内跑批/改星/配置编辑）。
+> 当前状态：**v1.1 已发布**，支持连拍姿势分组、照片复核、评分和配置编辑。
 > 当前方向：本地初筛、人工复核、Lightroom 元数据交接。darktable 批量 RAW 开发路线已停止；历史调研保存在 `DESIGN.md` §9。
 
 ## 构建
@@ -64,7 +62,7 @@ pic_process review <照片目录>
 pic_process score <照片目录>            # 第二次几乎秒级
 
 # 其他选项
-pic_process score <目录> -k 2           # 每个保留单元（M9 默认为姿势簇）保留 2 张
+pic_process score <目录> -k 2           # 每个保留单元保留 2 张
 pic_process score <目录> --no-ai        # 跳过 AI 推理
 pic_process score <目录> --no-cache     # 禁用缓存
 pic_process score <目录> --cache x.db   # 指定缓存文件
@@ -124,7 +122,7 @@ pic_process score <目录> --config stage.toml
 | `analysis_mode` | `ai` 为完整模型分析；`pixel` 为纯像素分析或模型不可用时的降级结果 |
 | `faces` | SCRFD 检测到的人脸数 |
 | `analysis_ok` | 评分数据是否可用（解码失败/无配对 ARW 为 false，运行结束 stderr 也有失败清单） |
-| `burst_group, burst_size, burst_rank, burst_keep, burst_pose` | 连拍去重：组号、**保留单元内**张数、保留单元内排名、是否建议保留、M9 姿态簇号（`burst_keep` 只是建议标记，**工具永不删除/移动文件**） |
+| `burst_group, burst_size, burst_rank, burst_keep, burst_pose` | 连拍去重：组号、**保留单元内**张数、保留单元内排名、是否建议保留、姿态簇号（`burst_keep` 只是建议标记，**工具永不删除/移动文件**） |
 
 **XMP 侧车**（`--xmp`）：写 `<stem>.xmp`（如 `DSC00001.xmp`），含
 `xmp:Rating`（1-5 星）+ `firstcut:` 命名空间（五维子分/人脸/连拍信息）。
@@ -180,7 +178,7 @@ pic_process score <目录> --config stage.toml
 > 星级之间不可比。
 > 人工改星保存在照片根目录的 `.firstcut/decisions.sqlite`，优先于算法星级，并同步给配对的 JPG/ARW。此文件是用户决定，**备份照片目录时请保留**；评分缓存 `pic_process_cache.sqlite` 可删除后重建。旧版仅写入 XMP 的人工星级不会自动导入决定库，需要在复核界面重新确认。
 
-**连拍去重（M9 自适应保留，默认开启）**：先按 EXIF 拍摄时间排序，再以间隔 ≤2s 成组 → 组内按 dHash
+**连拍去重（默认按姿势分组保留）**：先按 EXIF 拍摄时间排序，再以间隔 ≤2s 成组 → 组内按 dHash
 汉明距离 ≤10 分**子簇**（近乎同一张）→ 子簇内再按 **SCRFD 关键点姿态描述子**
 聚类（距离 > 0.25 = 不同姿势）→ **每个姿势簇各自保留 top-3**（`-k` 可调），
 单组保留总量受上限 20 约束（超出按总分截断）。
@@ -202,11 +200,13 @@ pic_process review <目录> --port 9000 --config stage.toml
   是否合焦时随时放大到 100%。
 - **连拍组并排对比**：灯箱内勾选同组 2~4 张，并排窗格**同步缩放平移**
   （滚轮/拖拽作用于所有窗格），逐帧对比合焦位置。
-- **UI 内跑批**（M-UI2）：侧栏"重新评分"触发完整评分流水线（与 `score` 子命令
+- **评分说明与场景标注**：打开照片后，悬浮面板列出五项子分、实际权重和各自贡献。场景初判目前仅依据人脸检测给出“人像候选”，其余显示“未识别”；这不是通用场景分类器，也不会自动切换评分配置。可选择实际场景并写备注，记录追加到 `.firstcut/scene-feedback.jsonl`，供后续识别与评分校准。
+- **手动调整连拍保留标记**：照片右键可设为保留/舍弃，也可恢复自动建议；标记保存在照片根目录的 `.firstcut/burst-overrides.json`，复核界面重启后仍有效。
+- **UI 内跑批**：侧栏"重新评分"触发完整评分流水线（与 `score` 子命令
   同一实现），进度条 + 日志实时可见，完成后快照自动刷新，无需重启服务。
-- **UI 内改星**（M-UI2）：灯箱内点星级或按 `1~5` 快捷键 → 保存人工决定并同步 XMP。
+- **UI 内改星**：灯箱内点星级或按 `1~5` 快捷键 → 保存人工决定并同步 XMP。
   重启复核界面、重新评分或导出后仍使用人工星级；他人侧车不覆盖。侧车同步失败时，界面会提示，人工决定仍然保存。
-- **配置编辑**（M-UI2）：权重/星级阈值/EV 容差/[dedup] 表单化编辑，
+- **配置编辑**：权重/星级阈值/EV 容差/[dedup] 表单化编辑，
   保存保留 TOML 注释，非法值（权重和越界等）拒绝写盘。
 - 默认 UI 配置位于照片根目录的 `.firstcut/config.toml`，再次打开 review 会自动加载；UI 跑批报告位于 `.firstcut/report.csv`。CLI 使用 UI 配置时传 `--config <照片目录>/.firstcut/config.toml`。
 - 数据来源：扫描目录 + SQLite 分析缓存 + 独立的人工决定库（星级/连拍与 `score` 同一逻辑在线计算）。
@@ -231,11 +231,11 @@ src/
 ├── decode.rs      # JPEG 解码（box 降采样）+ EXIF 方向 + 灰度/直方图
 ├── metrics/       # sharpness / exposure / noise / composition
 ├── ai/            # CLIPIQA + SCRFD（含 kps）+ YOLOv8-pose（ort 推理）
-├── dedup.rs       # 连拍分组 + dHash 聚类 + M9 姿态聚类 + 排序
+├── dedup.rs       # 连拍分组 + dHash 与姿态聚类 + 排序
 ├── cache.rs       # SQLite 增量缓存（键含配置指纹，含姿态描述子）
 ├── decision.rs    # 独立的人工星级决定与最终星级合成
 ├── selection.rs   # CLI/review 共用的星级与连拍结果合成
-├── review/        # M-UI1 本地 Web 复核服务（axum + 内嵌前端）
+├── review/        # 本地 Web 复核服务（axum + 内嵌前端）
 ├── output/        # csv / xmp 侧车
 ├── config.rs      # 权重与曲线参数 + [dedup] + 场景预设（TOML 可配）
 └── bin/

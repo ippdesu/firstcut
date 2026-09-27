@@ -6,12 +6,13 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::cache::{self, ScoreCache};
 use crate::config::ScoreConfig;
 use crate::scan;
 use crate::score::{self, AnalysisResult};
+use super::scene_feedback::SceneFeedbackRecord;
 
 /// 单张照片的 JSON 视图（相对路径是所有取图端点的 `p` 参数）
 #[derive(Debug, Clone, Serialize)]
@@ -36,9 +37,11 @@ pub struct PhotoJson {
     pub analysis_mode: Option<String>,
     pub faces: usize,
     pub burst: Option<BurstJson>,
+    pub scene_hint: SceneHintJson,
+    pub scene_feedback: Option<SceneFeedbackRecord>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScoresJson {
     pub sharpness: f64,
     pub exposure: f64,
@@ -51,12 +54,33 @@ pub struct ScoresJson {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct WeightsJson {
+    pub sharpness: f64,
+    pub exposure: f64,
+    pub noise: f64,
+    pub composition: f64,
+    pub aesthetic: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SceneHintJson {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct BurstJson {
     pub group: usize,
     pub size: usize,
     pub rank: usize,
+    /// 当前是否保留（手动标记优先于自动建议）
     pub keep: bool,
-    /// M9 姿态簇号（0 = 未启用/无簇）
+    /// 自动算法给出的保留建议
+    pub suggested_keep: bool,
+    /// 手动决定；None 表示沿用自动建议
+    pub manual_keep: Option<bool>,
+    /// 姿态簇号（0 = 未启用/无簇）
     pub pose_cluster: usize,
 }
 
@@ -64,13 +88,16 @@ pub struct BurstJson {
 #[derive(Debug, Clone, Serialize)]
 pub struct Snapshot {
     pub root: String,
+    pub weights: WeightsJson,
     pub photos: Vec<PhotoJson>,
 }
 
 /// 构建快照：扫描 + 打开缓存 + 按当前配置过滤命中 + 星级/连拍在线计算。
 ///
 /// 缓存打不开（文件损坏/不存在）时降级为"全部未评分"，不阻塞浏览。
-pub fn build_snapshot(root: &Path, cfg: &ScoreConfig, cache_path: &Path) -> anyhow::Result<Snapshot> {
+pub fn build_snapshot(root: &Path, cfg: &ScoreConfig, cache_path: &Path,
+    manual_keep: &HashMap<String, bool>,
+    scene_feedback: &HashMap<String, SceneFeedbackRecord>) -> anyhow::Result<Snapshot> {
     let entries = scan::scan_directory(root)?;
     let pixel_hash = crate::config::analysis_fingerprint(cfg, false);
     let ai_hash = crate::config::analysis_fingerprint(cfg, true);
@@ -108,8 +135,9 @@ pub fn build_snapshot(root: &Path, cfg: &ScoreConfig, cache_path: &Path) -> anyh
         .map(|e| {
             let analyzed_result = analyzed.get(e.pair_id());
             let rel = rel_path(root, Path::new(&e.path));
+            let ai_mode = mode_by_pair.get(e.pair_id()) == Some(&true);
             PhotoJson {
-                path: rel,
+                path: rel.clone(),
                 filename: e.filename.clone(),
                 ext: e.extension.clone(),
                 is_raw: e.is_raw,
@@ -131,15 +159,19 @@ pub fn build_snapshot(root: &Path, cfg: &ScoreConfig, cache_path: &Path) -> anyh
                 }),
                 stars: selection.ratings.get(e.pair_id()).map(|r| r.stars),
                 rating_source: selection.ratings.get(e.pair_id()).map(|r| r.source.as_str().to_string()),
-                analysis_mode: analyzed_result.map(|_| if mode_by_pair.get(e.pair_id()) == Some(&true) {
+                analysis_mode: analyzed_result.map(|_| if ai_mode {
                     "ai".to_string()
                 } else { "pixel".to_string() }),
                 faces: analyzed_result.map(|r| r.faces).unwrap_or(0),
+                scene_hint: scene_hint(analyzed_result, ai_mode),
+                scene_feedback: scene_feedback.get(&rel).cloned(),
                 burst: selection.bursts.get(e.pair_id()).map(|i| BurstJson {
                     group: i.group,
                     size: i.size,
                     rank: i.rank,
-                    keep: i.keep,
+                    keep: manual_keep.get(&rel).copied().unwrap_or(i.keep),
+                    suggested_keep: i.keep,
+                    manual_keep: manual_keep.get(&rel).copied(),
                     pose_cluster: i.pose_cluster,
                 }),
             }
@@ -149,8 +181,30 @@ pub fn build_snapshot(root: &Path, cfg: &ScoreConfig, cache_path: &Path) -> anyh
 
     Ok(Snapshot {
         root: root.display().to_string(),
+        weights: WeightsJson {
+            sharpness: cfg.weights.sharpness,
+            exposure: cfg.weights.exposure,
+            noise: cfg.weights.noise,
+            composition: cfg.weights.composition,
+            aesthetic: cfg.weights.aesthetic,
+        },
         photos,
     })
+}
+
+fn scene_hint(analysis: Option<&AnalysisResult>, ai_mode: bool) -> SceneHintJson {
+    match analysis {
+        None => SceneHintJson { id: "unknown", label: "未识别", reason: "照片尚未评分，缺少场景线索。".into() },
+        Some(_) if !ai_mode => SceneHintJson { id: "unknown", label: "未识别", reason: "当前只有像素分析，没有人物检测结果。".into() },
+        Some(result) if result.faces > 0 => SceneHintJson {
+            id: "portrait", label: "人像候选",
+            reason: format!("检测到 {} 张人脸；舞台、运动等场景也可能有人物，需人工确认。", result.faces),
+        },
+        Some(_) => SceneHintJson {
+            id: "unknown", label: "未识别",
+            reason: "现有模型没有通用场景分类能力；未检测到人脸。".into(),
+        },
+    }
 }
 
 

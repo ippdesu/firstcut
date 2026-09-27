@@ -7,9 +7,11 @@
 
 pub mod config_edit;
 pub mod job;
+pub mod scene_feedback;
 pub mod snapshot;
 pub mod thumb;
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
@@ -23,6 +25,7 @@ use serde::Deserialize;
 
 use crate::config::ScoreConfig;
 use crate::review::job::{JobState, JobStatus};
+use scene_feedback::SceneFeedbackRecord;
 use snapshot::Snapshot;
 
 /// 内嵌前端（单文件 HTML，内联 CSS/JS）
@@ -34,6 +37,11 @@ pub struct AppState {
     /// UI 配置编辑的目标文件（--config 指定；缺省 <照片根>/.firstcut/config.toml）
     config_path: PathBuf,
     config_explicit: bool,
+    /// 用户手动设置的连拍保留状态（照片相对路径 → 是否保留）
+    burst_overrides: RwLock<HashMap<String, bool>>,
+    burst_overrides_path: PathBuf,
+    scene_feedback: RwLock<HashMap<String, SceneFeedbackRecord>>,
+    scene_feedback_path: PathBuf,
     port: u16,
     /// 当前快照；跑批完成后热替换
     snapshot: RwLock<Snapshot>,
@@ -53,7 +61,11 @@ pub fn serve(
     config_path: Option<&Path>,
 ) -> Result<()> {
     eprintln!("[review] 正在构建快照（扫描 + 缓存）……");
-    let snapshot = snapshot::build_snapshot(root, cfg, cache_path)?;
+    let burst_overrides_path = root.join(".firstcut").join("burst-overrides.json");
+    let burst_overrides = load_burst_overrides(&burst_overrides_path);
+    let scene_feedback_path = scene_feedback::store_path(root);
+    let feedback = scene_feedback::load_latest(&scene_feedback_path)?;
+    let snapshot = snapshot::build_snapshot(root, cfg, cache_path, &burst_overrides, &feedback)?;
     let scored = snapshot.photos.iter().filter(|p| p.scores.is_some()).count();
     eprintln!(
         "[review] 快照就绪：{} 张照片（已评分 {}，未评分 {}）",
@@ -70,6 +82,10 @@ pub fn serve(
         cache_path: cache_path.to_path_buf(),
         config_path,
         config_explicit,
+        burst_overrides: RwLock::new(burst_overrides),
+        burst_overrides_path,
+        scene_feedback: RwLock::new(feedback),
+        scene_feedback_path,
         port,
         snapshot: RwLock::new(snapshot),
         job: Arc::new(JobState::new()),
@@ -84,6 +100,8 @@ pub fn serve(
             .route("/api/job", get(job_status))
             .route("/api/score/run", post(score_run))
             .route("/api/rate", post(rate))
+            .route("/api/burst/keep", post(burst_keep))
+            .route("/api/scene-feedback", post(scene_feedback_save))
             .route("/api/config", get(config_get).post(config_save))
             .with_state(state);
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
@@ -248,7 +266,9 @@ async fn score_run(State(state): State<Arc<AppState>>, headers: HeaderMap,
         }) {
             Ok(summary) => {
                 // 快照热替换：新分数立即可见，无需重启服务
-                match snapshot::build_snapshot(&root, &cfg, &cache_path) {
+                let overrides = st.burst_overrides.read().unwrap().clone();
+                let feedback = st.scene_feedback.read().unwrap().clone();
+                match snapshot::build_snapshot(&root, &cfg, &cache_path, &overrides, &feedback) {
                     Ok(snap) => {
                         *st.snapshot.write().unwrap() = snap;
                         job.log("[review] 快照已刷新");
@@ -281,6 +301,123 @@ struct RateParams {
     p: String,
     /// 1~5 星
     stars: u8,
+}
+
+#[derive(Deserialize)]
+struct BurstKeepParams {
+    p: String,
+    /// true=手动保留，false=手动舍弃，null=恢复自动建议
+    keep: Option<bool>,
+}
+
+/// POST /api/burst/keep：保存单张照片的手动连拍保留决定。
+async fn burst_keep(State(state): State<Arc<AppState>>, headers: HeaderMap,
+    axum::Json(p): axum::Json<BurstKeepParams>) -> Response {
+    if !valid_local_host(&headers, state.port) { return StatusCode::FORBIDDEN.into_response(); }
+    if state.job.is_running() {
+        return (StatusCode::CONFLICT, "评分任务进行中，暂不能修改连拍标记").into_response();
+    }
+    let pair_id = {
+        let guard = state.snapshot.read().unwrap();
+        let Some(photo) = guard.photos.iter().find(|x| x.path == p.p && !x.is_raw) else {
+            return (StatusCode::NOT_FOUND, "照片不在快照中").into_response();
+        };
+        if !photo.burst.as_ref().is_some_and(|b| b.group > 0) {
+            return (StatusCode::BAD_REQUEST, "只有连拍组照片可以手动标记").into_response();
+        }
+        photo.pair_id.clone()
+    };
+
+    let mut overrides = state.burst_overrides.write().unwrap();
+    let previous = overrides.get(&p.p).copied();
+    if let Some(keep) = p.keep { overrides.insert(p.p.clone(), keep); }
+    else { overrides.remove(&p.p); }
+    let bytes = match serde_json::to_vec_pretty(&*overrides) {
+        Ok(bytes) => bytes,
+        Err(err) => return internal_error(err.into()),
+    };
+    if let Some(parent) = state.burst_overrides_path.parent() {
+        if let Err(err) = std::fs::create_dir_all(parent) {
+            restore_override(&mut overrides, &p.p, previous);
+            return internal_error(err.into());
+        }
+    }
+    if let Err(err) = std::fs::write(&state.burst_overrides_path, bytes) {
+        restore_override(&mut overrides, &p.p, previous);
+        return internal_error(err.into());
+    }
+    drop(overrides);
+
+    let mut guard = state.snapshot.write().unwrap();
+    for photo in guard.photos.iter_mut().filter(|x| x.pair_id == pair_id) {
+        if let Some(burst) = &mut photo.burst {
+            burst.keep = p.keep.unwrap_or(burst.suggested_keep);
+            burst.manual_keep = p.keep;
+        }
+    }
+    json_response(serde_json::json!({"ok": true, "keep": p.keep}))
+}
+
+fn restore_override(overrides: &mut HashMap<String, bool>, path: &str, previous: Option<bool>) {
+    if let Some(value) = previous { overrides.insert(path.to_string(), value); }
+    else { overrides.remove(path); }
+}
+
+fn load_burst_overrides(path: &Path) -> HashMap<String, bool> {
+    std::fs::read(path).ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+#[derive(Deserialize)]
+struct SceneFeedbackParams {
+    p: String,
+    selected_scene: String,
+    #[serde(default)]
+    note: String,
+}
+
+/// POST /api/scene-feedback：记录场景纠错与当前评分线索，供后续校准。
+async fn scene_feedback_save(State(state): State<Arc<AppState>>, headers: HeaderMap,
+    axum::Json(p): axum::Json<SceneFeedbackParams>) -> Response {
+    if !valid_local_host(&headers, state.port) { return StatusCode::FORBIDDEN.into_response(); }
+    if !scene_feedback::valid_scene(&p.selected_scene) {
+        return (StatusCode::BAD_REQUEST, "请选择有效的场景").into_response();
+    }
+    if p.note.chars().count() > 1000 {
+        return (StatusCode::BAD_REQUEST, "备注不能超过 1000 字").into_response();
+    }
+    if state.job.is_running() {
+        return (StatusCode::CONFLICT, "评分任务进行中，暂不能记录场景").into_response();
+    }
+    let record = {
+        let guard = state.snapshot.read().unwrap();
+        let Some(photo) = guard.photos.iter().find(|x| x.path == p.p && !x.is_raw) else {
+            return (StatusCode::NOT_FOUND, "照片不在快照中").into_response();
+        };
+        SceneFeedbackRecord {
+            photo_path: photo.path.clone(),
+            predicted_scene: photo.scene_hint.id.to_string(),
+            predicted_reason: photo.scene_hint.reason.clone(),
+            selected_scene: p.selected_scene,
+            note: p.note.trim().to_string(),
+            recorded_at_unix_ms: scene_feedback::now_unix_ms(),
+            faces: photo.faces,
+            analysis_mode: photo.analysis_mode.clone(),
+            scores: photo.scores.clone(),
+        }
+    };
+    let mut feedback = state.scene_feedback.write().unwrap();
+    if let Err(err) = scene_feedback::append(&state.scene_feedback_path, &record) {
+        return internal_error(err);
+    }
+    feedback.insert(record.photo_path.clone(), record.clone());
+    drop(feedback);
+    let mut guard = state.snapshot.write().unwrap();
+    if let Some(photo) = guard.photos.iter_mut().find(|x| x.path == record.photo_path) {
+        photo.scene_feedback = Some(record.clone());
+    }
+    json_response(serde_json::json!({"ok": true, "record": record}))
 }
 
 /// POST /api/rate：UI 内改星——只改 `xmp:Rating`，firstcut 子分字段保留；
@@ -483,8 +620,14 @@ mod tests {
             cache_path: dir.join("c.sqlite"),
             config_path: dir.join("firstcut.toml"),
             config_explicit: true,
+            burst_overrides: RwLock::new(HashMap::new()),
+            burst_overrides_path: dir.join(".firstcut").join("burst-overrides.json"),
+            scene_feedback: RwLock::new(HashMap::new()),
+            scene_feedback_path: scene_feedback::store_path(&dir),
             port: 8787,
-            snapshot: RwLock::new(Snapshot { root: dir.display().to_string(), photos: vec![] }),
+            snapshot: RwLock::new(Snapshot { root: dir.display().to_string(),
+                weights: snapshot::WeightsJson { sharpness: 0.3, exposure: 0.25, noise: 0.15,
+                    composition: 0.15, aesthetic: 0.15 }, photos: vec![] }),
             job: Arc::new(JobState::new()),
         };
         let ok = resolve_jpeg(&state, "d/a.jpg");
@@ -494,5 +637,105 @@ mod tests {
         let missing = resolve_jpeg(&state, "d/none.jpg");
         assert!(missing.is_err(), "不存在的路径应 403（canonicalize 失败）");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn manual_burst_keep_persists_and_can_restore_suggestion() {
+        let dir = std::env::temp_dir().join(format!("firstcut_burst_override_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let override_path = dir.join(".firstcut").join("burst-overrides.json");
+        let photo = snapshot::PhotoJson {
+            path: "scene/a.jpg".into(), filename: "a.jpg".into(), ext: "jpg".into(),
+            is_raw: false, has_pair: false, pair_id: "a".into(), datetime: String::new(),
+            iso: String::new(), f_number: String::new(), shutter: String::new(), focal: String::new(),
+            scores: None, stars: None, rating_source: None, analysis_mode: None, faces: 0,
+            scene_hint: snapshot::SceneHintJson { id: "unknown", label: "未识别", reason: String::new() },
+            scene_feedback: None,
+            burst: Some(snapshot::BurstJson { group: 7, size: 1, rank: 1, keep: true,
+                suggested_keep: true, manual_keep: None, pose_cluster: 1 }),
+        };
+        let state = Arc::new(AppState {
+            root: dir.clone(), cache_path: dir.join("cache.sqlite"), config_path: dir.join("config.toml"),
+            config_explicit: false, burst_overrides: RwLock::new(HashMap::new()),
+            burst_overrides_path: override_path.clone(),
+            scene_feedback: RwLock::new(HashMap::new()), scene_feedback_path: scene_feedback::store_path(&dir),
+            port: 8787,
+            snapshot: RwLock::new(Snapshot { root: dir.display().to_string(),
+                weights: snapshot::WeightsJson { sharpness: 0.3, exposure: 0.25, noise: 0.15,
+                    composition: 0.15, aesthetic: 0.15 }, photos: vec![photo] }),
+            job: Arc::new(JobState::new()),
+        });
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "127.0.0.1:8787".parse().unwrap());
+
+        let response = burst_keep(State(Arc::clone(&state)), headers.clone(), axum::Json(BurstKeepParams {
+            p: "scene/a.jpg".into(), keep: Some(false),
+        })).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let saved: HashMap<String, bool> = serde_json::from_slice(&std::fs::read(&override_path).unwrap()).unwrap();
+        assert_eq!(saved.get("scene/a.jpg"), Some(&false));
+        {
+            let guard = state.snapshot.read().unwrap();
+            let burst = guard.photos[0].burst.as_ref().unwrap();
+            assert!(!burst.keep);
+            assert_eq!(burst.manual_keep, Some(false));
+        }
+
+        let response = burst_keep(State(Arc::clone(&state)), headers, axum::Json(BurstKeepParams {
+            p: "scene/a.jpg".into(), keep: None,
+        })).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!state.burst_overrides.read().unwrap().contains_key("scene/a.jpg"));
+        let guard = state.snapshot.read().unwrap();
+        let burst = guard.photos[0].burst.as_ref().unwrap();
+        assert!(burst.keep, "清除手动标记应恢复自动建议");
+        assert_eq!(burst.manual_keep, None);
+        drop(guard);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn scene_feedback_endpoint_records_actual_score_context() {
+        let dir = std::env::temp_dir().join(format!("firstcut_scene_endpoint_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let feedback_path = scene_feedback::store_path(&dir);
+        let photo = snapshot::PhotoJson {
+            path: "a.jpg".into(), filename: "a.jpg".into(), ext: "jpg".into(),
+            is_raw: false, has_pair: false, pair_id: "a".into(), datetime: String::new(),
+            iso: String::new(), f_number: String::new(), shutter: String::new(), focal: String::new(),
+            scores: Some(snapshot::ScoresJson { sharpness: 40.0, exposure: 60.0, noise: 80.0,
+                composition: 50.0, aesthetic: 70.0, total: 57.5, suggested_ev: None }),
+            stars: Some(3), rating_source: None, analysis_mode: Some("ai".into()), faces: 1,
+            burst: None, scene_hint: snapshot::SceneHintJson { id: "portrait", label: "人像候选",
+                reason: "检测到 1 张人脸".into() }, scene_feedback: None,
+        };
+        let state = Arc::new(AppState {
+            root: dir.clone(), cache_path: dir.join("cache.sqlite"), config_path: dir.join("config.toml"),
+            config_explicit: false, burst_overrides: RwLock::new(HashMap::new()),
+            burst_overrides_path: dir.join(".firstcut").join("burst-overrides.json"),
+            scene_feedback: RwLock::new(HashMap::new()), scene_feedback_path: feedback_path.clone(),
+            port: 8787, snapshot: RwLock::new(Snapshot { root: dir.display().to_string(),
+                weights: snapshot::WeightsJson { sharpness: 0.3, exposure: 0.25, noise: 0.15,
+                    composition: 0.15, aesthetic: 0.15 }, photos: vec![photo] }),
+            job: Arc::new(JobState::new()),
+        });
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "127.0.0.1:8787".parse().unwrap());
+        let response = scene_feedback_save(State(Arc::clone(&state)), headers.clone(),
+            axum::Json(SceneFeedbackParams { p: "a.jpg".into(), selected_scene: "stage".into(),
+                note: "舞台灯光".into() })).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let saved = scene_feedback::load_latest(&feedback_path).unwrap();
+        assert_eq!(saved["a.jpg"].predicted_scene, "portrait");
+        assert_eq!(saved["a.jpg"].selected_scene, "stage");
+        assert_eq!(saved["a.jpg"].scores.as_ref().unwrap().total, 57.5);
+        assert_eq!(state.snapshot.read().unwrap().photos[0].scene_feedback.as_ref().unwrap().note, "舞台灯光");
+
+        let response = scene_feedback_save(State(state), headers,
+            axum::Json(SceneFeedbackParams { p: "a.jpg".into(), selected_scene: "invalid".into(),
+                note: String::new() })).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(std::fs::read_to_string(&feedback_path).unwrap().lines().count(), 1);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
