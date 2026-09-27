@@ -30,6 +30,12 @@ cargo build --release --features gpu
 > `pic_process.exe` 主二进制已静态链接 onnxruntime，单文件免 DLL；
 > 辅助二进制也随 release 一同构建，可按需取用。
 
+## 自动检查与发布
+
+GitHub Actions 的 [CI 工作流](.github/workflows/ci.yml) 在提交到 `main`、向 `main` 提交 PR 时运行 Windows 测试和发行构建，也可手动运行。[Release 工作流](.github/workflows/release.yml) 在推送版本标签时重新测试、构建三个发行程序，生成 SHA-256 校验文件并创建 GitHub Release。手动运行 Release 工作流只构建并保存 14 天的临时工件，不会发布新版本。
+
+发布新版本时，先将 `Cargo.toml` 中的版本号和 `Cargo.lock` 更新并合入 `main`，确认 CI 通过，然后推送对应标签。例如 `1.3.0` 使用 `v1.3` 或 `v1.3.0`。发布任务会核对标签与版本号，GitHub 自动生成发行说明。`v1.2` 是此前手动发布的版本；这套自动流程从下一个标签开始使用。模型文件和本地照片不会进入发行包。
+
 ## 模型准备（一次性）
 
 `score` 需要 `models/` 目录下三个模型（已 gitignore）：

@@ -1,0 +1,96 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Windows release
+    runs-on: windows-2025
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check tag matches Cargo version
+        if: github.event_name == 'push'
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          $match = Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"(\d+\.\d+\.\d+)"' | Select-Object -First 1
+          if (-not $match) { throw 'Cargo package version was not found.' }
+          $version = $match.Matches[0].Groups[1].Value
+          $shortVersion = $version -replace '\.0$', ''
+          if ($env:RELEASE_TAG -notin @("v$version", "v$shortVersion")) {
+            throw "Tag $env:RELEASE_TAG does not match Cargo version $version."
+          }
+      - name: Install stable Rust
+        shell: pwsh
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Cache Cargo downloads
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+      - name: Run tests
+        run: cargo test --locked --all-targets
+      - name: Build release programs
+        run: cargo build --release --locked --bin pic_process --bin pic_process-gallery --bin pic_process-tune
+      - name: Package programs and checksums
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+          $names = @('pic_process.exe', 'pic_process-gallery.exe', 'pic_process-tune.exe')
+          foreach ($name in $names) {
+            Copy-Item -LiteralPath "target/release/$name" -Destination "dist/$name"
+          }
+          $checksums = foreach ($name in $names) {
+            $hash = (Get-FileHash -LiteralPath "dist/$name" -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $name"
+          }
+          [IO.File]::WriteAllLines('dist/SHA256SUMS.txt', [string[]]$checksums)
+      - name: Save build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: firstcut-windows-x64
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish GitHub Release
+    if: github.event_name == 'push'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: firstcut-windows-x64
+          path: dist
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$RELEASE_TAG" \
+            dist/pic_process.exe \
+            dist/pic_process-gallery.exe \
+            dist/pic_process-tune.exe \
+            dist/SHA256SUMS.txt \
+            --repo "$GH_REPO" \
+            --verify-tag \
+            --generate-notes \
+            --title "firstcut $RELEASE_TAG"
