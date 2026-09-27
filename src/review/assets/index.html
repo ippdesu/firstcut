@@ -39,9 +39,13 @@
   #lb .top button{background:#222;border:1px solid var(--line);color:var(--fg);padding:4px 12px;border-radius:4px;cursor:pointer}
   #lb .top button.on{background:var(--acc);color:#000;border-color:var(--acc)}
   #lb .top .close{margin-left:auto;font-size:18px}
-  #lbDetails{position:absolute;top:50px;right:12px;bottom:96px;width:min(360px,calc(100vw - 24px));z-index:22;display:none;overflow-y:auto;background:rgba(30,30,30,.97);border:1px solid #444;border-radius:8px;box-shadow:0 8px 28px rgba(0,0,0,.6);padding:14px;font-size:12px}
-  #lbDetails .head{display:flex;align-items:center;justify-content:space-between;font-weight:600;font-size:14px}
+  #lbDetails{position:absolute;top:50px;right:12px;width:min(360px,calc(100vw - 24px));height:min(540px,calc(100vh - 160px));min-width:260px;min-height:180px;max-width:calc(100vw - 24px);max-height:calc(100vh - 72px);z-index:22;display:none;overflow:auto;resize:both;background:rgba(30,30,30,.97);border:1px solid #444;border-radius:8px;box-shadow:0 8px 28px rgba(0,0,0,.6);padding:14px;font-size:12px}
+  #lbDetails .head{position:sticky;top:0;z-index:1;display:flex;align-items:center;justify-content:space-between;background:rgba(30,30,30,.98);font-weight:600;font-size:14px;cursor:move;user-select:none;touch-action:none}
   #lbDetails .head button{background:none;border:0;color:var(--fg);font-size:20px;cursor:pointer}
+  #lbDetails .panel-tip{color:var(--dim);font-size:10px;margin-top:3px}
+  #lbDetails .photo-pick{display:flex;align-items:center;gap:8px;margin:10px 0 2px}
+  #lbDetails .photo-pick label{white-space:nowrap}
+  #lbDetails .photo-pick select{width:auto;flex:1;min-width:0;margin:0}
   #lbDetails h4{margin:14px 0 6px;color:var(--acc);font-size:12px}
   #lbDetails .detail-note{color:var(--dim);font-size:11px;line-height:1.45;margin:5px 0}
   #lbDetails .score-row{padding:6px 0;border-bottom:1px solid #333}
@@ -54,6 +58,7 @@
   #panes{flex:1;display:flex;gap:2px;min-height:0}
   .pane{flex:1;position:relative;overflow:hidden;background:#000;cursor:grab}
   .pane.dragging{cursor:grabbing}
+  .pane.active::after{content:"";position:absolute;inset:0;border:2px solid var(--acc);pointer-events:none;z-index:2}
   .pane img{position:absolute;transform-origin:0 0;user-select:none;-webkit-user-drag:none;pointer-events:none}
   .pane .tag{position:absolute;top:6px;left:8px;font-size:12px;background:rgba(0,0,0,.7);padding:2px 8px;border-radius:4px;pointer-events:none}
   .pane .hint{position:absolute;bottom:8px;left:50%;transform:translateX(-50%);font-size:11px;color:var(--dim);pointer-events:none}
@@ -172,6 +177,8 @@
   <div id="panes"></div>
   <div id="lbDetails" aria-label="照片评分与场景">
     <div class="head">评分与场景 <button id="lbDetailsClose" title="关闭面板">×</button></div>
+    <div class="panel-tip">拖动标题移动 · 右下角调整大小</div>
+    <div class="photo-pick" id="lbDetailsPicker"><label for="lbDetailsPhoto">当前照片</label><select id="lbDetailsPhoto"></select></div>
     <div id="lbDetailsBody"></div>
   </div>
   <div id="strip"></div>
@@ -446,11 +453,11 @@ window.addEventListener("scroll", hidePhotoContextMenu, true);
 window.addEventListener("resize", hidePhotoContextMenu);
 
 // ---------- 灯箱（1:1 缩放 / 并排同步对比） ----------
-let LB = null; // {list, idx, compare, sel:Set, view:{s, ax, ay, fx, fy}}
+let LB = null; // {list, idx, compare, sel:Set, activePath, view:{s, ax, ay, fx, fy}}
 const lbEl = document.getElementById("lb");
 
 function openLightbox(p, list){
-  LB = { list, idx: list.indexOf(p), compare:false, sel:new Set([p.path]), view:{s:1, ax:.5, ay:.5, fx:.5, fy:.5}, detailsOpen:true };
+  LB = { list, idx: list.indexOf(p), compare:false, sel:new Set([p.path]), activePath:p.path, view:{s:1, ax:.5, ay:.5, fx:.5, fy:.5}, detailsOpen:true };
   lbEl.style.display = "flex";
   renderLB();
 }
@@ -473,38 +480,63 @@ function groupMembers(){
   }
   return [cur];
 }
-
-function renderLB(){
+function shownPhotos(){
+  if(!LB) return [];
   const cur = LB.list[LB.idx];
+  if(!LB.compare) return [cur];
+  const shown = [...LB.sel].map(path => jpgs.find(p=>p.path===path)).filter(Boolean);
+  return shown.length ? shown : [cur];
+}
+function activePhoto(){
+  if(!LB) return null;
+  return shownPhotos().find(p=>p.path===LB.activePath) || shownPhotos()[0];
+}
+function selectPane(path){
+  if(!LB || !LB.compare || !LB.sel.has(path) || LB.activePath === path) return;
+  LB.activePath = path;
+  renderLBActive();
+}
+function renderLBActive(){
+  const cur = activePhoto();
+  if(!cur) return;
   document.getElementById("lbName").textContent = cur.filename;
   document.getElementById("lbMeta").textContent =
     `${cur.stars ? "★".repeat(cur.stars)+" " : ""}${cur.scores ? "总分 "+cur.scores.total.toFixed(1) : "未评分"}`
     + (cur.burst && cur.burst.group ? ` · 组${cur.burst.group} 第${cur.burst.rank}/${cur.burst.size}名（姿势簇${cur.burst.pose_cluster}）${cur.burst.manual_keep!=null?" 手动":""}${cur.burst.keep?" ✓保留":" ✗舍弃"}` : "")
     + ` · ${cur.iso? "ISO"+cur.iso : ""} ${cur.f_number||""} ${cur.shutter||""} ${cur.focal||""}`;
+  document.querySelectorAll("#panes .pane").forEach(pane=>pane.classList.toggle("active", pane.dataset.path===cur.path));
+  document.querySelectorAll("#strip .st").forEach(item=>item.classList.toggle("cur", item.dataset.path===cur.path));
+  renderLbStars();
+  renderLBDetails();
+}
+
+function renderLB(){
+  const cur = LB.list[LB.idx];
   document.getElementById("lbCompare").classList.toggle("on", LB.compare);
 
   // 窗格
   const panes = document.getElementById("panes");
   panes.innerHTML = "";
-  const shown = LB.compare ? [...LB.sel].map(path => jpgs.find(p=>p.path===path)).filter(Boolean) : [cur];
+  const shown = shownPhotos();
+  if(!shown.some(p=>p.path===LB.activePath)) LB.activePath = shown[0].path;
   for(const p of shown){
     const pane = document.createElement("div");
     pane.className = "pane"; pane.dataset.path = p.path;
     pane.innerHTML = `<img src="/image?p=${encodeURIComponent(p.path)}">
       <span class="tag">${escapeHtml(p.filename)}${p.scores ? " · "+p.scores.total.toFixed(1) : ""}</span>
-      <span class="hint">滚轮缩放 · 拖拽平移 · 双击复位</span>`;
+      <span class="hint">${LB.compare ? "点击查看评分 · " : ""}滚轮缩放 · 拖拽平移 · 双击复位</span>`;
     bindPane(pane);
     panes.appendChild(pane);
   }
   requestAnimationFrame(()=> layoutPanes());
 
-  renderLbStars();
   // 底条（组内成员，供导航与对比勾选）
   const strip = document.getElementById("strip");
   strip.innerHTML = "";
   for(const m of groupMembers()){
     const d = document.createElement("div");
-    d.className = "st" + (m.path === cur.path ? " cur" : "");
+    d.className = "st";
+    d.dataset.path = m.path;
     const checked = LB.sel.has(m.path) ? "checked" : "";
     d.innerHTML = `<img loading="lazy" src="/thumb?p=${encodeURIComponent(m.path)}">
       ${LB.compare ? `<input type="checkbox" ${checked}>` : ""}
@@ -514,19 +546,28 @@ function renderLB(){
         if(e.target.checked){
           if(LB.sel.size >= 4){ e.target.checked = false; return; }
           LB.sel.add(m.path);
+          LB.activePath = m.path;
         } else {
           if(LB.sel.size <= 1){ e.target.checked = false; return; }
           LB.sel.delete(m.path);
+          if(LB.activePath === m.path) LB.activePath = [...LB.sel][0];
         }
         renderLB();
+      } else if(LB.compare){
+        if(LB.sel.has(m.path)) selectPane(m.path);
+        else if(LB.sel.size < 4){ LB.sel.add(m.path); LB.activePath = m.path; renderLB(); }
+        else toast('最多并排对比 4 张照片');
       } else {
-        LB.idx = LB.list.indexOf(m);
+        let idx = LB.list.findIndex(p=>p.path===m.path);
+        if(idx < 0){ LB.list = groupMembers(); idx = LB.list.findIndex(p=>p.path===m.path); }
+        LB.idx = idx;
+        LB.activePath = m.path;
         renderLB();
       }
     });
     strip.appendChild(d);
   }
-  renderLBDetails();
+  renderLBActive();
 }
 const SCENE_OPTIONS = [
   ['portrait','人像 / 人物'],['stage','舞台 / 演出'],['highkey','高调 / 雪景'],
@@ -540,7 +581,13 @@ function renderLBDetails(){
   document.getElementById('lbDetailsToggle').classList.toggle('on', LB.detailsOpen);
   document.getElementById('lbDetailsToggle').setAttribute('aria-expanded', String(LB.detailsOpen));
   if(!LB.detailsOpen) return;
-  const photo = LB.list[LB.idx];
+  const photo = activePhoto();
+  const picker = document.getElementById('lbDetailsPicker');
+  picker.style.display = LB.compare ? 'flex' : 'none';
+  if(LB.compare){
+    document.getElementById('lbDetailsPhoto').innerHTML = shownPhotos().map((p,i)=>
+      `<option value="${i}" ${p.path===photo.path?'selected':''}>${escapeHtml(p.filename)}</option>`).join('');
+  }
   const weights = SNAPSHOT.weights || {};
   const body = document.getElementById('lbDetailsBody');
   const scores = photo.scores;
@@ -570,6 +617,10 @@ function renderLBDetails(){
     <p class="detail-note">记录会保存到照片目录的 .firstcut/scene-feedback.jsonl，供后续改进识别与评分。</p>`;
   document.getElementById('lbSceneSave').addEventListener('click', ()=>saveSceneFeedback(photo));
 }
+document.getElementById('lbDetailsPhoto').addEventListener('change', e=>{
+  const photo = shownPhotos()[Number(e.target.value)];
+  if(photo) selectPane(photo.path);
+});
 async function saveSceneFeedback(photo){
   const selected_scene = document.getElementById('lbSceneSelect').value;
   const note = document.getElementById('lbSceneNote').value.trim();
@@ -596,10 +647,47 @@ document.getElementById('lbDetailsClose').addEventListener('click', ()=>{
   LB.detailsOpen = false;
   renderLBDetails();
 });
+const detailsPanel = document.getElementById('lbDetails');
+const detailsHead = detailsPanel.querySelector('.head');
+let detailsDrag = null;
+function placeDetailsPanel(left, top){
+  const maxLeft = Math.max(8, lbEl.clientWidth - detailsPanel.offsetWidth - 8);
+  const maxTop = Math.max(48, lbEl.clientHeight - detailsPanel.offsetHeight - 8);
+  detailsPanel.style.left = `${Math.max(8, Math.min(maxLeft, left))}px`;
+  detailsPanel.style.top = `${Math.max(48, Math.min(maxTop, top))}px`;
+}
+detailsHead.addEventListener('pointerdown', e=>{
+  if(e.button !== 0 || e.target.closest('button')) return;
+  const rect = detailsPanel.getBoundingClientRect();
+  const host = lbEl.getBoundingClientRect();
+  detailsPanel.style.right = 'auto';
+  detailsPanel.style.bottom = 'auto';
+  detailsDrag = {id:e.pointerId, x:e.clientX, y:e.clientY, left:rect.left-host.left, top:rect.top-host.top};
+  placeDetailsPanel(detailsDrag.left, detailsDrag.top);
+  detailsHead.setPointerCapture(e.pointerId);
+  e.preventDefault();
+});
+detailsHead.addEventListener('pointermove', e=>{
+  if(!detailsDrag || e.pointerId !== detailsDrag.id) return;
+  placeDetailsPanel(detailsDrag.left + e.clientX - detailsDrag.x,
+    detailsDrag.top + e.clientY - detailsDrag.y);
+});
+for(const eventName of ['pointerup','pointercancel']){
+  detailsHead.addEventListener(eventName, e=>{
+    if(detailsDrag && e.pointerId === detailsDrag.id) detailsDrag = null;
+  });
+}
+window.addEventListener('resize', ()=>{
+  if(detailsPanel.style.left) placeDetailsPanel(parseFloat(detailsPanel.style.left), parseFloat(detailsPanel.style.top));
+});
+new ResizeObserver(()=>{
+  if(detailsPanel.style.left) placeDetailsPanel(parseFloat(detailsPanel.style.left), parseFloat(detailsPanel.style.top));
+}).observe(detailsPanel);
 document.getElementById("lbCompare").addEventListener("click", function(){
   LB.compare = !LB.compare;
   const cur = LB.list[LB.idx];
   if(LB.compare){ LB.sel = new Set([cur.path]); const g = groupMembers().filter(m=>m.path!==cur.path); if(g[0]) LB.sel.add(g[0].path); }
+  LB.activePath = cur.path;
   renderLB();
 });
 
@@ -622,6 +710,7 @@ function bindPane(pane){
   }, {passive:false});
   let drag = null;
   pane.addEventListener("mousedown", e=>{
+    selectPane(pane.dataset.path);
     drag = {x:e.clientX, y:e.clientY, ax:LB.view.ax, ay:LB.view.ay};
     pane.classList.add("dragging");
   });
@@ -665,12 +754,20 @@ window.addEventListener("keydown", e=>{
   if(e.key === "Escape"){ LB && LB.compare ? (LB.compare = false, renderLB()) : closeLightbox(); }
   else if(isTypingTarget(e.target)) return;
   else if(e.key === "ArrowRight" || e.key === "ArrowLeft"){
+    if(LB.compare){
+      const shown = shownPhotos();
+      let i = shown.findIndex(p=>p.path===LB.activePath);
+      i = e.key === "ArrowRight" ? (i+1) % shown.length : (i-1+shown.length) % shown.length;
+      selectPane(shown[i].path);
+      return;
+    }
     const set = lbNavSet();
     const cur = LB.list[LB.idx];
     let i = set.findIndex(p => p.path === cur.path);
     i = e.key === "ArrowRight" ? (i+1) % set.length : (i-1+set.length) % set.length;
     LB.idx = LB.list.indexOf(set[i]);
-    LB.view = {s:1, ax:.5, ay:.5};
+    LB.activePath = set[i].path;
+    LB.view = {s:1, ax:.5, ay:.5, fx:.5, fy:.5};
     renderLB();
   }
 });
@@ -727,7 +824,7 @@ pollJob();
 
 // 星级：灯箱内按钮 + 快捷键
 function renderLbStars(){
-  const cur = LB && LB.list[LB.idx];
+  const cur = activePhoto();
   const box = document.getElementById('lbStars');
   box.innerHTML = '';
   if(!cur || !cur.scores){ box.innerHTML = '<span class="dim" style="font-size:11px">未评分</span>'; return; }
@@ -759,7 +856,7 @@ function setStars(photo, n){
 window.addEventListener('keydown', e=>{
   if(lbEl.style.display !== 'flex' || isTypingTarget(e.target)) return;
   if(e.key >= '1' && e.key <= '5'){
-    const cur = LB && LB.list[LB.idx];
+    const cur = activePhoto();
     if(cur && cur.scores) setStars(cur, +e.key);
   }
 });
