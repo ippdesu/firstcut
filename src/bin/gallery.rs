@@ -20,8 +20,8 @@ struct Args {
     /// score 子命令输出的 CSV
     report: PathBuf,
     /// 输出 HTML 路径
-    #[arg(short, long, default_value = "gallery.html")]
-    output: PathBuf,
+    #[arg(short, long)]
+    output: Option<PathBuf>,
     /// 缩略图长边像素
     #[arg(long, default_value_t = 320)]
     thumb: u32,
@@ -43,6 +43,10 @@ struct Row {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    let output = args.output.clone().unwrap_or_else(|| {
+        args.report.parent().unwrap_or_else(|| std::path::Path::new("."))
+            .join("gallery.html")
+    });
 
     // 读取 CSV（首行为表头）
     let mut reader = csv::Reader::from_path(&args.report)?;
@@ -118,7 +122,8 @@ fn main() -> Result<()> {
         rows[b].total.partial_cmp(&rows[a].total).unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    let mut out = std::fs::File::create(&args.output)?;
+    if let Some(parent) = output.parent() { std::fs::create_dir_all(parent)?; }
+    let mut out = std::fs::File::create(&output)?;
     writeln!(out, "<!DOCTYPE html><html lang=\"zh\"><head><meta charset=\"utf-8\">")?;
     writeln!(out, "<title>firstcut 评分联系表（{} 张）</title>", rows.len())?;
     writeln!(
@@ -185,6 +190,6 @@ fn main() -> Result<()> {
         }});
         </script></body></html>"#
     )?;
-    eprintln!("[gallery] 已生成 {}（{} 张）", args.output.display(), rows.len());
+    eprintln!("[gallery] 已生成 {}（{} 张）", output.display(), rows.len());
     Ok(())
 }

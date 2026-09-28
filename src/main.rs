@@ -18,17 +18,17 @@ enum Commands {
     Scan {
         /// 照片目录
         dir: PathBuf,
-        /// 输出 CSV 路径（默认 report.csv）
-        #[arg(short, long, default_value = "report.csv")]
-        output: PathBuf,
+        /// 输出 CSV 路径（默认 <照片目录>/.firstcut/scan-report.csv）
+        #[arg(short, long)]
+        output: Option<PathBuf>,
     },
     /// 扫描并评分（清晰度/曝光/噪点/构图/美学 + 连拍去重），输出 CSV
     Score {
         /// 照片目录
         dir: PathBuf,
-        /// 输出 CSV 路径（默认 report.csv）
-        #[arg(short, long, default_value = "report.csv")]
-        output: PathBuf,
+        /// 输出 CSV 路径（默认 <照片目录>/.firstcut/report.csv）
+        #[arg(short, long)]
+        output: Option<PathBuf>,
         /// 连拍保留单元（姿态簇/dHash 子簇）内保留前 K 张
         /// （缺省用 `[dedup] keep_k` 配置，默认 3）
         #[arg(short, long)]
@@ -39,13 +39,13 @@ enum Commands {
         /// 写 XMP 星级侧车（xmp:Rating + firstcut 子分）
         #[arg(long)]
         xmp: bool,
-        /// 增量缓存文件路径（默认 pic_process_cache.sqlite）
-        #[arg(long, default_value = "pic_process_cache.sqlite")]
-        cache: PathBuf,
+        /// 增量缓存文件路径（默认 <照片目录>/.firstcut/cache.sqlite）
+        #[arg(long)]
+        cache: Option<PathBuf>,
         /// 禁用增量缓存
         #[arg(long)]
         no_cache: bool,
-        /// 评分配置文件（TOML，可多场景存多份；缺省用内置默认）
+        /// 评分配置文件（默认优先读取 <照片目录>/.firstcut/config.toml）
         #[arg(long)]
         config: Option<PathBuf>,
         /// 实验性：用 DirectML GPU 推理（需 cargo build --features gpu；
@@ -55,9 +55,9 @@ enum Commands {
     },
     /// 输出默认评分配置模板（可存多份场景配置）
     ConfigTemplate {
-        /// 输出路径（默认 firstcut.toml）
-        #[arg(short, long, default_value = "firstcut.toml")]
-        output: PathBuf,
+        /// 输出路径（默认当前工作目录下的 .firstcut/firstcut-template.toml）
+        #[arg(short, long)]
+        output: Option<PathBuf>,
         /// 输出内置场景预设而非通用模板（portrait/stage/highkey/sports/lowlight）
         #[arg(long, value_name = "名称")]
         preset: Option<String>,
@@ -69,9 +69,9 @@ enum Commands {
         /// 评分配置（与 score 相同的 TOML；影响总分/星级/连拍划分）
         #[arg(long)]
         config: Option<PathBuf>,
-        /// 增量缓存文件（应与 score 用的同一份）
-        #[arg(long, default_value = "pic_process_cache.sqlite")]
-        cache: PathBuf,
+        /// 增量缓存文件（默认 <照片目录>/.firstcut/cache.sqlite）
+        #[arg(long)]
+        cache: Option<PathBuf>,
         /// 监听端口（仅绑定 127.0.0.1）
         #[arg(long, default_value_t = 8787)]
         port: u16,
@@ -85,12 +85,17 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Commands::Scan { dir, output } => {
+            let dir = pic_process::review::normal_photo_root(&dir)?;
+            let paths = pic_process::review::photo_root_paths(&dir);
+            let output = output.unwrap_or(paths.scan_report);
+            if let Some(parent) = output.parent() { std::fs::create_dir_all(parent)?; }
             let entries = scan::scan_directory(&dir)?;
             eprintln!("[scan] 发现 {} 个文件（JPG/ARW）", entries.len());
             pic_process::output::csv::write_csv(&output, &entries)?;
             eprintln!("[scan] CSV 已写出: {}", output.display());
         }
         Commands::ConfigTemplate { output, preset } => {
+            let output = output.unwrap_or_else(|| PathBuf::from(".firstcut/firstcut-template.toml"));
             let text = match &preset {
                 Some(name) => match pic_process::config::preset(name) {
                     Some(t) => t.to_string(),
@@ -105,34 +110,45 @@ fn main() -> Result<()> {
                 },
                 None => pic_process::config::config_template(),
             };
+            if let Some(parent) = output.parent() { std::fs::create_dir_all(parent)?; }
             std::fs::write(&output, text)?;
             eprintln!("[config] 已写出: {}", output.display());
         }
         Commands::Score { dir, output, keep, no_ai, xmp, cache, no_cache, config, gpu } => {
+            let dir = pic_process::review::normal_photo_root(&dir)?;
+            let paths = pic_process::review::photo_root_paths(&dir);
+            std::fs::create_dir_all(&paths.state_dir)?;
             // 0) 评分配置（默认或文件）
             //    显式传入的配置加载失败必须硬报错：静默回退默认值会让用户
             //    以为参数已生效（M6-4 同类问题的解析层版本）
-            let cfg = match &config {
-                Some(path) => pic_process::config::load_config(path).map_err(|err| {
-                    anyhow::anyhow!("配置加载失败: {}\n{err:#}", path.display())
-                })?,
-                None => ScoreConfig::default(),
+            let selected_config = config.as_ref().unwrap_or(&paths.config);
+            let cfg = if selected_config.exists() {
+                pic_process::config::load_config(selected_config).map_err(|err| {
+                    anyhow::anyhow!("配置加载失败: {}\n{err:#}", selected_config.display())
+                })?
+            } else if config.is_some() {
+                anyhow::bail!("配置加载失败: {}\n文件不存在", selected_config.display());
+            } else {
+                ScoreConfig::default()
             };
-            if config.is_some() {
-                eprintln!("[score] 配置已加载: {}", config.as_ref().unwrap().display());
+            if selected_config.exists() {
+                eprintln!("[score] 配置已加载: {}", selected_config.display());
+            } else {
+                eprintln!("[score] 使用内置默认配置（照片根目录尚无 UI 配置）");
             }
 
             // 评分流水线在库内（score::run_score_job），review 界面的"重新评分"共用同一实现
+            let preferences = pic_process::review::load_ui_preferences(&dir);
             let opts = score::ScoreJobOptions {
-                output_csv: output,
-                cache_path: cache,
+                output_csv: output.unwrap_or(paths.report),
+                cache_path: cache.unwrap_or(paths.cache),
                 no_cache,
                 no_ai,
                 xmp,
                 gpu,
                 keep_override: keep,
-                include_raw: true,
-                skip_processed: false,
+                include_raw: preferences.include_raw,
+                skip_processed: true,
             };
             score::run_score_job(&dir, &cfg, &opts, &|ev| match ev {
                 score::ScoreEvent::Info(s) => eprintln!("[score] {s}"),
@@ -146,20 +162,23 @@ fn main() -> Result<()> {
             })?;
         }
         Commands::Review { dir, config, cache, port, no_browser } => {
+            let dir = pic_process::review::normal_photo_root(&dir)?;
+            let paths = pic_process::review::photo_root_paths(&dir);
             // 与 score 相同的 fail-fast 配置加载
-            let cfg = match &config {
-                Some(path) => pic_process::config::load_config(path).map_err(|err| {
-                    anyhow::anyhow!("配置加载失败: {}\n{err:#}", path.display())
-                })?,
-                None => {
-                    let saved = dir.join(".firstcut").join("config.toml");
-                    if saved.exists() { pic_process::config::load_config(&saved)? }
-                    else { ScoreConfig::default() }
-                },
+            let selected_config = config.as_ref().unwrap_or(&paths.config);
+            let cfg = if selected_config.exists() {
+                pic_process::config::load_config(selected_config).map_err(|err| {
+                    anyhow::anyhow!("配置加载失败: {}\n{err:#}", selected_config.display())
+                })?
+            } else if config.is_some() {
+                anyhow::bail!("配置加载失败: {}\n文件不存在", selected_config.display());
+            } else {
+                ScoreConfig::default()
             };
             if config.is_some() {
                 eprintln!("[review] 配置已加载: {}", config.as_ref().unwrap().display());
             }
+            let cache = cache.unwrap_or(paths.cache);
             pic_process::review::serve(&dir, &cfg, &cache, port, !no_browser, config.as_deref())
                 .with_context(|| "复核服务启动失败")?;
         }

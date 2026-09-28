@@ -4,7 +4,7 @@
 **五维评分**（清晰度 / 曝光 / 噪点 / 构图 / 美学），连拍去重排序，输出
 **CSV 报告**和 **XMP 星级侧车**。全程本地运行、照片不上传。
 
-> 当前状态：**v1.2 已发布**，提供可用的本地照片复核界面、评分解释、筛选与人工决定，并统一 CLI、CSV、XMP 的星级来源。
+> 当前状态：**v1.3.0 准备发布**，提供可用的本地照片复核界面、评分解释、筛选与人工决定，并统一 UI 与 CLI 的照片发现和缓存行为。当前只支持 SDR JPEG。
 > 当前方向：本地初筛、人工复核、Lightroom 元数据交接。darktable 批量 RAW 开发路线已停止；历史调研保存在 `DESIGN.md` §9。
 
 ## 构建
@@ -33,13 +33,15 @@ cargo build --release --features gpu
 
 ### 双击启动复核 UI（Windows）
 
-运行发行包里的 `firstcut-ui.exe`，在目录窗口中选择照片根目录后会自动启动本地服务并打开浏览器。若 JPG 和 RAW 分放在 `JPG/`、`RAW/` 子目录，请选择同时包含这两个目录的活动根目录；只有 JPG 时可直接选择 JPG 目录。复核 UI 会递归扫描所选目录，但默认跳过其中名为 `Processed/` 的输出子目录；若要看成片，可直接选择 `Processed/` 本身。放在活动根目录顶层的 JPG 无法与原片自动区分，也会进入列表，建议把成片放进 `Processed/`。取消选目录会直接退出。侧栏的“选择照片目录…”可随时换目录；“关联同名 RAW 照片”开关可决定是否载入 RAW、把 JPG 分数映射到 RAW 并在评分或改星时写其 XMP 侧车。关闭后只处理 JPG，该偏好保存在所选根目录的 `.firstcut/ui-preferences.json`；CLI 默认仍关联 RAW。启动器使用所选根目录下的 `.firstcut/config.toml` 和 `.firstcut/cache.sqlite`；首次评分可在 UI 侧栏点击“重新评分”。
+运行发行包里的 `firstcut-ui.exe`，在目录窗口中选择照片根目录后会自动启动本地服务并打开浏览器。若 JPG 和 RAW 分放在 `JPG/`、`RAW/` 子目录，请选择同时包含这两个目录的活动根目录；只有 JPG 时可直接选择 JPG 目录。复核 UI 会递归扫描所选目录，但默认跳过其中名为 `Processed/` 的输出子目录；若要看成片，可直接选择 `Processed/` 本身。放在活动根目录顶层的 JPG 无法与原片自动区分，也会进入列表，建议把成片放进 `Processed/`。取消选目录会直接退出。侧栏的“选择照片目录…”可随时换目录；“关联同名 RAW 照片”开关可决定是否载入 RAW、把 JPG 分数映射到 RAW 并在评分或改星时写其 XMP 侧车。该开关保存在所选根目录的 `.firstcut/ui-preferences.json`，CLI 评分和 review 也读取相同偏好；UI 与 CLI 默认使用相同配置、缓存、扫描规则和照片根路径，不会因启动方式不同而换一套评分记录。
 
-浏览器会在启动后立即显示实际扫描阶段、已发现或已读取文件数，以及有总数时的进度条；完成后自动切换照片列表。若目录已有 `.firstcut/report.csv`，复核会复用其中未变照片的 EXIF 元数据来加快扫描，评分仍以 `cache.sqlite` 中的文件指纹和分析记录为准。Windows 启动器把系统返回的 `\\?\` 路径规范化为缓存中的普通绝对路径，以免同一目录被误判为不同目录。未找到可用评分时，页面会提示重新选择之前评分的照片目录，或继续按未评分照片浏览。启动器会从可执行文件所在目录及其上级目录寻找 `models/`，因此在项目内双击 `target/release/firstcut-ui.exe` 也能命中原有 AI 评分缓存。GitHub Release 不包含模型文件；独立使用发行包时，请把模型放在可执行文件同级的 `models/` 目录。
+浏览器会在启动后立即显示实际扫描阶段、已发现或已读取文件数，以及有总数时的进度条；完成后自动切换照片列表。UI 和 CLI 默认共用所选照片根目录 `.firstcut/cache.sqlite`、`.firstcut/report.csv` 与 `.firstcut/config.toml`；扫描报告为 `.firstcut/scan-report.csv`。缩略图、人工决定、界面偏好、场景反馈和有大小上限的任务日志也都放在 `.firstcut/`。Windows 启动器把系统返回的 `\\?\` 路径规范化为缓存中的普通绝对路径，以免同一目录被误判为不同目录。未找到可用评分时，页面会提示重新选择之前评分的照片目录，或继续按未评分照片浏览。启动器会从可执行文件所在目录及其上级目录寻找 `models/`，因此在项目内双击 `target/release/firstcut-ui.exe` 也能命中原有 AI 评分缓存。GitHub Release 不包含模型文件；独立使用发行包时，请把模型放在可执行文件同级的 `models/` 目录。
 
 页面右上角的“重启服务”会重新读取配置与照片快照，“退出程序”会关闭本地服务并释放 8787 端口。评分运行时这两项操作会被拒绝，需等评分完成。仅关闭浏览器标签页不会停止服务；再次双击 `firstcut-ui.exe` 会重新打开仍在运行的页面。CLI 的 `review` 模式继续使用终端里的 Ctrl+C 退出。
 
-命令行用户继续运行 `pic_process review <照片目录>`，原有 CLI 流程保持不变。
+命令行用户继续运行 `pic_process review <照片目录>`。`scan`、`score` 和 `review` 默认都以照片目录作为状态归属位置，将缓存、报告和配置放到 `<照片目录>/.firstcut/`；显式传入 `--cache`、`--output` 或 `--config` 时以指定路径为准。`config-template` 没有照片目录参数，默认写入当前目录的 `.firstcut/firstcut-template.toml`；`tune` 默认写入照片目录 `.firstcut/metrics.csv`，`gallery` 默认把 HTML 联系表写在输入报告同目录。已有旧版工作目录缓存不会自动搬移；如需继续读取，CLI 可用 `--cache <旧缓存文件>` 显式指定，避免错误地把另一图库的缓存当成本目录数据。
+
+XMP 是唯一有意写在照片旁边的导出物：Lightroom 通过照片同目录的标准侧车文件识别星级和曝光建议。其他 firstcut 状态和报告不会散落在照片根目录。
 
 ## 自动检查与发布
 
@@ -64,10 +66,10 @@ GitHub Actions 的 [CI 工作流](.github/workflows/ci.yml) 在提交到 `main`�
 
 ```bash
 # 只建索引（EXIF + 配对，不评分）
-pic_process scan <照片目录> -o report.csv
+pic_process scan <照片目录>  # 默认写入 <照片目录>/.firstcut/scan-report.csv
 
 # 评分 + 连拍去重（推荐）
-pic_process score <照片目录> -o report.csv
+pic_process score <照片目录>  # 默认写入 <照片目录>/.firstcut/report.csv 和 cache.sqlite
 
 # 评分 + 写 XMP 星级侧车（Lightroom 可读）
 pic_process score <照片目录> --xmp
@@ -87,14 +89,14 @@ pic_process score <目录> --config x.toml # 自定义评分配置（多场景�
 pic_process score <目录> --gpu          # 实验性 DirectML（需 --features gpu 构建）
 
 # 生成评分配置模板
-pic_process config-template -o firstcut.toml
+pic_process config-template                   # 默认写入当前目录/.firstcut/firstcut-template.toml
 
 # 生成内置场景预设（portrait / stage / highkey / sports / lowlight）
-pic_process config-template --preset stage -o stage.toml
+pic_process config-template --preset stage -o .firstcut/config-stage.toml
 
 # 辅助工具
-pic_process-gallery report.csv -o gallery.html   # HTML 联系表（缩略图+分数）
-pic_process-tune <目录> -o metrics.csv           # 原始指标（调参用）
+pic_process-gallery <目录>/.firstcut/report.csv  # 默认写入报告同目录/gallery.html
+pic_process-tune <目录>                           # 默认写入 <目录>/.firstcut/metrics.csv
 ```
 
 ## 多场景配置
@@ -102,8 +104,8 @@ pic_process-tune <目录> -o metrics.csv           # 原始指标（调参用）
 不同拍摄场景用不同权重与曝光容差。内置 5 个场景预设，可直接生成后微调：
 
 ```bash
-pic_process config-template --preset stage -o stage.toml
-pic_process score <目录> --config stage.toml
+pic_process config-template --preset stage -o .firstcut/config-stage.toml
+pic_process score <目录> --config <目录>/.firstcut/config-stage.toml
 ```
 
 | 预设 | 适用场景 | 主要差异 |
@@ -193,7 +195,7 @@ pic_process score <目录> --config stage.toml
 
 > 注意：星级依赖"批次"——建议**整场照片一次跑完**。分批跑不同子目录会各自归一化，
 > 星级之间不可比。
-> 人工改星保存在照片根目录的 `.firstcut/decisions.sqlite`，优先于算法星级，并同步给配对的 JPG/ARW。此文件是用户决定，**备份照片目录时请保留**；评分缓存 `pic_process_cache.sqlite` 可删除后重建。旧版仅写入 XMP 的人工星级不会自动导入决定库，需要在复核界面重新确认。
+> 人工改星保存在照片根目录的 `.firstcut/decisions.sqlite`，优先于算法星级，并同步给配对的 JPG/ARW。此文件是用户决定，**备份照片目录时请保留**；评分缓存 `.firstcut/cache.sqlite` 可删除后重建。旧版仅写入 XMP 的人工星级不会自动导入决定库，需要在复核界面重新确认。
 
 **连拍去重（默认按姿势分组保留）**：先按 EXIF 拍摄时间排序，再以间隔 ≤2s 成组 → 组内按 dHash
 汉明距离 ≤10 分**子簇**（近乎同一张）→ 子簇内再按 **SCRFD 关键点姿态描述子**
@@ -216,7 +218,7 @@ pic_process review <目录> --port 9000 --config stage.toml
 - **1:1 原图灯箱**：点击卡片打开原图（按需直读原文件，不预生成），
   滚轮缩放、拖拽平移、双击复位，`←/→` 在同一连拍组内切换——缩略图看不清
   是否合焦时随时放大到 100%。顶部显示带单位的 ISO、光圈、快门和焦距信息。
-- **直方图**：灯箱顶部可显示或隐藏亮度与 RGB 直方图，面板可拖动；并排对比时跟随当前选中的照片。W（亮度）、R、G、B 通道可分别开关。横轴为 JPEG 解码后的 8-bit 色阶（0–255），纵轴为相对像素频数。抽样比例默认 10%，可在“程序配置 → 界面设置”中调整为 1–25%；比例越高，耗时和临时内存越大。固定网格抽样的暗部、亮部百分比是估计值，不能用于精确判断少量像素的过曝或欠曝；不生成磁盘缓存。
+- **直方图**：灯箱顶部可显示或隐藏亮度与 RGB 直方图，面板可拖动；并排对比时跟随当前选中的照片。W（亮度）、R、G、B 通道可分别开关。横轴为 JPEG 解码后的 8-bit 色阶（0–255），纵轴为相对像素频数。抽样比例默认 10%，可在“程序配置 → 界面设置”中调整为 1–25%；比例越高，耗时和临时内存越大。固定网格抽样的暗部、亮部百分比是估计值，不能用于精确判断少量像素的过曝或欠曝；不生成磁盘缓存。灯箱同时显示缩放百分比；照片信息中的快门、焦距带有 `s`、`mm` 单位。
 - **连拍组并排对比**：灯箱内勾选同组 2~4 张，并排窗格**同步缩放平移**
   （滚轮/拖拽作用于所有窗格），逐帧对比合焦位置。
 - **评分说明与场景标注**：打开照片后，悬浮面板列出五项子分、实际权重和各自贡献。并排对比时可点击窗格或在面板中选择照片；面板标题可拖动，右下角可调整大小。场景初判目前仅依据人脸检测给出“人像候选”，其余显示“未识别”；这不是通用场景分类器，也不会自动切换评分配置。可选择实际场景并写备注，记录追加到 `.firstcut/scene-feedback.jsonl`，供后续识别与评分校准。
@@ -228,6 +230,7 @@ pic_process review <目录> --port 9000 --config stage.toml
 - **配置编辑**：权重/星级阈值/EV 容差/[dedup] 表单化编辑，
   保存保留 TOML 注释，非法值（权重和越界等）拒绝写盘。
 - 默认 UI 配置位于照片根目录的 `.firstcut/config.toml`，再次打开 review 会自动加载；UI 跑批报告位于 `.firstcut/report.csv`。CLI 使用 UI 配置时传 `--config <照片目录>/.firstcut/config.toml`。
+- **图像兼容范围**：目前直方图与分析基于解码后的 SDR JPEG 像素；HDR 增益图、PQ/HLG 等 HDR 内容尚未识别或保留 HDR 亮度信息。HDR 照片暂按 SDR JPEG 兼容范围处理。
 - 数据来源：扫描目录 + SQLite 分析缓存 + 独立的人工决定库（星级/连拍与 `score` 同一逻辑在线计算）。
   未跑过评分的照片显示为未评分。
 

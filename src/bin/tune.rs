@@ -18,8 +18,8 @@ use pic_process::scan;
 #[derive(Parser)]
 struct Args {
     dir: PathBuf,
-    #[arg(short, long, default_value = "metrics.csv")]
-    output: PathBuf,
+    #[arg(short, long)]
+    output: Option<PathBuf>,
 }
 
 /// 直方图分位数（0-255）
@@ -41,10 +41,14 @@ fn percentile(hist: &[u64], q: f64) -> f64 {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    let output = args.output.unwrap_or_else(|| {
+        args.dir.join(".firstcut").join("metrics.csv")
+    });
+    if let Some(parent) = output.parent() { std::fs::create_dir_all(parent)?; }
     let entries = scan::scan_directory(&args.dir)?;
     let jpgs: Vec<_> = entries.iter().filter(|e| !e.is_raw).collect();
 
-    let mut wtr = csv::Writer::from_path(&args.output)?;
+    let mut wtr = csv::Writer::from_path(&output)?;
     wtr.write_record([
         "filename", "iso", "width", "height", "tenengrad_var", "luma_var",
         "norm_sharp", "edge_ratio", "reblur_p90", "dark_noise", "over_pct", "under_pct", "mean_luma",
@@ -90,11 +94,11 @@ fn main() -> Result<()> {
         wtr.write_record(&r)?;
     }
     wtr.flush()?;
-    eprintln!("[tune] 已写出 {}", args.output.display());
+    eprintln!("[tune] 已写出 {}", output.display());
 
     // 汇总
     let all: Vec<Vec<String>> = {
-        let mut reader = csv::Reader::from_path(&args.output)?;
+        let mut reader = csv::Reader::from_path(&output)?;
         reader.records().map(|r| r.unwrap().iter().map(|s| s.to_string()).collect()).collect()
     };
     if !all.is_empty() {

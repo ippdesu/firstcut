@@ -54,19 +54,40 @@ struct LoadProgress {
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(default)]
-struct UiPreferences {
-    include_raw: bool,
-    histogram_sample_percent: u8,
+pub struct UiPreferences {
+    pub include_raw: bool,
+    pub histogram_sample_percent: u8,
 }
 
 impl Default for UiPreferences {
     fn default() -> Self { Self { include_raw: true, histogram_sample_percent: 10 } }
 }
 
-fn load_ui_preferences(root: &Path) -> UiPreferences {
+pub fn load_ui_preferences(root: &Path) -> UiPreferences {
     std::fs::read(root.join(".firstcut/ui-preferences.json"))
         .ok().and_then(|bytes| serde_json::from_slice::<UiPreferences>(&bytes).ok())
         .unwrap_or_default()
+}
+
+/// 默认状态文件统一放在照片根目录，供 CLI、双击启动器和复核服务共用。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PhotoRootPaths {
+    pub state_dir: PathBuf,
+    pub cache: PathBuf,
+    pub report: PathBuf,
+    pub scan_report: PathBuf,
+    pub config: PathBuf,
+}
+
+pub fn photo_root_paths(root: &Path) -> PhotoRootPaths {
+    let state_dir = root.join(".firstcut");
+    PhotoRootPaths {
+        cache: state_dir.join("cache.sqlite"),
+        report: state_dir.join("report.csv"),
+        scan_report: state_dir.join("scan-report.csv"),
+        config: state_dir.join("config.toml"),
+        state_dir,
+    }
 }
 
 fn save_ui_preferences(root: &Path, preferences: &UiPreferences) -> Result<()> {
@@ -132,7 +153,9 @@ pub fn serve(
     open_browser: bool,
     config_path: Option<&Path>,
 ) -> Result<()> {
-    serve_once(root, cfg, cache_path, port, open_browser, config_path, false, true)?;
+    let preferences = load_ui_preferences(root);
+    serve_once(root, cfg, cache_path, port, open_browser, config_path,
+        false, preferences.include_raw, true)?;
     Ok(())
 }
 
@@ -141,10 +164,10 @@ pub fn serve_ui(root: &Path, pick_root: impl Fn() -> Option<PathBuf>) -> Result<
     let mut root = normal_photo_root(root)?;
     let mut open_browser = true;
     loop {
-        let state_dir = root.join(".firstcut");
-        std::fs::create_dir_all(&state_dir)?;
-        let cache_path = state_dir.join("cache.sqlite");
-        let config_path = root.join(".firstcut").join("config.toml");
+        let paths = photo_root_paths(&root);
+        std::fs::create_dir_all(&paths.state_dir)?;
+        let cache_path = paths.cache;
+        let config_path = paths.config;
         let config = if config_path.exists() {
             crate::config::load_config(&config_path)?
         } else {
@@ -152,7 +175,8 @@ pub fn serve_ui(root: &Path, pick_root: impl Fn() -> Option<PathBuf>) -> Result<
         };
         let preferences = load_ui_preferences(&root);
         let include_raw = preferences.include_raw;
-        match serve_once(&root, &config, &cache_path, 8787, open_browser, None, true, include_raw)? {
+        match serve_once(&root, &config, &cache_path, 8787, open_browser, None,
+            true, include_raw, true)? {
             Some(UiAction::Restart) => open_browser = false,
             Some(UiAction::Choose) => {
                 if let Some(next) = pick_root() {
@@ -186,6 +210,7 @@ fn serve_once(
     config_path: Option<&Path>,
     ui_control: bool,
     include_raw: bool,
+    skip_processed: bool,
 ) -> Result<Option<UiAction>> {
     let burst_overrides_path = root.join(".firstcut").join("burst-overrides.json");
     let burst_overrides = load_burst_overrides(&burst_overrides_path);
@@ -195,7 +220,7 @@ fn serve_once(
         Snapshot::empty(root, cfg)
     } else {
         build_review_snapshot(root, cfg, cache_path, &burst_overrides, &feedback,
-            include_raw, false, &|_, _, _| {})?
+            include_raw, skip_processed, &|_, _, _| {})?
     };
     let load_overrides = burst_overrides.clone();
     let load_feedback = feedback.clone();
@@ -260,7 +285,7 @@ fn serve_once(
                 };
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     build_review_snapshot(&load_root, &load_cfg, &load_cache,
-                        &load_overrides, &load_feedback, include_raw, true, &on_progress)
+                        &load_overrides, &load_feedback, include_raw, skip_processed, &on_progress)
                 }));
                 match result {
                     Ok(Ok(snapshot)) => *load_state.snapshot.write().unwrap() = snapshot,
@@ -535,7 +560,7 @@ async fn score_run(State(state): State<Arc<AppState>>, headers: HeaderMap,
         });
 
         let opts = crate::score::ScoreJobOptions {
-            output_csv: root.join(".firstcut").join("report.csv"),
+            output_csv: photo_root_paths(&root).report,
             cache_path: cache_path.clone(),
             no_cache: false,
             no_ai,
@@ -927,6 +952,31 @@ fn valid_control_origin(headers: &HeaderMap, port: u16) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn photo_root_outputs_share_one_hidden_state_directory() {
+        let root = Path::new("photos");
+        let paths = photo_root_paths(root);
+        assert_eq!(paths.state_dir, root.join(".firstcut"));
+        assert_eq!(paths.cache, paths.state_dir.join("cache.sqlite"));
+        assert_eq!(paths.report, paths.state_dir.join("report.csv"));
+        assert_eq!(paths.scan_report, paths.state_dir.join("scan-report.csv"));
+        assert_eq!(paths.config, paths.state_dir.join("config.toml"));
+    }
+
+    #[test]
+    fn preferences_keep_defaults_when_loading_older_partial_file() {
+        let dir = std::env::temp_dir().join(format!("firstcut_prefs_{}", std::process::id()));
+        let state_dir = dir.join(".firstcut");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        assert!(load_ui_preferences(&dir).include_raw);
+        assert_eq!(load_ui_preferences(&dir).histogram_sample_percent, 10);
+        std::fs::write(state_dir.join("ui-preferences.json"), r#"{"include_raw":false}"#).unwrap();
+        let preferences = load_ui_preferences(&dir);
+        assert!(!preferences.include_raw);
+        assert_eq!(preferences.histogram_sample_percent, 10);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[cfg(windows)]
     #[test]
