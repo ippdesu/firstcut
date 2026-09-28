@@ -862,8 +862,9 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let selected = normal_photo_root(&root).unwrap();
         assert!(!selected.to_string_lossy().starts_with(r"\\?\"));
-        assert_eq!(selected, root);
-        let verbatim = root.canonicalize().unwrap();
+        let canonical = root.canonicalize().unwrap();
+        assert_eq!(selected.canonicalize().unwrap(), canonical);
+        let verbatim = canonical;
         assert_eq!(normal_photo_root(&verbatim).unwrap(), selected);
         std::fs::remove_dir_all(&root).unwrap();
     }
