@@ -87,12 +87,27 @@
   /* ---- 灯箱 ---- */
   #lb{position:fixed;inset:0;background:rgba(0,0,0,.95);z-index:20;display:none;flex-direction:column}
   #lb .top{display:flex;align-items:center;gap:12px;padding:8px 14px;font-size:14px}
-  #lb .top .meta{color:var(--dim);font-size:12px}
+  #lb .top .meta{color:var(--dim);font-size:12px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   #lb .top button{background:#222;border:1px solid var(--line);color:var(--fg);padding:4px 12px;border-radius:4px;cursor:pointer}
   #lb .top button.on{background:var(--acc);color:#000;border-color:var(--acc)}
   #lb .top .close{margin-left:auto;font-size:18px}
+  #lbHistogram{position:absolute;top:50px;left:12px;width:min(320px,calc(100vw - 24px));z-index:21;background:rgba(25,25,25,.92);border:1px solid #444;border-radius:8px;box-shadow:0 8px 28px rgba(0,0,0,.5);padding:10px;font-size:12px;backdrop-filter:blur(4px)}
+  #lbHistogram .hist-head{display:flex;align-items:center;justify-content:space-between;font-weight:600;cursor:move;touch-action:none;user-select:none}
+  #lbHistogram .hist-head button{background:none;border:0;color:var(--fg);font-size:20px;cursor:pointer}
+  #lbHistogram .hist-photo{color:var(--dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin:4px 0 8px}
+  #lbHistogram canvas{display:block;width:100%;height:126px;background:#111;border:1px solid #333;border-radius:4px}
+  #lbHistogram .hist-legend{display:flex;gap:5px;margin-top:6px;font-size:11px}
+  #lbHistogram .hist-channel{border:1px solid #444;border-radius:4px;background:#222;color:#999;padding:2px 7px;cursor:pointer}
+  #lbHistogram .hist-channel.on{background:#383838;color:#fff;border-color:#777}
+  #lbHistogram .hist-channel[data-channel="0"].on{color:#fff}
+  #lbHistogram .hist-channel[data-channel="1"].on{color:#f66}
+  #lbHistogram .hist-channel[data-channel="2"].on{color:#6c6}
+  #lbHistogram .hist-channel[data-channel="3"].on{color:#69f}
+  #lbHistogram .hist-note{color:var(--dim);font-size:11px;margin-top:5px;line-height:1.4}
+  #lbHistogram .hist-axis-note{color:var(--dim);font-size:10px;margin-top:4px;line-height:1.35}
+  #uiHistogramSettings{margin-top:14px;padding-top:10px;border-top:1px solid var(--line)}
   #lbDetails{position:absolute;top:50px;right:12px;width:min(360px,calc(100vw - 24px));height:min(540px,calc(100vh - 160px));min-width:260px;min-height:180px;max-width:calc(100vw - 24px);max-height:calc(100vh - 72px);z-index:22;display:none;overflow:auto;resize:both;background:rgba(30,30,30,.97);border:1px solid #444;border-radius:8px;box-shadow:0 8px 28px rgba(0,0,0,.6);padding:14px;font-size:12px}
-  #lbDetails .head{position:sticky;top:0;z-index:1;display:flex;align-items:center;justify-content:space-between;background:rgba(30,30,30,.98);font-weight:600;font-size:14px;cursor:move;user-select:none;touch-action:none}
+  #lbDetails .head{position:sticky;top:-14px;z-index:5;display:flex;align-items:center;justify-content:space-between;background:#1e1e1e;box-shadow:0 5px 8px rgba(0,0,0,.75);margin:-14px -14px 0;padding:14px;font-weight:600;font-size:14px;cursor:move;user-select:none;touch-action:none}
   #lbDetails .head button{background:none;border:0;color:var(--fg);font-size:20px;cursor:pointer}
   #lbDetails .panel-tip{color:var(--dim);font-size:10px;margin-top:3px}
   #lbDetails .photo-pick{display:flex;align-items:center;gap:8px;margin:10px 0 2px}
@@ -219,6 +234,7 @@
       <div id="runBarWrap"><div id="runBar"></div></div>
       <div class="dim" id="runState" style="display:none"></div>
       <pre id="runLog"></pre>
+      <div class="dim">任务日志保存在照片目录的 .firstcut/review.log，文件上限 256 KiB。</div>
     </div>
     <details class="side-section" id="usageHelp"><summary>使用说明</summary>
       <div class="dim">点击卡片看 1:1 原图（滚轮缩放 / 拖拽平移 / 双击复位 / ←→ 组内切换 / Esc 关闭）。连拍组内可在灯箱勾选 2~4 张进入同步缩放对比。</div>
@@ -248,10 +264,24 @@
     <span class="meta" id="lbMeta"></span>
     <span class="starbtns" id="lbStars" title="点击改星（快捷键 1~5），写入 XMP 侧车"></span>
     <button id="lbCompare">并排对比</button>
+    <button id="lbHistogramToggle" aria-expanded="true">直方图</button>
     <button id="lbDetailsToggle" aria-expanded="false">评分说明</button>
     <button class="close" id="lbClose">✕ Esc</button>
   </div>
   <div id="panes"></div>
+  <div id="lbHistogram" role="region" aria-label="当前照片直方图">
+    <div class="hist-head">直方图 <button id="lbHistogramClose" aria-label="关闭直方图">×</button></div>
+    <div class="hist-photo" id="lbHistogramPhoto"></div>
+    <canvas id="lbHistogramCanvas" width="300" height="126" aria-label="亮度与 RGB 分布"></canvas>
+    <div class="hist-legend" aria-label="直方图通道">
+      <button class="hist-channel on" data-channel="0" aria-pressed="true" title="切换白色亮度通道">W 亮度</button>
+      <button class="hist-channel on" data-channel="1" aria-pressed="true" title="切换红色通道">R</button>
+      <button class="hist-channel on" data-channel="2" aria-pressed="true" title="切换绿色通道">G</button>
+      <button class="hist-channel on" data-channel="3" aria-pressed="true" title="切换蓝色通道">B</button>
+    </div>
+    <div class="hist-axis-note">横轴：W 亮度或 RGB 通道值（8-bit，0–255）；纵轴：相对像素频数，最高柱为 100%。</div>
+    <div class="hist-note" id="lbHistogramNote">从整张 JPEG 的原始像素网格抽样，结果仅供参考。</div>
+  </div>
   <div id="lbDetails" aria-label="照片评分与场景">
     <div class="head">评分与场景 <button id="lbDetailsClose" title="关闭面板">×</button></div>
     <div class="panel-tip">拖动标题移动 · 右下角调整大小</div>
@@ -263,11 +293,20 @@
 
 <div id="modal">
   <div class="box">
-    <h3>评分配置 <span class="dim" id="cfgPath" style="font-weight:normal;font-size:11px"></span></h3>
+    <h3>程序配置 <span class="dim" id="cfgPath" style="font-weight:normal;font-size:11px"></span></h3>
     <div id="cfgBody"></div>
+    <div id="uiHistogramSettings" class="grp">
+      <b>界面设置</b>
+      <div class="cfg-field">
+        <div class="cfg-line"><span class="cfg-name">直方图抽样比例</span><input class="cfg-number" id="histogramSampleNumber" type="number" min="1" max="25" step="1" value="10"></div>
+        <div class="cfg-range"><span>1%</span><input id="histogramSampleRange" type="range" min="1" max="25" step="1" value="10" aria-label="直方图抽样比例滑块"><span>25%</span></div>
+        <div class="cfg-help">比例越高，曲线统计越细，计算时间和临时内存也按比例增加。照片像素只在浏览器内抽样，不写入缓存。</div>
+      </div>
+      <div class="cfg-line"><span id="uiSettingsStatus" class="dim"></span><button class="btn" id="uiSettingsSave">保存界面设置</button></div>
+    </div>
     <div class="foot">
       <button class="btn" id="cfgCancel">取消</button>
-      <button class="btn primary" id="cfgSave">保存</button>
+      <button class="btn primary" id="cfgSave">保存评分配置</button>
     </div>
   </div>
 </div>
@@ -736,9 +775,45 @@ window.addEventListener("resize", hidePhotoContextMenu);
 // ---------- 灯箱（1:1 缩放 / 并排同步对比） ----------
 let LB = null; // {list, idx, compare, sel:Set, activePath, view:{s, ax, ay, fx, fy}}
 const lbEl = document.getElementById("lb");
+let histogramVisible = true;
+let histogramSamplePercent = 10;
+try { histogramVisible = localStorage.getItem('fc_histogram_visible') !== 'false'; } catch (_) {}
+const histogramCache = new Map();
+let histogramChannels = new Set([0,1,2,3]);
+let histogramPosition = null;
+try {
+  const savedChannels = JSON.parse(localStorage.getItem('fc_histogram_channels') || 'null');
+  if(Array.isArray(savedChannels)) histogramChannels = new Set(savedChannels.filter(c=>[0,1,2,3].includes(c)));
+  const savedPosition = JSON.parse(localStorage.getItem('fc_histogram_position') || 'null');
+  if(savedPosition && Number.isFinite(savedPosition.left) && Number.isFinite(savedPosition.top)) histogramPosition = savedPosition;
+} catch (_) {}
+async function loadHistogramSettings(){
+  try {
+    const response = await fetch('/api/ui-settings', {cache:'no-store'});
+    if(!response.ok) return;
+    const settings = await response.json();
+    const value = Number(settings.histogram_sample_percent);
+    if(Number.isInteger(value) && value>=1 && value<=25) histogramSamplePercent = value;
+    if(LB?.histogramOpen) renderLBHistogram();
+  } catch (_) {}
+}
+loadHistogramSettings();
+
+function apertureLabel(value){
+  const text = String(value || '').trim();
+  return text ? (/^f\s*\//i.test(text) ? text : `f/${text}`) : '';
+}
+function shutterLabel(value){
+  const text = String(value || '').trim();
+  return text ? (/\s*(s|sec|seconds)$/i.test(text) ? text : `${text}s`) : '';
+}
+function focalLabel(value){
+  const text = String(value || '').trim();
+  return text ? (/\s*mm$/i.test(text) ? text : `${text}mm`) : '';
+}
 
 function openLightbox(p, list){
-  LB = { list, idx: list.indexOf(p), compare:false, sel:new Set([p.path]), activePath:p.path, view:{s:1, ax:.5, ay:.5, fx:.5, fy:.5}, detailsOpen:true };
+  LB = { list, idx: list.indexOf(p), compare:false, sel:new Set([p.path]), activePath:p.path, view:{s:1, ax:.5, ay:.5, fx:.5, fy:.5}, detailsOpen:true, histogramOpen:histogramVisible };
   lbEl.style.display = "flex";
   renderLB();
 }
@@ -781,14 +856,21 @@ function renderLBActive(){
   const cur = activePhoto();
   if(!cur) return;
   document.getElementById("lbName").textContent = cur.filename;
-  document.getElementById("lbMeta").textContent =
+  const exif = [
+    cur.iso ? (/^ISO\s*/i.test(cur.iso) ? cur.iso : `ISO ${cur.iso}`) : '',
+    apertureLabel(cur.f_number), shutterLabel(cur.shutter), focalLabel(cur.focal)
+  ].filter(Boolean);
+  const metadata =
     `${cur.stars ? "★".repeat(cur.stars)+" " : ""}${cur.scores ? "总分 "+cur.scores.total.toFixed(1) : "未评分"}`
     + (cur.burst && cur.burst.group ? ` · 组${cur.burst.group} 第${cur.burst.rank}/${cur.burst.size}名（姿势簇${cur.burst.pose_cluster}）${cur.burst.manual_keep!=null?" 手动":""}${cur.burst.keep?" ✓保留":" ✗舍弃"}` : "")
-    + ` · ${cur.iso? "ISO"+cur.iso : ""} ${cur.f_number||""} ${cur.shutter||""} ${cur.focal||""}`;
+    + (exif.length ? ` · ${exif.join(' · ')}` : '');
+  document.getElementById("lbMeta").textContent = metadata;
+  document.getElementById("lbMeta").title = metadata;
   document.querySelectorAll("#panes .pane").forEach(pane=>pane.classList.toggle("active", pane.dataset.path===cur.path));
   document.querySelectorAll("#strip .st").forEach(item=>item.classList.toggle("cur", item.dataset.path===cur.path));
   renderLbStars();
   renderLBDetails();
+  renderLBHistogram();
 }
 
 function renderLB(){
@@ -806,6 +888,10 @@ function renderLB(){
     pane.innerHTML = `<img src="/image?p=${encodeURIComponent(p.path)}">
       <span class="tag">${escapeHtml(p.filename)}${p.scores ? " · "+p.scores.total.toFixed(1) : ""}</span>
       <span class="hint">${LB.compare ? "点击查看评分 · " : ""}滚轮缩放 · 拖拽平移 · 双击复位</span>`;
+    const img = pane.querySelector('img');
+    for(const eventName of ['load','error']) img.addEventListener(eventName, ()=>{
+      if(pane.isConnected && LB?.activePath === p.path) renderLBHistogram();
+    });
     bindPane(pane);
     panes.appendChild(pane);
   }
@@ -850,6 +936,168 @@ function renderLB(){
   }
   renderLBActive();
 }
+
+// 最近邻缩图相当于抽取原始 JPEG 像素网格，约取全图 10%，避免插值抹平极值。不写缓存文件。
+function histogramFromImage(img){
+  const scale = Math.min(1, Math.sqrt(histogramSamplePercent/100));
+  const width = Math.max(1, Math.ceil(img.naturalWidth * scale));
+  const height = Math.max(1, Math.ceil(img.naturalHeight * scale));
+  const sample = document.createElement('canvas');
+  sample.width = width; sample.height = height;
+  const ctx = sample.getContext('2d', {willReadFrequently:true});
+  if(!ctx) throw new Error('浏览器未提供 Canvas 2D');
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(img, 0, 0, width, height);
+  const pixels = ctx.getImageData(0, 0, width, height).data;
+  const bins = Array.from({length:4}, ()=>new Uint32Array(256)); // 亮度、红、绿、蓝
+  let dark = 0, bright = 0, count = 0;
+  for(let i=0; i<pixels.length; i+=4){
+    if(pixels[i+3] === 0) continue;
+    const red = pixels[i], green = pixels[i+1], blue = pixels[i+2];
+    const luminance = Math.round(.2126*red + .7152*green + .0722*blue);
+    bins[0][luminance]++; bins[1][red]++; bins[2][green]++; bins[3][blue]++;
+    if(luminance <= 5) dark++;
+    if(luminance >= 250) bright++;
+    count++;
+  }
+  return {bins, dark, bright, count, totalPixels:img.naturalWidth*img.naturalHeight};
+}
+function drawHistogram(histogram){
+  const canvas = document.getElementById('lbHistogramCanvas');
+  const width = Math.max(1, canvas.clientWidth);
+  const height = Math.max(1, canvas.clientHeight);
+  const pixelRatio = Math.min(2, window.devicePixelRatio || 1);
+  canvas.width = Math.round(width * pixelRatio);
+  canvas.height = Math.round(height * pixelRatio);
+  const ctx = canvas.getContext('2d');
+  if(!ctx) return;
+  ctx.setTransform(pixelRatio,0,0,pixelRatio,0,0);
+  ctx.fillStyle = '#111'; ctx.fillRect(0,0,width,height);
+  const plot = {left:30, right:width-7, top:7, bottom:height-22};
+  const plotHeight = Math.max(1, plot.bottom-plot.top);
+  ctx.font = '9px system-ui, sans-serif'; ctx.fillStyle = '#999'; ctx.strokeStyle = '#333'; ctx.lineWidth = 1;
+  ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+  for(const [fraction,label] of [[1,'100%'],[.5,'50%'],[0,'0%']]){
+    const y = plot.bottom-fraction*plotHeight;
+    ctx.beginPath(); ctx.moveTo(plot.left,y); ctx.lineTo(plot.right,y); ctx.stroke();
+    ctx.fillText(label,plot.left-4,y);
+  }
+  const levels = [0,64,128,192,255];
+  ctx.textBaseline = 'alphabetic';
+  for(const [index,level] of levels.entries()){
+    const x = plot.left+index*(plot.right-plot.left)/4;
+    ctx.beginPath(); ctx.moveTo(x,plot.top); ctx.lineTo(x,plot.bottom); ctx.stroke();
+    ctx.textAlign = index===0 ? 'left' : index===levels.length-1 ? 'right' : 'center';
+    ctx.fillText(String(level),x,height-5);
+  }
+  let peak = 1;
+  for(const channel of histogramChannels) for(const count of histogram.bins[channel]) peak = Math.max(peak, count);
+  const colors = ['rgba(235,235,235,.95)','rgba(255,95,95,.8)','rgba(95,215,95,.8)','rgba(95,135,255,.8)'];
+  for(const channel of [1,2,3,0]){
+    if(!histogramChannels.has(channel)) continue;
+    ctx.beginPath(); ctx.strokeStyle = colors[channel]; ctx.lineWidth = channel===0 ? 1.7 : 1.25;
+    for(let i=0; i<256; i++){
+      const x = plot.left + i * (plot.right-plot.left) / 255;
+      const y = plot.bottom - histogram.bins[channel][i] / peak * plotHeight;
+      if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+    }
+    ctx.stroke();
+  }
+}
+function renderLBHistogram(){
+  if(!LB) return;
+  const panel = document.getElementById('lbHistogram');
+  const toggle = document.getElementById('lbHistogramToggle');
+  panel.hidden = !LB.histogramOpen;
+  toggle.classList.toggle('on', LB.histogramOpen);
+  toggle.setAttribute('aria-expanded', String(LB.histogramOpen));
+  if(!LB.histogramOpen) return;
+  positionHistogramPanel();
+  renderHistogramChannels();
+  const photo = activePhoto();
+  if(!photo) return;
+  document.getElementById('lbHistogramPhoto').textContent = photo.filename;
+  const note = document.getElementById('lbHistogramNote');
+  const pane = [...document.querySelectorAll('#panes .pane')].find(item=>item.dataset.path===photo.path);
+  const img = pane?.querySelector('img');
+  if(!img?.naturalWidth){
+    const canvas = document.getElementById('lbHistogramCanvas');
+    canvas.width = canvas.width;
+    note.textContent = img?.complete ? '原图加载失败，无法生成直方图。' : '正在读取原图像素…';
+    return;
+  }
+  const key = `${SNAPSHOT?.root || ''}|${photo.path}|${histogramSamplePercent}`;
+  let histogram = histogramCache.get(key);
+  if(!histogram){
+    try { histogram = histogramFromImage(img); }
+    catch(error){ note.textContent = `无法读取原图像素：${error.message}`; return; }
+    histogramCache.set(key, histogram);
+    if(histogramCache.size > 8) histogramCache.delete(histogramCache.keys().next().value);
+  }
+  drawHistogram(histogram);
+  const percent = count => histogram.count ? `${(100*count/histogram.count).toFixed(1)}%` : '0%';
+  const sampledPercent = histogram.totalPixels ? (100*histogram.count/histogram.totalPixels).toFixed(1) : `约${histogramSamplePercent}`;
+  note.textContent = `JPEG 网格抽样 ${sampledPercent}% · ${histogram.count.toLocaleString()} 点（估计） · 暗部 ≤5：${percent(histogram.dark)} · 亮部 ≥250：${percent(histogram.bright)}`;
+}
+function positionHistogramPanel(){
+  const panel = document.getElementById('lbHistogram');
+  const toolbarHeight = document.querySelector('#lb .top').getBoundingClientRect().height;
+  const paneTag = document.querySelector('#panes .pane.active .tag');
+  const defaultTop = toolbarHeight + (paneTag?.offsetHeight || 20) + 22;
+  const desired = histogramPosition || {left:12, top:defaultTop};
+  const maxLeft = Math.max(8, window.innerWidth-panel.offsetWidth-8);
+  const maxTop = Math.max(8, window.innerHeight-panel.offsetHeight-8);
+  const position = {left:Math.max(8,Math.min(desired.left,maxLeft)), top:Math.max(8,Math.min(desired.top,maxTop))};
+  panel.style.left = `${position.left}px`;
+  panel.style.top = `${position.top}px`;
+  histogramPosition = position;
+}
+function renderHistogramChannels(){
+  document.querySelectorAll('#lbHistogram .hist-channel').forEach(button=>{
+    const enabled = histogramChannels.has(Number(button.dataset.channel));
+    button.classList.toggle('on', enabled);
+    button.setAttribute('aria-pressed', String(enabled));
+  });
+}
+function setHistogramOpen(open){
+  if(!LB) return;
+  LB.histogramOpen = open;
+  histogramVisible = open;
+  try { localStorage.setItem('fc_histogram_visible', String(open)); } catch (_) {}
+  renderLBHistogram();
+}
+document.getElementById('lbHistogramToggle').addEventListener('click', ()=>setHistogramOpen(!LB?.histogramOpen));
+document.getElementById('lbHistogramClose').addEventListener('click', ()=>setHistogramOpen(false));
+document.querySelectorAll('#lbHistogram .hist-channel').forEach(button=>button.addEventListener('click', ()=>{
+  const channel = Number(button.dataset.channel);
+  if(histogramChannels.has(channel)) histogramChannels.delete(channel); else histogramChannels.add(channel);
+  try { localStorage.setItem('fc_histogram_channels', JSON.stringify([...histogramChannels])); } catch (_) {}
+  renderHistogramChannels();
+  const photo = activePhoto();
+  const histogram = photo && histogramCache.get(`${SNAPSHOT?.root || ''}|${photo.path}|${histogramSamplePercent}`);
+  if(histogram) drawHistogram(histogram);
+}));
+const histogramDragHandle = document.querySelector('#lbHistogram .hist-head');
+let histogramDrag = null;
+histogramDragHandle.addEventListener('pointerdown', event=>{
+  if(event.target.closest('button')) return;
+  const rect = document.getElementById('lbHistogram').getBoundingClientRect();
+  histogramDrag = {id:event.pointerId, dx:event.clientX-rect.left, dy:event.clientY-rect.top};
+  histogramDragHandle.setPointerCapture(event.pointerId);
+});
+histogramDragHandle.addEventListener('pointermove', event=>{
+  if(!histogramDrag || histogramDrag.id !== event.pointerId) return;
+  histogramPosition = {left:event.clientX-histogramDrag.dx, top:event.clientY-histogramDrag.dy};
+  positionHistogramPanel();
+});
+function finishHistogramDrag(event){
+  if(!histogramDrag || histogramDrag.id !== event.pointerId) return;
+  histogramDrag = null;
+  try { localStorage.setItem('fc_histogram_position', JSON.stringify(histogramPosition)); } catch (_) {}
+}
+histogramDragHandle.addEventListener('pointerup', finishHistogramDrag);
+histogramDragHandle.addEventListener('pointercancel', finishHistogramDrag);
+window.addEventListener('resize', ()=>{ if(LB?.histogramOpen) renderLBHistogram(); });
 const SCENE_OPTIONS = [
   ['portrait','人像 / 人物'],['stage','舞台 / 演出'],['highkey','高调 / 雪景'],
   ['sports','运动 / 飞鸟'],['lowlight','夜景 / 暗光'],['landscape','风光'],
@@ -1177,8 +1425,13 @@ const FIELD_GUIDE = {
   dedup_burst_group_cap:{help:'单个连拍组最终保留照片总数上限，超过时按总分截断。',min:1,max:60,step:1,recommended:'常用 10–30 张'},
 };
 document.getElementById('cfgBtn').addEventListener('click', async ()=>{
-  const r = await fetch('/api/config'); const j = await r.json();
-  document.getElementById('cfgPath').textContent = '→ ' + j.path + (j.exists ? '' : '（文件尚不存在，保存时创建）');
+  const [r, settingsResponse] = await Promise.all([fetch('/api/config'),fetch('/api/ui-settings')]);
+  const j = await r.json(), settings = await settingsResponse.json();
+  document.getElementById('cfgPath').textContent = '评分参数 → ' + j.path + (j.exists ? '' : '（文件尚不存在，保存时创建）');
+  histogramSamplePercent = Number(settings.histogram_sample_percent) || 10;
+  document.getElementById('histogramSampleNumber').value = histogramSamplePercent;
+  document.getElementById('histogramSampleRange').value = histogramSamplePercent;
+  document.getElementById('uiSettingsStatus').textContent = '';
   const v = j.values, body = document.getElementById('cfgBody');
   body.innerHTML = '';
   for(const [title, fields] of FIELDS){
@@ -1224,6 +1477,36 @@ document.getElementById('cfgBtn').addEventListener('click', async ()=>{
   document.getElementById('modal').style.display = 'flex';
 });
 document.getElementById('cfgCancel').addEventListener('click', ()=> document.getElementById('modal').style.display='none');
+document.getElementById('histogramSampleRange').addEventListener('input', event=>{
+  document.getElementById('histogramSampleNumber').value = event.target.value;
+});
+document.getElementById('histogramSampleNumber').addEventListener('input', event=>{
+  const value = Math.max(1,Math.min(25,Number(event.target.value)||1));
+  document.getElementById('histogramSampleRange').value = value;
+});
+document.getElementById('uiSettingsSave').addEventListener('click', async ()=>{
+  const samplePercent = Number(document.getElementById('histogramSampleNumber').value);
+  if(!Number.isInteger(samplePercent) || samplePercent<1 || samplePercent>25){
+    toast('直方图抽样比例必须为 1% 到 25% 的整数'); return;
+  }
+  const button = document.getElementById('uiSettingsSave');
+  button.disabled = true;
+  try {
+    const response = await fetch('/api/ui-settings', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({histogram_sample_percent:samplePercent})
+    });
+    const body = await response.text();
+    let result = {};
+    try { result = JSON.parse(body); } catch (_) {}
+    if(!response.ok) throw new Error(result.error || result.message || body || '保存失败');
+    histogramSamplePercent = samplePercent;
+    document.getElementById('histogramSampleRange').value = samplePercent;
+    document.getElementById('uiSettingsStatus').textContent = '已保存在当前照片目录的 .firstcut/ui-preferences.json';
+    if(LB?.histogramOpen) renderLBHistogram();
+  } catch(error){ toast('界面设置保存失败：'+error.message); }
+  finally { button.disabled = false; }
+});
 document.getElementById('cfgSave').addEventListener('click', ()=>{
   const values = {};
   document.querySelectorAll('#cfgBody [data-k]').forEach(el=>{

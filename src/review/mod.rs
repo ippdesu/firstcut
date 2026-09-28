@@ -1,8 +1,8 @@
 //! 本地 Web 复核与操作台（M-UI1 只读复核 + M-UI2 跑批/星级/配置）
 //!
 //! axum 服务 + 内嵌 vanilla JS 前端（无 npm 工具链，单 exe 交付）。
-//! 写入面（全部明示）：缩略图缓存 `.firstcut/thumbs/`、XMP 侧车（跑批 --xmp
-//! 与 UI 内改星，均沿用他人侧车保护）、配置文件（UI 编辑）、CSV 报告（跑批）。
+//! 写入面（全部明示）：缩略图缓存 `.firstcut/thumbs/`、有界任务日志 `.firstcut/review.log`、
+//! XMP 侧车（跑批 --xmp 与 UI 内改星，均沿用他人侧车保护）、配置文件（UI 编辑）、CSV 报告（跑批）。
 //! 所有取图请求的路径参数强制限制在扫描根目录内。
 
 pub mod config_edit;
@@ -52,18 +52,28 @@ struct LoadProgress {
     total: usize,
 }
 
-#[derive(Deserialize, Serialize)]
-struct UiPreferences { include_raw: bool }
-
-fn load_ui_preferences(root: &Path) -> bool {
-    std::fs::read(root.join(".firstcut/ui-preferences.json"))
-        .ok().and_then(|bytes| serde_json::from_slice::<UiPreferences>(&bytes).ok())
-        .map(|prefs| prefs.include_raw).unwrap_or(true)
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(default)]
+struct UiPreferences {
+    include_raw: bool,
+    histogram_sample_percent: u8,
 }
 
-fn save_ui_preferences(root: &Path, include_raw: bool) -> Result<()> {
-    std::fs::write(root.join(".firstcut/ui-preferences.json"),
-        serde_json::to_vec_pretty(&UiPreferences { include_raw })?)?;
+impl Default for UiPreferences {
+    fn default() -> Self { Self { include_raw: true, histogram_sample_percent: 10 } }
+}
+
+fn load_ui_preferences(root: &Path) -> UiPreferences {
+    std::fs::read(root.join(".firstcut/ui-preferences.json"))
+        .ok().and_then(|bytes| serde_json::from_slice::<UiPreferences>(&bytes).ok())
+        .unwrap_or_default()
+}
+
+fn save_ui_preferences(root: &Path, preferences: &UiPreferences) -> Result<()> {
+    let state_dir = root.join(".firstcut");
+    std::fs::create_dir_all(&state_dir)?;
+    std::fs::write(state_dir.join("ui-preferences.json"),
+        serde_json::to_vec_pretty(preferences)?)?;
     Ok(())
 }
 
@@ -140,7 +150,8 @@ pub fn serve_ui(root: &Path, pick_root: impl Fn() -> Option<PathBuf>) -> Result<
         } else {
             ScoreConfig::default()
         };
-        let include_raw = load_ui_preferences(&root);
+        let preferences = load_ui_preferences(&root);
+        let include_raw = preferences.include_raw;
         match serve_once(&root, &config, &cache_path, 8787, open_browser, None, true, include_raw)? {
             Some(UiAction::Restart) => open_browser = false,
             Some(UiAction::Choose) => {
@@ -149,8 +160,18 @@ pub fn serve_ui(root: &Path, pick_root: impl Fn() -> Option<PathBuf>) -> Result<
                 }
                 open_browser = false;
             }
-            Some(UiAction::Rawon) => { save_ui_preferences(&root, true)?; open_browser = false; }
-            Some(UiAction::Rawoff) => { save_ui_preferences(&root, false)?; open_browser = false; }
+            Some(UiAction::Rawon) => {
+                let mut preferences = load_ui_preferences(&root);
+                preferences.include_raw = true;
+                save_ui_preferences(&root, &preferences)?;
+                open_browser = false;
+            }
+            Some(UiAction::Rawoff) => {
+                let mut preferences = load_ui_preferences(&root);
+                preferences.include_raw = false;
+                save_ui_preferences(&root, &preferences)?;
+                open_browser = false;
+            }
             _ => return Ok(()),
         }
     }
@@ -204,7 +225,7 @@ fn serve_once(
             phase: "准备读取照片".into(), done: 0, total: 0,
         }),
         include_raw,
-        job: Arc::new(JobState::new()),
+        job: Arc::new(JobState::with_log_file(root.join(".firstcut").join("review.log"))),
         control: control.clone(),
     });
     let load_state = Arc::clone(&state);
@@ -226,6 +247,7 @@ fn serve_once(
             .route("/api/burst/keep", post(burst_keep))
             .route("/api/scene-feedback", post(scene_feedback_save))
             .route("/api/config", get(config_get).post(config_save))
+            .route("/api/ui-settings", get(ui_settings_get).post(ui_settings_save))
             .route("/api/control", get(control_status).post(control_post))
             .with_state(state);
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
@@ -390,6 +412,40 @@ async fn control_status(State(state): State<Arc<AppState>>) -> Response {
 }
 
 #[derive(Deserialize)]
+struct UiSettingsRequest {
+    histogram_sample_percent: u8,
+}
+
+async fn ui_settings_get(State(state): State<Arc<AppState>>) -> Response {
+    let preferences = load_ui_preferences(&state.root);
+    json_response(serde_json::json!({
+        "histogram_sample_percent": preferences.histogram_sample_percent,
+    }))
+}
+
+async fn ui_settings_save(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::Json(request): axum::Json<UiSettingsRequest>,
+) -> Response {
+    if !valid_local_host(&headers, state.port) || !valid_control_origin(&headers, state.port) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    if !(1..=25).contains(&request.histogram_sample_percent) {
+        return (StatusCode::BAD_REQUEST, "直方图抽样比例必须在 1% 到 25% 之间").into_response();
+    }
+    let mut preferences = load_ui_preferences(&state.root);
+    preferences.histogram_sample_percent = request.histogram_sample_percent;
+    if let Err(error) = save_ui_preferences(&state.root, &preferences) {
+        return internal_error(error.into());
+    }
+    json_response(serde_json::json!({
+        "ok": true,
+        "histogram_sample_percent": preferences.histogram_sample_percent,
+    }))
+}
+
+#[derive(Deserialize)]
 struct ControlRequest {
     action: UiAction,
 }
@@ -447,6 +503,7 @@ async fn score_run(State(state): State<Arc<AppState>>, headers: HeaderMap,
     let xmp = params.xmp;
     let no_ai = params.no_ai;
     std::thread::spawn(move || {
+        let started = std::time::Instant::now();
         job.log("[score] 任务开始");
         // 每次跑批都重新加载配置：UI 里的配置编辑保存后下一次跑批即生效
         let cfg_result = match crate::config::load_config(&config_path) {
@@ -463,7 +520,10 @@ async fn score_run(State(state): State<Arc<AppState>>, headers: HeaderMap,
         let cfg = match cfg_result {
             Ok(c) => c,
             Err(err) => {
-                job.log(format!("[score] 配置加载失败: {err:#}"));
+                job.log(format!(
+                    "[score] 配置加载失败（耗时 {:.1} 秒）: {err:#}",
+                    started.elapsed().as_secs_f64()
+                ));
                 job.fail(format!("配置加载失败: {err:#}"));
                 return;
             }
@@ -487,7 +547,12 @@ async fn score_run(State(state): State<Arc<AppState>>, headers: HeaderMap,
         };
         if let Some(parent) = opts.output_csv.parent() {
             if let Err(err) = std::fs::create_dir_all(parent) {
-                job.fail(format!("无法创建报告目录: {err}"));
+                let message = format!("无法创建报告目录: {err}");
+                job.log(format!(
+                    "[score] {message}（耗时 {:.1} 秒）",
+                    started.elapsed().as_secs_f64()
+                ));
+                job.fail(message);
                 return;
             }
         }
@@ -512,7 +577,7 @@ async fn score_run(State(state): State<Arc<AppState>>, headers: HeaderMap,
                         job.log(format!("[review] 快照刷新失败: {err:#}"));
                     }
                 }
-                job.finish(format!(
+                let summary = format!(
                     "完成：{} 张 JPG（命中 {}，新分析 {}，失败 {}，ARW 无映射 {}）→ {}",
                     summary.total_jpg,
                     summary.hits,
@@ -520,10 +585,18 @@ async fn score_run(State(state): State<Arc<AppState>>, headers: HeaderMap,
                     summary.failed_jpgs.len(),
                     summary.unmapped_arw,
                     summary.csv_path.display()
+                );
+                job.log(format!(
+                    "[score] {summary}（耗时 {:.1} 秒）",
+                    started.elapsed().as_secs_f64()
                 ));
+                job.finish(summary);
             }
             Err(err) => {
-                job.log(format!("[score] 任务失败: {err:#}"));
+                job.log(format!(
+                    "[score] 任务失败（耗时 {:.1} 秒）: {err:#}",
+                    started.elapsed().as_secs_f64()
+                ));
                 job.fail(format!("{err:#}"));
             }
         }
