@@ -152,6 +152,7 @@
       <option value="burst">仅连拍照片</option>
       <option value="single">仅非连拍照片</option>
     </select>
+    <label title="每个连拍组在首页只显示当前排序最靠前的一张；打开照片仍可查看整组"><input type="checkbox" id="fAggregate" checked> 按连拍组聚合</label>
     <h3>有人脸</h3>
     <label><input type="checkbox" id="fFaces"> 仅看有人脸的照片</label>
     <h3>分数下限</h3>
@@ -321,7 +322,7 @@ const DIMS = ["sharpness","exposure","noise","composition","aesthetic"];
 const DIM_NAMES = {sharpness:"清晰",exposure:"曝光",noise:"噪点",composition:"构图",aesthetic:"美学"};
 
 const f = {
-  search: "", stars: new Set(), keep: "all", group: "all", faces: false,
+  search: "", stars: new Set(), keep: "all", group: "all", aggregate: true, faces: false,
   min: {total:0, sharpness:0, exposure:0, noise:0, composition:0, aesthetic:0},
   sort: "total",
 };
@@ -369,7 +370,8 @@ async function boot(){
   document.getElementById('loadPanel').hidden = true;
   ingest();
   buildFilters();
-  document.querySelectorAll("aside input:not(#includeRaw), aside select").forEach(el => el.addEventListener("input", onFilter));
+  document.querySelectorAll("#fSearch, #fStars input, #fKeep, #fGroup, #fAggregate, #fFaces, #fDims input, #fSort")
+    .forEach(el => el.addEventListener("input", onFilter));
   await controlsReady;
   if(uiSession !== null && jpgs.length && !jpgs.some(photo => photo.scores)){
     document.getElementById('missingScores').hidden = false;
@@ -419,19 +421,20 @@ function buildFilters(){
     groupBox.appendChild(option);
   }
 }
-function onFilter(e){
+function onFilter(){
   f.search = document.getElementById("fSearch").value.trim().toLowerCase();
   f.stars = new Set([...document.querySelectorAll("#fStars input:checked")].map(i=>+i.dataset.star));
   f.keep = document.getElementById("fKeep").value;
   f.group = document.getElementById("fGroup").value || "all";
+  f.aggregate = document.getElementById("fAggregate").checked;
   f.faces = document.getElementById("fFaces").checked;
   document.querySelectorAll("#fDims input").forEach(r=>{
     f.min[r.dataset.dim] = +r.value;
     document.getElementById("v_"+r.dataset.dim).textContent = "≥"+r.value;
   });
   f.sort = document.getElementById("fSort").value;
-  if(e && e.target.dataset.star) return; // 星级变化也要 apply，下面统一
-  localStorage.setItem("fc_filters", JSON.stringify({search:f.search,stars:[...f.stars],keep:f.keep,group:f.group,faces:f.faces,min:f.min,sort:f.sort}));
+  page = 0;
+  localStorage.setItem("fc_filters", JSON.stringify({search:f.search,stars:[...f.stars],keep:f.keep,group:f.group,aggregate:f.aggregate,faces:f.faces,min:f.min,sort:f.sort}));
   apply();
 }
 function resetFilters(){
@@ -439,6 +442,7 @@ function resetFilters(){
   document.querySelectorAll("#fStars input").forEach(i=>i.checked=false);
   document.getElementById("fKeep").value = "all";
   document.getElementById("fGroup").value = "all";
+  document.getElementById("fAggregate").checked = true;
   document.getElementById("fFaces").checked = false;
   document.querySelectorAll("#fDims input").forEach(r=>{ r.value = 0; });
   document.getElementById("fSort").value = "total";
@@ -477,8 +481,20 @@ function visible(){
   });
   return list;
 }
+function aggregatePhotos(list){
+  if(!f.aggregate || f.group.startsWith("group:")) return list;
+  const seen = new Set();
+  return list.filter(p=>{
+    const group = p.burst && p.burst.group;
+    if(!group) return true;
+    if(seen.has(group)) return false;
+    seen.add(group);
+    return true;
+  });
+}
 function apply(){
-  const list = visible();
+  const matching = visible();
+  const list = aggregatePhotos(matching);
   const pages = Math.max(1, Math.ceil(list.length / PAGE));
   if(page >= pages) page = pages - 1;
   const slice = list.slice(page*PAGE, page*PAGE + PAGE);
@@ -495,14 +511,16 @@ function apply(){
       ${p.scores ? `<span class="b total">${p.scores.total.toFixed(1)}</span>` : `<span class="b total">未评分</span>`}
       ${p.burst && p.burst.group ? `<span class="b burst ${p.burst.keep?"":"drop"}">组${p.burst.group} #${p.burst.rank}/${p.burst.size} ${p.burst.manual_keep!=null?(p.burst.keep?"手动保留":"手动舍弃"):(p.burst.keep?"✓":"✗")}</span>` : ""}
       <span class="b name">${escapeHtml(p.filename)}</span>`;
-    d.addEventListener("click", ()=> openLightbox(p, list));
+    d.addEventListener("click", ()=> openLightbox(p, matching));
     d.addEventListener("contextmenu", e=>{
       e.preventDefault();
       showPhotoContextMenu(p, e.clientX, e.clientY);
     });
     grid.appendChild(d);
   }
-  document.getElementById("pgInfo").textContent = `${list.length ? page*PAGE+1 : 0}–${Math.min((page+1)*PAGE, list.length)} / ${list.length}`;
+  const position = `${list.length ? page*PAGE+1 : 0}–${Math.min((page+1)*PAGE, list.length)} / ${list.length}`;
+  document.getElementById("pgInfo").textContent = matching.length === list.length
+    ? position : `${position} 项（符合条件 ${matching.length} 张）`;
   document.getElementById("pgPrev").disabled = page === 0;
   document.getElementById("pgNext").disabled = page >= pages-1;
 }
@@ -1108,6 +1126,7 @@ try{
   if(saved){
     f.search = saved.search || ""; f.keep = saved.keep || "all";
     f.group = saved.group || "all";
+    f.aggregate = saved.aggregate !== false;
     f.faces = !!saved.faces; f.sort = saved.sort || "total";
     f.min = Object.assign(f.min, saved.min || {});
     f.stars = new Set(saved.stars || []);
@@ -1118,6 +1137,7 @@ boot().then(ready=>{
   document.getElementById("fSearch").value = f.search;
   document.getElementById("fKeep").value = f.keep;
   document.getElementById("fGroup").value = f.group;
+  document.getElementById("fAggregate").checked = f.aggregate;
   if(!document.getElementById("fGroup").value){
     f.group = "all";
     document.getElementById("fGroup").value = "all";
