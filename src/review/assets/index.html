@@ -4,13 +4,14 @@
 <meta charset="utf-8">
 <title>firstcut 复核</title>
 <style>
-  :root{--bg:#141414;--panel:#1e1e1e;--line:#2e2e2e;--fg:#ddd;--dim:#888;--acc:#4caf50}
+  :root{--bg:#141414;--panel:#1e1e1e;--line:#2e2e2e;--fg:#ddd;--dim:#888;--acc:#4caf50;--sidebar-width:230px}
   *{box-sizing:border-box}
   [hidden]{display:none!important}
   body{margin:0;background:var(--bg);color:var(--fg);font-family:system-ui,Segoe UI,"Microsoft YaHei",sans-serif}
   header{display:flex;align-items:center;gap:16px;padding:8px 16px;background:var(--panel);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:5}
   header h1{font-size:16px;margin:0}
   header .info{color:var(--dim);font-size:12px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  #sidebarToggle,#sidebarClose{display:none;background:#2a2a2a;border:1px solid var(--line);color:var(--fg);border-radius:4px;padding:5px 9px;cursor:pointer}
   #appControls{display:flex;gap:6px;margin-left:auto;flex:none}
   #appControls button{background:#2a2a2a;border:1px solid var(--line);color:var(--fg);padding:5px 9px;border-radius:4px;cursor:pointer;font-size:12px}
   #appControls button:disabled{opacity:.45;cursor:default}
@@ -26,16 +27,51 @@
   #missingScores{position:fixed;inset:0;z-index:45;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.72);padding:20px}
   #missingScores .box{max-width:460px;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:20px;line-height:1.6}
   #missingScores .actions{display:flex;gap:8px;justify-content:flex-end;margin-top:16px}
-  #layout{display:flex}
-  aside{position:sticky;top:41px;align-self:flex-start;width:230px;flex:none;background:var(--panel);border-right:1px solid var(--line);padding:12px;font-size:13px;height:calc(100vh - 41px);overflow-y:auto;z-index:6}
+  #layout{display:flex;min-width:0}
+  aside{position:sticky;top:41px;align-self:flex-start;width:var(--sidebar-width);min-width:190px;max-width:min(480px,calc(100vw - 320px));flex:none;background:var(--panel);border-right:1px solid var(--line);padding:12px;font-size:13px;height:calc(100dvh - 41px);overflow-y:auto;z-index:6}
   aside h3{font-size:12px;color:var(--dim);margin:14px 0 6px;text-transform:letter-spacing}
   aside label{display:flex;align-items:center;gap:6px;margin:4px 0;cursor:pointer}
   aside input[type=text]{width:100%;background:#111;border:1px solid var(--line);color:var(--fg);padding:4px 6px;border-radius:4px}
   aside input[type=range]{width:100%}
   aside select{width:100%;background:#111;border:1px solid var(--line);color:var(--fg);padding:4px;border-radius:4px}
   aside .dim{color:var(--dim);font-size:11px}
-  main{flex:1;padding:12px}
+  #sidebarResize{position:sticky;top:41px;align-self:flex-start;flex:none;width:9px;height:calc(100dvh - 41px);cursor:col-resize;touch-action:none;z-index:7;background:#181818}
+  #sidebarResize::after{content:"";display:block;width:2px;height:100%;margin:auto;background:#393939}
+  #sidebarResize:hover::after,#sidebarResize:focus-visible::after,body.resizing-sidebar #sidebarResize::after{background:var(--acc)}
+  body.resizing-sidebar{user-select:none;cursor:col-resize}
+  aside details.side-section{margin-top:14px}
+  aside details.side-section.compact{margin-top:6px}
+  aside details.side-section summary{color:var(--dim);font-size:12px;font-weight:600;cursor:pointer;list-style:none;display:flex;align-items:center;gap:5px}
+  aside details.side-section summary::marker{content:""}
+  aside details.side-section summary::-webkit-details-marker{display:none}
+  aside details.side-section summary::before{content:"▸";font-size:11px;color:var(--dim)}
+  aside details.side-section[open] summary::before{content:"▾"}
+  aside details.side-section .dim{margin-top:6px}
+  aside details.side-section .filter-count{color:var(--acc);font-weight:400;margin-left:auto}
+  #fStars,#fDims{margin-top:8px}
+  #fDims label{display:grid;grid-template-columns:36px 26px minmax(0,1fr);gap:4px;align-items:center}
+  #fDims input[type=range]{min-width:0;width:100%}
+  #asideMobileHead{display:none}
+  #sidebarBackdrop{display:none}
+  main{flex:1;min-width:0;padding:12px}
   #grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px}
+  @media(max-width:720px){
+    header{flex-wrap:wrap;gap:6px;padding:7px 9px}
+    header .info{order:3;flex-basis:100%}
+    #sidebarToggle,#sidebarClose{display:block}
+    #asideMobileHead{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;font-weight:600}
+    #appControls{gap:4px}
+    #appControls button{padding:5px 6px}
+    #layout aside{position:fixed;top:0;left:0;bottom:0;width:min(86vw,320px);min-width:0;max-width:none;height:100dvh;z-index:61;transform:translateX(-100%);transition:transform .2s ease;box-shadow:8px 0 24px rgba(0,0,0,.45)}
+    body.sidebar-open #layout aside{transform:translateX(0)}
+    body.sidebar-open{overflow:hidden}
+    #sidebarBackdrop:not([hidden]){display:block;position:fixed;inset:0;z-index:60;background:rgba(0,0,0,.6)}
+    #sidebarResize{display:none}
+    main{width:100%;padding:8px}
+    #grid{grid-template-columns:repeat(auto-fill,minmax(125px,1fr));gap:6px}
+    #lb .top{flex-wrap:wrap;gap:6px}
+    #lb .top .meta{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  }
   .card{position:relative;background:#000;border-radius:6px;overflow:hidden;cursor:pointer;aspect-ratio:4/3}
   .card img{width:100%;height:100%;object-fit:cover;display:block}
   .card.noscore img{filter:grayscale(1) brightness(.5)}
@@ -122,6 +158,7 @@
 </head>
 <body>
 <header>
+  <button id="sidebarToggle" type="button" aria-controls="filterSidebar" aria-expanded="false">筛选</button>
   <h1>firstcut 复核</h1>
   <span class="info" id="info">加载中…</span>
   <div id="appControls" hidden>
@@ -129,17 +166,22 @@
     <button id="exitService" title="关闭本地服务并退出程序">退出程序</button>
   </div>
 </header>
+<div id="sidebarBackdrop" hidden></div>
 <div id="layout">
-  <aside>
+  <aside id="filterSidebar">
+    <div id="asideMobileHead"><span>筛选与评分</span><button id="sidebarClose" type="button" aria-label="关闭筛选侧栏">关闭</button></div>
     <div id="folderBlock" hidden>
       <button class="btn" id="chooseFolder">选择照片目录…</button>
       <label title="关闭后仅载入和评分 JPG/JPEG，不关联或写入 RAW"><input type="checkbox" id="includeRaw"> 关联同名 RAW 照片</label>
-      <div class="dim">活动根目录可包含 JPG/、RAW/；Processed/ 子目录默认跳过。关闭关联后只处理 JPG。</div>
+      <details class="side-section compact" id="directoryHelp"><summary>目录说明</summary>
+        <div class="dim">活动根目录可包含 JPG/、RAW/；Processed/ 子目录默认跳过。关闭关联后只处理 JPG。</div>
+      </details>
     </div>
     <h3>搜索</h3>
     <input type="text" id="fSearch" placeholder="文件名…">
-    <h3>星级</h3>
-    <div id="fStars"></div>
+    <details class="side-section" id="starsSection"><summary>星级 <span class="filter-count" id="starFilterCount"></span></summary>
+      <div id="fStars"></div>
+    </details>
     <h3>连拍保留</h3>
     <select id="fKeep">
       <option value="all">全部</option>
@@ -155,8 +197,9 @@
     <label title="每个连拍组在首页只显示当前排序最靠前的一张；打开照片仍可查看整组"><input type="checkbox" id="fAggregate" checked> 按连拍组聚合</label>
     <h3>有人脸</h3>
     <label><input type="checkbox" id="fFaces"> 仅看有人脸的照片</label>
-    <h3>分数下限</h3>
-    <div id="fDims"></div>
+    <details class="side-section" id="scoresSection"><summary>分数下限 <span class="filter-count" id="scoreFilterCount"></span></summary>
+      <div id="fDims"></div>
+    </details>
     <button id="fReset" style="margin-top:14px;width:100%;background:#222;border:1px solid var(--line);color:var(--fg);padding:5px;border-radius:4px;cursor:pointer">重置筛选</button>
     <h3>排序</h3>
     <select id="fSort">
@@ -177,9 +220,11 @@
       <div class="dim" id="runState" style="display:none"></div>
       <pre id="runLog"></pre>
     </div>
-    <h3 class="dim">说明</h3>
-    <div class="dim">点击卡片看 1:1 原图（滚轮缩放 / 拖拽平移 / 双击复位 / ←→ 组内切换 / Esc 关闭）。连拍组内可在灯箱勾选 2~4 张进入同步缩放对比。</div>
+    <details class="side-section" id="usageHelp"><summary>使用说明</summary>
+      <div class="dim">点击卡片看 1:1 原图（滚轮缩放 / 拖拽平移 / 双击复位 / ←→ 组内切换 / Esc 关闭）。连拍组内可在灯箱勾选 2~4 张进入同步缩放对比。</div>
+    </details>
   </aside>
+  <div id="sidebarResize" role="separator" tabindex="0" aria-label="调整筛选栏宽度" aria-orientation="vertical" aria-valuemin="190" aria-valuemax="480" aria-valuenow="230" title="拖动调整侧栏宽度；双击恢复默认"></div>
   <main>
     <div id="loadPanel" role="status" aria-live="polite">
       <strong>正在载入照片</strong>
@@ -244,6 +289,74 @@
 "use strict";
 function escapeHtml(v){
   return String(v).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+// ---------- 侧栏布局 ----------
+const sidebar = document.getElementById('filterSidebar');
+const sidebarResize = document.getElementById('sidebarResize');
+const sidebarToggle = document.getElementById('sidebarToggle');
+const sidebarBackdrop = document.getElementById('sidebarBackdrop');
+function setSidebarWidth(value, save=false){
+  const width = Math.max(190, Math.min(480, Math.round(value)));
+  document.documentElement.style.setProperty('--sidebar-width', `${width}px`);
+  sidebarResize.setAttribute('aria-valuenow', String(width));
+  if(save) try { localStorage.setItem('fc_sidebar_width', String(width)); } catch (_) {}
+}
+try {
+  const savedWidth = Number(localStorage.getItem('fc_sidebar_width'));
+  if(Number.isFinite(savedWidth) && savedWidth > 0) setSidebarWidth(savedWidth);
+} catch (_) {}
+let sidebarDrag = null;
+sidebarResize.addEventListener('pointerdown', e=>{
+  if(e.button !== 0) return;
+  sidebarDrag = {id:e.pointerId, x:e.clientX, width:sidebar.getBoundingClientRect().width};
+  sidebarResize.setPointerCapture(e.pointerId);
+  document.body.classList.add('resizing-sidebar');
+  e.preventDefault();
+});
+sidebarResize.addEventListener('pointermove', e=>{
+  if(!sidebarDrag || e.pointerId !== sidebarDrag.id) return;
+  const max = Math.max(190, Math.min(480, innerWidth - 320));
+  setSidebarWidth(Math.min(max, sidebarDrag.width + e.clientX - sidebarDrag.x));
+});
+function endSidebarDrag(e){
+  if(!sidebarDrag || e.pointerId !== sidebarDrag.id) return;
+  sidebarDrag = null;
+  document.body.classList.remove('resizing-sidebar');
+  setSidebarWidth(sidebar.getBoundingClientRect().width, true);
+}
+sidebarResize.addEventListener('pointerup', endSidebarDrag);
+sidebarResize.addEventListener('pointercancel', endSidebarDrag);
+sidebarResize.addEventListener('lostpointercapture', endSidebarDrag);
+sidebarResize.addEventListener('dblclick', ()=>setSidebarWidth(230, true));
+sidebarResize.addEventListener('keydown', e=>{
+  const step = e.key === 'ArrowRight' ? 20 : e.key === 'ArrowLeft' ? -20 : 0;
+  if(!step && e.key !== 'Home') return;
+  e.preventDefault();
+  const max = Math.max(190, Math.min(480, innerWidth - 320));
+  setSidebarWidth(e.key === 'Home' ? 230 : Math.min(max, sidebar.getBoundingClientRect().width + step), true);
+});
+function setSidebarOpen(open){
+  document.body.classList.toggle('sidebar-open', open);
+  sidebarBackdrop.hidden = !open;
+  sidebarToggle.setAttribute('aria-expanded', String(open));
+}
+sidebarToggle.addEventListener('click', ()=>setSidebarOpen(true));
+document.getElementById('sidebarClose').addEventListener('click', ()=>setSidebarOpen(false));
+sidebarBackdrop.addEventListener('click', ()=>setSidebarOpen(false));
+document.addEventListener('keydown', e=>{
+  if(e.key === 'Escape' && document.body.classList.contains('sidebar-open')) setSidebarOpen(false);
+});
+matchMedia('(max-width:720px)').addEventListener('change', e=>{ if(!e.matches) setSidebarOpen(false); });
+const sidebarSections = ['directoryHelp','starsSection','scoresSection','usageHelp'];
+try {
+  const saved = JSON.parse(localStorage.getItem('fc_sidebar_sections') || '{}');
+  for(const id of sidebarSections) document.getElementById(id).open = saved[id] === true;
+} catch (_) {}
+for(const id of sidebarSections){
+  document.getElementById(id).addEventListener('toggle', ()=>{
+    const state = Object.fromEntries(sidebarSections.map(key=>[key,document.getElementById(key).open]));
+    try { localStorage.setItem('fc_sidebar_sections', JSON.stringify(state)); } catch (_) {}
+  });
 }
 // ---------- 数据 ----------
 let SNAPSHOT = null;        // {root, photos}
@@ -433,6 +546,7 @@ function onFilter(){
     document.getElementById("v_"+r.dataset.dim).textContent = "≥"+r.value;
   });
   f.sort = document.getElementById("fSort").value;
+  updateFilterCounts();
   page = 0;
   localStorage.setItem("fc_filters", JSON.stringify({search:f.search,stars:[...f.stars],keep:f.keep,group:f.group,aggregate:f.aggregate,faces:f.faces,min:f.min,sort:f.sort}));
   apply();
@@ -480,6 +594,11 @@ function visible(){
     return va < vb ? (descending ? 1 : -1) : va > vb ? (descending ? -1 : 1) : 0;
   });
   return list;
+}
+function updateFilterCounts(){
+  document.getElementById('starFilterCount').textContent = f.stars.size ? `已选 ${f.stars.size} 档` : '';
+  const count = Object.values(f.min).filter(value=>Number(value)>0).length;
+  document.getElementById('scoreFilterCount').textContent = count ? `已设 ${count} 项` : '';
 }
 function aggregatePhotos(list){
   if(!f.aggregate || f.group.startsWith("group:")) return list;
@@ -1149,6 +1268,7 @@ boot().then(ready=>{
     r.value = f.min[r.dataset.dim] || 0;
     document.getElementById("v_"+r.dataset.dim).textContent = "≥"+r.value;
   });
+  updateFilterCounts();
   apply();
 });
 </script>
