@@ -90,6 +90,7 @@
   #lb .top .meta{color:var(--dim);font-size:12px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   #lb .top button{background:#222;border:1px solid var(--line);color:var(--fg);padding:4px 12px;border-radius:4px;cursor:pointer}
   #lb .top button.on{background:var(--acc);color:#000;border-color:var(--acc)}
+  #lbZoom{flex:none;color:var(--fg);font-size:12px;font-variant-numeric:tabular-nums;white-space:nowrap;background:#222;border:1px solid var(--line);border-radius:4px;padding:4px 8px}
   #lb .top .close{margin-left:auto;font-size:18px}
   #lbHistogram{position:absolute;top:50px;left:12px;width:min(320px,calc(100vw - 24px));z-index:21;background:rgba(25,25,25,.92);border:1px solid #444;border-radius:8px;box-shadow:0 8px 28px rgba(0,0,0,.5);padding:10px;font-size:12px;backdrop-filter:blur(4px)}
   #lbHistogram .hist-head{display:flex;align-items:center;justify-content:space-between;font-weight:600;cursor:move;touch-action:none;user-select:none}
@@ -264,6 +265,7 @@
     <span class="meta" id="lbMeta"></span>
     <span class="starbtns" id="lbStars" title="点击改星（快捷键 1~5），写入 XMP 侧车"></span>
     <button id="lbCompare">并排对比</button>
+    <span id="lbZoom" role="status" aria-live="polite" title="相对于照片适配窗格尺寸的缩放倍率">缩放 100%</span>
     <button id="lbHistogramToggle" aria-expanded="true">直方图</button>
     <button id="lbDetailsToggle" aria-expanded="false">评分说明</button>
     <button class="close" id="lbClose">✕ Esc</button>
@@ -1266,6 +1268,9 @@ function curK(pane){
 }
 function layoutPanes(){
   if(!LB) return;
+  const zoom = document.getElementById('lbZoom');
+  zoom.textContent = `缩放 ${Math.round(LB.view.s * 100)}%`;
+  zoom.title = `相对于${LB.compare ? '各并排窗格' : '当前窗格'}适配尺寸的缩放倍率；100% 表示适配显示`;
   document.querySelectorAll(".pane").forEach(pane=>{
     const img = pane.querySelector("img");
     if(!img.naturalWidth) { img.onload = layoutPanes; return; }
