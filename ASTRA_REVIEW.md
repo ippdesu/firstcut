@@ -35,7 +35,7 @@
 2. 用 Lightroom 实际导入一组 JPG/ARW 与 XMP，核对星级、配对和 `crs:Exposure2` 的显示及效果。现有自动测试只能证明侧车字段和文件写入，不能证明 Lightroom 的实际行为。
 3. 在扩展人工“保留/排除”等操作前，把新决定存入独立决定库并经过同一 `selection` 合成路径，保持 CLI、review 与导出一致。
 
-## 后续维护：UI 与 CLI 统一及 v1.3.0 准备（2026-09-29）
+## 后续维护：UI 与 CLI 统一及 v1.3.0 发布（2026-09-29）
 
 用户在人肉验证灯箱缩放显示后，发现双击启动的 UI 与 CLI 对已有评分目录的判定可能不同。核对默认路径后确认：UI 一直将缓存放在所选照片根 `.firstcut/cache.sqlite`，旧 CLI 默认将缓存写到进程工作目录的 `pic_process_cache.sqlite`；同时 CLI 的 RAW 默认值和 `Processed/` 扫描行为与 UI 不同。启动方式变化或工作目录变化会造成缓存未命中和图库内容不一致。
 
@@ -43,4 +43,4 @@
 
 验证时用双击 UI 启动器和 CLI review 同时读取同一照片根目录，两边均发现 272 张照片，其中 268 张有评分；API 快照逐张比较了路径、RAW 配对、星级来源、总分和连拍保留建议，结果完全一致。代码回归验证 `cargo test --locked --all-targets` 通过（72 单元、7 集成），`cargo build --locked --bin pic_process` 和 `git diff --check` 通过。Release 发布前仍由 GitHub Actions 再跑一次相同测试与 Windows 构建。
 
-此次文档同时注明当前只按 SDR JPEG 进行分析和直方图统计，HDR 增益图、PQ/HLG 尚未支持；收录缩放百分比、EXIF 单位、RGBW 直方图和 10% 默认网格抽样等近期界面变化。真实照片选片质量仍需要用户独立验收，不在本轮推断算法质量。
+此次文档同时注明当前只按 SDR JPEG 进行分析和直方图统计，HDR 增益图、PQ/HLG 尚未支持；收录缩放百分比、EXIF 单位、RGBW 直方图和 10% 默认网格抽样等近期界面变化。v1.3.0 已推送 GitHub 并通过 CI 与 Release 工作流，发布页提供四个 Windows 程序和 SHA-256 校验文件。真实照片选片质量仍需要用户独立验收，不在本轮推断算法质量。
