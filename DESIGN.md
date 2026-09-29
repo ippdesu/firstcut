@@ -1,6 +1,6 @@
 # 照片初筛评分工具（Rust）— 设计与实现文档
 
-> 状态：**v1.3.0 已发布**，包含本地复核界面改进、有限任务日志、直方图、缩放显示和 UI/CLI 行为统一。当前图像兼容范围为 SDR JPEG；HDR 增益图、PQ/HLG 未实现。
+> 状态：**v1.4.0** 增加 Linux amd64/ARM64 容器发布与 Apple Silicon Docker 支持说明；此前已完成本地复核界面、有限任务日志、直方图、缩放显示和 UI/CLI 行为统一。当前图像兼容范围为 SDR JPEG；HDR 增益图、PQ/HLG 未实现。
 > 日期：2026 规划稿 / 2026 实施完成
 > 需求来源：索尼相机 JPG+ARW 连拍/风景/人像选片地狱，需要自动初步评分
 > 配套文档：`README.md`（用户手册）/ `release_notes.md`（版本说明）/ `REVIEW.md`（历次评审记录）/ `ASTRA_REVIEW.md`（本轮过程与结果）/ `firstcut.toml`（配置模板）
@@ -583,10 +583,10 @@ Kelvin→RGB 换算；降噪强度分级目视；**LR 对本轮 16bit TIFF 的�
 
 ### 12.2 M-UI1 已实现范围（复核视图）
 
-- **形态**：CLI `pic_process review <目录> [--config x.toml] [--cache x.sqlite] [--port 8787]`，或 Windows 双击 `firstcut-ui.exe` 选择目录；两者都启动仅绑定 127.0.0.1 的本地服务并自动开浏览器。图像位于 `JPG/`、`RAW/` 子目录时应选择它们的共同上级目录。UI 可随时重新选目录；RAW 关联是每个照片根目录单独保存的偏好，关闭后扫描和跑批均只处理 JPG。CLI 与 UI 默认跳过所选根目录下的 `Processed/` 输出子树，需复核成片时可直接选择该目录。`score`、`review` 默认共同使用 `.firstcut/cache.sqlite` 和 `.firstcut/config.toml`；其他默认报告及状态也统一置于 `.firstcut/`，避免因进程工作目录变化而漏掉已有评分。XMP 侧车保留在照片旁，供 Lightroom 识别。
+- **形态**：CLI `pic_process review <目录> [--config x.toml] [--cache x.sqlite] [--bind 127.0.0.1] [--port 8787]`，或 Windows 双击 `firstcut-ui.exe` 选择目录。桌面启动默认仅绑定 127.0.0.1；容器可显式绑定 `0.0.0.0` 接收 Docker 转发，并应把宿主端口限制在 127.0.0.1。图像位于 `JPG/`、`RAW/` 子目录时应选择它们的共同上级目录。UI 可随时重新选目录；RAW 关联是每个照片根目录单独保存的偏好，关闭后扫描和跑批均只处理 JPG。CLI 与 UI 默认跳过所选根目录下的 `Processed/` 输出子树，需复核成片时可直接选择该目录。`score`、`review` 默认共同使用 `.firstcut/cache.sqlite` 和 `.firstcut/config.toml`；其他默认报告及状态也统一置于 `.firstcut/`，避免因进程工作目录变化而漏掉已有评分。XMP 侧车保留在照片旁，供 Lightroom 识别。
 - **数据流**：不依赖 CSV——`scan_directory` + 按当前配置指纹过滤缓存行 → 内存快照；**星级/连拍信息在启动时用当前配置现算**（与 `score` 同一函数，保证逐张一致）；缓存未命中的照片显示"未评分"。
 - **API**：`GET /`（内嵌前端）、`GET /api/photos`（JSON 快照）、`GET /thumb?p=`（320px 缩略图，按需生成落盘 `<照片根>/.firstcut/thumbs/`，已存在按 size+mtime 跳过）、`GET /image?p=`（原图直读，100% 预览零预生成成本）。
-- **安全**：仅 127.0.0.1；所有 `p` 参数 canonicalize 后强制在扫描根目录内（越界 403）；扩展名白名单。
+- **安全**：默认服务仅绑定 127.0.0.1，API 校验本机 Host/Origin；Docker 示例只发布到宿主 127.0.0.1。所有 `p` 参数 canonicalize 后强制在扫描根目录内（越界 403）；扩展名白名单。
 - **前端**（无构建步骤）：缩略图墙（分页 500/页 + lazy）；筛选（星级/保留/五维下限/有人脸/文件名搜索）+ 排序，条件持久化 localStorage；**单图 1:1 灯箱**（滚轮缩放 + 拖拽平移 + 双击复位，`←/→` 同连拍组切换）；**连拍组并排对比**（2~4 窗格共享同一 transform，滚轮/拖拽同步缩放，检查合焦的眼睛）。
 
 ### 12.3 M-UI2 已实现范围（操作台）
@@ -605,3 +605,4 @@ Kelvin→RGB 换算；降噪强度分级目视；**LR 对本轮 16bit TIFF 的�
 ### 12.4 后续里程碑
 
 - **后续**：用用户真实选片结果验证候选覆盖率与误删率，再决定是否扩展复核工作流；darktable develop 操作台不再计划实施。
+- **Linux 容器**：实现 Dockerfile、Compose 本机目录挂载和 GHCR 双架构发布；CI 使用 x86_64 与 ARM64 原生 runner 分别构建和冒烟测试。Apple Silicon 用户使用 Docker Desktop 的 `linux/arm64` 镜像；原生 macOS ARM64 需另外启用并验证 CoreML，Intel macOS 当前受锁定 ONNX Runtime 预编译目标限制。

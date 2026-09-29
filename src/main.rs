@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 use pic_process::config::ScoreConfig;
 use pic_process::scan::{self};
 use pic_process::score;
+use std::net::IpAddr;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -72,7 +73,10 @@ enum Commands {
         /// 增量缓存文件（默认 <照片目录>/.firstcut/cache.sqlite）
         #[arg(long)]
         cache: Option<PathBuf>,
-        /// 监听端口（仅绑定 127.0.0.1）
+        /// 监听地址（容器部署时可用 0.0.0.0，并将宿主机端口限制为本机）
+        #[arg(long, default_value = "127.0.0.1")]
+        bind: IpAddr,
+        /// 监听端口
         #[arg(long, default_value_t = 8787)]
         port: u16,
         /// 不自动打开浏览器
@@ -161,7 +165,7 @@ fn main() -> Result<()> {
                 ),
             })?;
         }
-        Commands::Review { dir, config, cache, port, no_browser } => {
+        Commands::Review { dir, config, cache, bind, port, no_browser } => {
             let dir = pic_process::review::normal_photo_root(&dir)?;
             let paths = pic_process::review::photo_root_paths(&dir);
             // 与 score 相同的 fail-fast 配置加载
@@ -179,7 +183,9 @@ fn main() -> Result<()> {
                 eprintln!("[review] 配置已加载: {}", config.as_ref().unwrap().display());
             }
             let cache = cache.unwrap_or(paths.cache);
-            pic_process::review::serve(&dir, &cfg, &cache, port, !no_browser, config.as_deref())
+            pic_process::review::serve_with_bind(
+                &dir, &cfg, &cache, bind, port, !no_browser, config.as_deref(),
+            )
                 .with_context(|| "复核服务启动失败")?;
         }
     }

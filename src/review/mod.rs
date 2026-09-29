@@ -12,6 +12,7 @@ pub mod snapshot;
 pub mod thumb;
 
 use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -153,8 +154,27 @@ pub fn serve(
     open_browser: bool,
     config_path: Option<&Path>,
 ) -> Result<()> {
+    serve_with_bind(
+        root, cfg, cache_path, IpAddr::V4(Ipv4Addr::LOCALHOST), port, open_browser, config_path,
+    )
+}
+
+/// CLI review server with a configurable network bind address.
+///
+/// The default CLI path remains loopback-only; container users may bind `0.0.0.0`
+/// and publish the host port only on loopback.
+pub fn serve_with_bind(
+    root: &Path,
+    cfg: &ScoreConfig,
+    cache_path: &Path,
+    bind: IpAddr,
+    port: u16,
+    open_browser: bool,
+    config_path: Option<&Path>,
+) -> Result<()> {
+    std::fs::create_dir_all(root.join(".firstcut"))?;
     let preferences = load_ui_preferences(root);
-    serve_once(root, cfg, cache_path, port, open_browser, config_path,
+    serve_once(root, cfg, cache_path, bind, port, open_browser, config_path,
         false, preferences.include_raw, true)?;
     Ok(())
 }
@@ -175,7 +195,8 @@ pub fn serve_ui(root: &Path, pick_root: impl Fn() -> Option<PathBuf>) -> Result<
         };
         let preferences = load_ui_preferences(&root);
         let include_raw = preferences.include_raw;
-        match serve_once(&root, &config, &cache_path, 8787, open_browser, None,
+        match serve_once(&root, &config, &cache_path,
+            IpAddr::V4(Ipv4Addr::LOCALHOST), 8787, open_browser, None,
             true, include_raw, true)? {
             Some(UiAction::Restart) => open_browser = false,
             Some(UiAction::Choose) => {
@@ -205,6 +226,7 @@ fn serve_once(
     root: &Path,
     cfg: &ScoreConfig,
     cache_path: &Path,
+    bind: IpAddr,
     port: u16,
     open_browser: bool,
     config_path: Option<&Path>,
@@ -275,7 +297,7 @@ fn serve_once(
             .route("/api/ui-settings", get(ui_settings_get).post(ui_settings_save))
             .route("/api/control", get(control_status).post(control_post))
             .with_state(state);
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
+        let listener = tokio::net::TcpListener::bind((bind, port)).await?;
         if ui_control {
             std::thread::spawn(move || {
                 let on_progress = |phase: &str, done: usize, total: usize| {

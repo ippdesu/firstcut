@@ -1,0 +1,20 @@
+services:
+  firstcut:
+    image: ${FIRSTCUT_IMAGE:-ghcr.io/ippdesu/firstcut:latest}
+    pull_policy: always
+    user: "${FIRSTCUT_UID:-1000}:${FIRSTCUT_GID:-1000}"
+    command: ["review", "/photos", "--bind", "0.0.0.0", "--port", "8787", "--no-browser"]
+    ports:
+      - "127.0.0.1:8787:8787"
+    volumes:
+      - type: bind
+        source: ${PHOTO_DIR:?Set PHOTO_DIR in .env to your activity photo directory}
+        target: /photos
+      - type: bind
+        source: ${MODEL_DIR:-./models}
+        target: /app/models
+        read_only: true
+    init: true
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 10s

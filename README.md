@@ -4,7 +4,7 @@
 **五维评分**（清晰度 / 曝光 / 噪点 / 构图 / 美学），连拍去重排序，输出
 **CSV 报告**和 **XMP 星级侧车**。全程本地运行、照片不上传。
 
-> 当前状态：**v1.3.0 已发布**，提供可用的本地照片复核界面、评分解释、筛选与人工决定，并统一 UI 与 CLI 的照片发现和缓存行为。当前只支持 SDR JPEG。
+> 当前状态：**v1.4.0** 增加 Linux amd64/ARM64 容器与 Apple Silicon Docker 使用方式，并继续提供本地照片复核界面、评分解释、筛选与人工决定。当前只支持 SDR JPEG。
 > 当前方向：本地初筛、人工复核、Lightroom 元数据交接。darktable 批量 RAW 开发路线已停止；历史调研保存在 `DESIGN.md` §9。
 
 ## 构建
@@ -43,11 +43,39 @@ cargo build --release --features gpu
 
 XMP 是唯一有意写在照片旁边的导出物：Lightroom 通过照片同目录的标准侧车文件识别星级和曝光建议。其他 firstcut 状态和报告不会散落在照片根目录。
 
+## Linux 容器（Linux / macOS）
+
+Release 工作流在 Windows 测试通过后，会构建并发布 `linux/amd64` 与 `linux/arm64` 两种镜像到 GitHub Container Registry。Docker 会按主机架构自动选择镜像。Apple Silicon（M1/M2/M3/M4）用户可通过 Docker Desktop 运行 ARM64 Linux 镜像，不需要模拟 x86；这提供的是 Linux 容器环境，不是原生 macOS 应用。该方案适合浏览、复核和使用已有评分缓存。
+
+首次发布后，需要在 GitHub 仓库关联的 `firstcut` container package 设置中把可见性改成 Public，朋友才能匿名拉取镜像。GHCR 新建的 package 默认是 Private。
+
+macOS 上先安装并启动 Docker Desktop，然后克隆仓库，把 `.env.example` 复制为 `.env` 并填写照片与模型目录：
+
+```dotenv
+PHOTO_DIR=/Users/你的用户名/Pictures/活动目录
+MODEL_DIR=/Users/你的用户名/firstcut-models
+```
+
+在终端启动时，把照片目录写权限映射给当前 macOS 用户，再启动容器：
+
+```bash
+export FIRSTCUT_UID="$(id -u)"
+export FIRSTCUT_GID="$(id -g)"
+docker compose pull
+docker compose up -d
+```
+
+访问 <http://localhost:8787>；结束后运行 `docker compose down`。`PHOTO_DIR` 必须是活动照片根目录，容器会在其 `.firstcut/` 下读取和保存评分、配置、缓存、缩略图及日志，因此该目录以读写方式挂载。端口只发布到本机回环地址。模型目录挂载到容器的 `/app/models`；没有模型时仍可浏览已有评分，AI 重评分会按程序现有规则降级或提示。
+
+Linux 主机也使用同一 Compose 配置。若要直接运行 CLI，可用 `pic_process review <照片目录> --bind 0.0.0.0 --no-browser`；容器使用此监听地址是为了接收 Docker 转发的连接，宿主端口应像 Compose 示例一样只绑定 `127.0.0.1`。
+
+当前锁定的 ONNX Runtime 版本提供 Linux x86_64 与 ARM64 CPU 运行库；CI 和镜像发布会分别在 x86_64、ARM64 原生 runner 上测试和构建。M 芯片用户通过 ARM64 容器可用 CPU 推理。原生 macOS Apple Silicon 也有继续支持的路径，但需要启用并实际验证 CoreML；当前先不把原生 macOS 程序列入发行承诺。该 ONNX Runtime 版本没有 Intel Mac 预编译目标。
+
 ## 自动检查与发布
 
-GitHub Actions 的 [CI 工作流](.github/workflows/ci.yml) 在提交到 `main`、向 `main` 提交 PR 时运行 Windows 测试和发行构建，也可手动运行。[Release 工作流](.github/workflows/release.yml) 在推送版本标签时重新测试、构建发行程序，生成 SHA-256 校验文件并创建 GitHub Release。手动运行 Release 工作流只构建并保存 14 天的临时工件，不会发布新版本。
+GitHub Actions 的 [CI 工作流](.github/workflows/ci.yml) 在提交到 `main`、向 `main` 提交 PR 时运行 Windows、Linux x86_64 和 Linux ARM64 测试，Windows job 同时构建发行程序。[Release 工作流](.github/workflows/release.yml) 在推送版本标签时重新测试、构建 Windows 发行程序和 Linux 双架构容器；两种容器镜像均成功后才创建 GitHub Release。GHCR 提供不带架构后缀的多架构版本标签及 `latest`。手动运行 Release 工作流只构建并保存 14 天的 Windows 临时工件，不会发布新版本。
 
-发布新版本时，先将 `Cargo.toml` 中的版本号和 `Cargo.lock` 更新并合入 `main`，确认 CI 通过，然后推送对应标签。例如 `1.3.0` 使用 `v1.3` 或 `v1.3.0`。发布任务会核对标签与版本号，GitHub 自动生成发行说明。`v1.2` 是此前手动发布的版本；这套自动流程从下一个标签开始使用。模型文件和本地照片不会进入发行包。
+发布新版本时，先将 `Cargo.toml` 中的版本号和 `Cargo.lock` 更新并合入 `main`，确认 CI 通过，然后推送对应标签。例如 `1.4.0` 使用 `v1.4` 或 `v1.4.0`。发布任务会核对标签与版本号，GitHub 自动生成发行说明。`v1.2` 是此前手动发布的版本；这套自动流程从下一个标签开始使用。模型文件和本地照片不会进入发行包。
 
 ## 模型准备（一次性）
 
