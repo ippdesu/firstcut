@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-FROM rust:1-bookworm AS builder
+FROM rust:1-trixie AS builder
 WORKDIR /build
 
 COPY Cargo.toml Cargo.lock ./
@@ -12,7 +12,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release --locked --bin pic_process && \
     cp target/release/pic_process /pic_process
 
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 LABEL org.opencontainers.image.source="https://github.com/ippdesu/firstcut" \
       org.opencontainers.image.description="Local-first photo scoring and review UI"
 
