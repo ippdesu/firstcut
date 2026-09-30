@@ -29,8 +29,49 @@ pub struct EffectiveRating {
 }
 
 /// 决定存储在照片根目录内，独立于可删除的分析缓存。
-pub fn store_path(root: &Path) -> PathBuf {
-    root.join(".firstcut").join("decisions.sqlite")
+///
+/// `.firstcut` 可能来自照片目录本身，因此解析链接后必须确认它仍位于所选根目录内。
+fn store_path(root: &Path, create_state_dir: bool) -> Result<PathBuf> {
+    let root = root.canonicalize()?;
+    let state_dir = root.join(".firstcut");
+    let metadata = match state_dir.symlink_metadata() {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound && !create_state_dir => {
+            return Ok(state_dir.join("decisions.sqlite"));
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            // create_dir is intentionally non-recursive: if a link appears after the
+            // metadata check, it fails instead of following that link to another folder.
+            match std::fs::create_dir(&state_dir) {
+                Ok(()) => state_dir.symlink_metadata()?,
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    state_dir.symlink_metadata()?
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
+        Err(err) => return Err(err.into()),
+    };
+    anyhow::ensure!(
+        metadata.is_dir() && !metadata.file_type().is_symlink(),
+        "拒绝将 firstcut 状态目录作为符号链接或非目录使用"
+    );
+    let state_dir = state_dir.canonicalize()?;
+    anyhow::ensure!(
+        state_dir.starts_with(&root),
+        "firstcut 状态目录必须位于照片根目录内"
+    );
+
+    let path = state_dir.join("decisions.sqlite");
+    match path.symlink_metadata() {
+        Ok(metadata) => anyhow::ensure!(
+            !metadata.file_type().is_symlink(),
+            "拒绝写入符号链接形式的人工评分数据库"
+        ),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err.into()),
+    }
+    Ok(path)
 }
 
 fn relative_key(root: &Path, photo: &Path) -> Result<String> {
@@ -42,7 +83,7 @@ fn relative_key(root: &Path, photo: &Path) -> Result<String> {
 }
 
 pub fn load(root: &Path) -> Result<HashMap<String, u8>> {
-    let path = store_path(root);
+    let path = store_path(root, false)?;
     if !path.exists() {
         return Ok(HashMap::new());
     }
@@ -56,8 +97,7 @@ pub fn load(root: &Path) -> Result<HashMap<String, u8>> {
 pub fn set(root: &Path, jpg: &Path, stars: u8) -> Result<()> {
     anyhow::ensure!((1..=5).contains(&stars), "星级必须在 1~5");
     let key = relative_key(root, jpg)?;
-    let path = store_path(root);
-    std::fs::create_dir_all(path.parent().unwrap())?;
+    let path = store_path(root, true)?;
     let conn = rusqlite::Connection::open(path)?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS manual_rating (
@@ -140,5 +180,57 @@ mod tests {
             }
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_state_directory_symlink_outside_photo_root() {
+        use std::os::unix::fs::symlink;
+
+        let base = std::env::temp_dir().join(format!(
+            "firstcut_decisions_symlink_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let root = base.join("photos");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, root.join(".firstcut")).unwrap();
+
+        let result = set(&root, &root.join("photo.jpg"), 3);
+        assert!(result.is_err());
+        assert!(!outside.join("decisions.sqlite").exists());
+
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_database_file_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let base = std::env::temp_dir().join(format!(
+            "firstcut_decisions_file_symlink_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let root = base.join("photos");
+        let outside = base.join("outside.sqlite");
+        std::fs::create_dir_all(root.join(".firstcut")).unwrap();
+        std::fs::write(&outside, b"leave this file alone").unwrap();
+        symlink(&outside, root.join(".firstcut/decisions.sqlite")).unwrap();
+
+        let result = set(&root, &root.join("photo.jpg"), 3);
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&outside).unwrap(), b"leave this file alone");
+
+        std::fs::remove_dir_all(base).unwrap();
     }
 }

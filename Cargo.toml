@@ -49,20 +49,20 @@ base64 = "0.23"
 clap = { version = "4", features = ["derive"] }
 csv = "1"
 image = "0.25"
-kamadak-exif = "0.5"
+kamadak-exif = "0.6"
 ndarray = "0.17"
 ort = { version = "2.0.0-rc.13", features = ["ndarray"] }
 rayon = "1"
 rusqlite = { version = "0.31", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
-toml = "0.8"
+toml = "1.1"
 walkdir = "2"
 jpeg-decoder = "0.3"
 axum = "0.8"
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync"] }
-toml_edit = "0.22"
-roxmltree = "0.20"
+toml_edit = "0.25"
+roxmltree = "0.21"
 
 [target.'cfg(windows)'.dependencies]
 rfd = { version = "0.17.2", default-features = false }
