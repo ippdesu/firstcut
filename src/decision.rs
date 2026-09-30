@@ -34,17 +34,29 @@ pub struct EffectiveRating {
 fn store_path(root: &Path, create_state_dir: bool) -> Result<PathBuf> {
     let root = root.canonicalize()?;
     let state_dir = root.join(".firstcut");
-    if create_state_dir {
-        std::fs::create_dir_all(&state_dir)?;
-    }
-
-    let state_dir = match state_dir.canonicalize() {
-        Ok(path) => path,
+    let metadata = match state_dir.symlink_metadata() {
+        Ok(metadata) => metadata,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound && !create_state_dir => {
             return Ok(state_dir.join("decisions.sqlite"));
         }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            // create_dir is intentionally non-recursive: if a link appears after the
+            // metadata check, it fails instead of following that link to another folder.
+            match std::fs::create_dir(&state_dir) {
+                Ok(()) => state_dir.symlink_metadata()?,
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    state_dir.symlink_metadata()?
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
         Err(err) => return Err(err.into()),
     };
+    anyhow::ensure!(
+        metadata.is_dir() && !metadata.file_type().is_symlink(),
+        "拒绝将 firstcut 状态目录作为符号链接或非目录使用"
+    );
+    let state_dir = state_dir.canonicalize()?;
     anyhow::ensure!(
         state_dir.starts_with(&root),
         "firstcut 状态目录必须位于照片根目录内"
