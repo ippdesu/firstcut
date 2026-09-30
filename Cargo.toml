@@ -61,7 +61,7 @@ jpeg-decoder = "0.3"
 axum = "0.8"
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync"] }
-toml_edit = "0.22"
+toml_edit = "0.25"
 roxmltree = "0.20"
 
 [target.'cfg(windows)'.dependencies]
