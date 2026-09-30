@@ -49,7 +49,7 @@ base64 = "0.23"
 clap = { version = "4", features = ["derive"] }
 csv = "1"
 image = "0.25"
-kamadak-exif = "0.5"
+kamadak-exif = "0.6"
 ndarray = "0.17"
 ort = { version = "2.0.0-rc.13", features = ["ndarray"] }
 rayon = "1"
