@@ -4,7 +4,7 @@
 **五维评分**（清晰度 / 曝光 / 噪点 / 构图 / 美学），连拍去重排序，输出
 **CSV 报告**和 **XMP 星级侧车**。全程本地运行、照片不上传。
 
-> 当前状态：**v1.4.0** 增加 Linux amd64/ARM64 容器与 Apple Silicon Docker 使用方式，并继续提供本地照片复核界面、评分解释、筛选与人工决定。当前只支持 SDR JPEG。
+> 当前状态：**v1.4.1** 加固人工评分存储路径并更新兼容依赖；继续提供 Windows 程序、Linux amd64/ARM64 容器与 Apple Silicon Docker 使用方式。现有配置、评分缓存和 XMP 无需迁移。当前只支持 SDR JPEG。
 > 当前方向：本地初筛、人工复核、Lightroom 元数据交接。darktable 批量 RAW 开发路线已停止；历史调研保存在 `DESIGN.md` §9。
 
 ## 构建
@@ -75,7 +75,7 @@ Linux 主机也使用同一 Compose 配置。若要直接运行 CLI，可用 `pi
 
 GitHub Actions 的 [CI 工作流](.github/workflows/ci.yml) 在提交到 `main`、向 `main` 提交 PR 时运行 Windows、Linux x86_64 和 Linux ARM64 测试，Windows job 同时构建发行程序。[Release 工作流](.github/workflows/release.yml) 在推送版本标签时重新测试、构建 Windows 发行程序和 Linux 双架构容器；两种容器镜像均成功后才创建 GitHub Release。GHCR 提供不带架构后缀的多架构版本标签及 `latest`。手动运行 Release 工作流只构建并保存 14 天的 Windows 临时工件，不会发布新版本。
 
-发布新版本时，先将 `Cargo.toml` 中的版本号和 `Cargo.lock` 更新并合入 `main`，确认 CI 通过，然后推送对应标签。例如 `1.4.0` 使用 `v1.4` 或 `v1.4.0`。发布任务会核对标签与版本号，GitHub 自动生成发行说明。`v1.2` 是此前手动发布的版本；这套自动流程从下一个标签开始使用。模型文件和本地照片不会进入发行包。
+发布新版本时，先将 `Cargo.toml` 中的版本号和 `Cargo.lock` 更新并合入 `main`，确认 CI 通过，然后推送对应标签。例如 `1.4.1` 使用 `v1.4.1`。发布任务会核对标签与版本号，GitHub 自动生成发行说明。`v1.2` 是此前手动发布的版本；后续版本使用自动发布流程。模型文件和本地照片不会进入发行包。
 
 ## 模型准备（一次性）
 

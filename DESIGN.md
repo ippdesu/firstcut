@@ -1,6 +1,6 @@
 # 照片初筛评分工具（Rust）— 设计与实现文档
 
-> 状态：**v1.4.0** 增加 Linux amd64/ARM64 容器发布与 Apple Silicon Docker 支持说明；此前已完成本地复核界面、有限任务日志、直方图、缩放显示和 UI/CLI 行为统一。当前图像兼容范围为 SDR JPEG；HDR 增益图、PQ/HLG 未实现。
+> 状态：**v1.4.1** 加固人工评分状态目录并完成依赖兼容性维护；v1.4.0 已增加 Linux amd64/ARM64 容器发布与 Apple Silicon Docker 支持说明。此前已完成本地复核界面、有限任务日志、直方图、缩放显示和 UI/CLI 行为统一。当前图像兼容范围为 SDR JPEG；HDR 增益图、PQ/HLG 未实现。
 > 日期：2026 规划稿 / 2026 实施完成
 > 需求来源：索尼相机 JPG+ARW 连拍/风景/人像选片地狱，需要自动初步评分
 > 配套文档：`README.md`（用户手册）/ `release_notes.md`（版本说明）/ `REVIEW.md`（历次评审记录）/ `ASTRA_REVIEW.md`（本轮过程与结果）/ `firstcut.toml`（配置模板）
