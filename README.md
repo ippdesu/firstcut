@@ -4,10 +4,10 @@
 **五维评分**（清晰度 / 曝光 / 噪点 / 构图 / 美学），连拍去重排序，输出
 **CSV 报告**和 **XMP 星级侧车**。全程本地运行、照片不上传。
 
-> 当前状态：**v1.4.1** 加固人工评分存储路径并更新兼容依赖；继续提供 Windows 程序、Linux amd64/ARM64 容器与 Apple Silicon Docker 使用方式。现有配置、评分缓存和 XMP 无需迁移。当前只支持 SDR JPEG。
+> 当前版本 **v1.4.2** 加固复核访问、评分存储与导出。继续提供 Windows 程序和 Linux AMD64、ARM64 容器。正常关闭的评分库、现有配置和 XMP 可继续使用。图像分析支持 SDR JPEG。
 > 当前方向：本地初筛、人工复核、Lightroom 元数据交接。darktable 批量 RAW 开发路线已停止；历史调研保存在 [项目历史档案](docs/HISTORY.md#5-已停止的-darktable-raw-开发研究原设计-9)。
 >
-> 文档入口：[使用说明](#构建) · [当前设计](DESIGN.md) · [版本说明](release_notes.md) · [评审与历史决策](docs/HISTORY.md) · [安全政策](SECURITY.md)。文档于 2026-11-05 基于 v1.4.1 代码整理；旧里程碑不作为当前待办。
+> 文档入口：[使用说明](#构建) · [当前设计](DESIGN.md) · [版本说明](release_notes.md) · [评审与历史决策](docs/HISTORY.md) · [安全政策](SECURITY.md)。
 
 ## 构建
 
