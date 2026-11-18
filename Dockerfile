@@ -18,7 +18,7 @@ LABEL org.opencontainers.image.source="https://github.com/ippdesu/firstcut" \
       org.opencontainers.image.description="Local-first photo scoring and review UI"
 
 RUN apt-get update \
-    && apt-get install --no-install-recommends -y ca-certificates libstdc++6 libgomp1 \
+    && apt-get install --no-install-recommends -y ca-certificates libstdc++6 libgomp1 zlib1g \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
