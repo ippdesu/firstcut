@@ -10,6 +10,7 @@ pub mod job;
 pub mod scene_feedback;
 pub mod snapshot;
 pub mod thumb;
+mod access;
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
@@ -19,20 +20,22 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use anyhow::Result;
 use axum::extract::{Query, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{header, StatusCode};
 use axum::response::{AppendHeaders, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
 use serde::{Deserialize, Serialize};
-use tokio::sync::Notify;
+use tokio::sync::{Notify, Semaphore};
 
 use crate::config::ScoreConfig;
 use crate::review::job::{JobState, JobStatus};
+use crate::storage::{FileRef, Folder};
 use scene_feedback::SceneFeedbackRecord;
 use snapshot::Snapshot;
 
-/// 内嵌前端（单文件 HTML，内联 CSS/JS）
+/// 内嵌前端；脚本走独立路由，以便 CSP 禁止内联脚本。
 const INDEX_HTML: &[u8] = include_bytes!("assets/index.html");
+const REVIEW_JS: &str = include_str!("assets/review.js");
 
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -65,9 +68,18 @@ impl Default for UiPreferences {
 }
 
 pub fn load_ui_preferences(root: &Path) -> UiPreferences {
-    std::fs::read(root.join(".firstcut/ui-preferences.json"))
-        .ok().and_then(|bytes| serde_json::from_slice::<UiPreferences>(&bytes).ok())
-        .unwrap_or_default()
+    match state_file(root, "ui-preferences.json", false).and_then(|file| file.read(16 * 1024)) {
+        Ok(Some(bytes)) => serde_json::from_slice(&bytes).unwrap_or_else(|err| {
+            quiet_log(format!("[review] 界面偏好无效，使用默认值: {err}"));
+            UiPreferences::default()
+        }),
+        Ok(None) => UiPreferences::default(),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => UiPreferences::default(),
+        Err(err) => {
+            quiet_log(format!("[review] 界面偏好未读取: {err}"));
+            UiPreferences::default()
+        }
+    }
 }
 
 /// 默认状态文件统一放在照片根目录，供 CLI、双击启动器和复核服务共用。
@@ -92,11 +104,27 @@ pub fn photo_root_paths(root: &Path) -> PhotoRootPaths {
 }
 
 fn save_ui_preferences(root: &Path, preferences: &UiPreferences) -> Result<()> {
-    let state_dir = root.join(".firstcut");
-    std::fs::create_dir_all(&state_dir)?;
-    std::fs::write(state_dir.join("ui-preferences.json"),
-        serde_json::to_vec_pretty(preferences)?)?;
+    state_file(root, "ui-preferences.json", true)?.write(&serde_json::to_vec_pretty(preferences)?)?;
     Ok(())
+}
+
+fn state_file(root: &Path, name: &str, create: bool) -> std::io::Result<FileRef> {
+    Folder::open(root)?.state(create)?.file(name)
+}
+
+pub fn load_review_config(root: &Path, explicit: Option<&Path>) -> Result<(ScoreConfig, bool)> {
+    let path = explicit.map(Path::to_path_buf).unwrap_or_else(|| photo_root_paths(root).config);
+    let bytes = match FileRef::at(root, &path, false) {
+        Ok(file) => file.read(1024 * 1024)?,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound && explicit.is_none() => None,
+        Err(err) => return Err(err.into()),
+    };
+    match bytes {
+        Some(bytes) => Ok((crate::config::load_config_text(
+            std::str::from_utf8(&bytes)?, &path.display().to_string())?, true)),
+        None if explicit.is_none() => Ok((ScoreConfig::default(), false)),
+        None => anyhow::bail!("配置文件不存在：{}", path.display()),
+    }
 }
 
 /// Windows 的 `canonicalize` 会加上 `\\?\`，与原有缓存中的普通绝对路径不相等。
@@ -131,7 +159,8 @@ pub struct AppState {
     burst_overrides_path: PathBuf,
     scene_feedback: RwLock<HashMap<String, SceneFeedbackRecord>>,
     scene_feedback_path: PathBuf,
-    port: u16,
+    image_slots: Arc<Semaphore>,
+    thumb_slots: Arc<Semaphore>,
     /// 当前快照；跑批完成后热替换
     snapshot: RwLock<Snapshot>,
     loading: AtomicBool,
@@ -155,7 +184,7 @@ pub fn serve(
     config_path: Option<&Path>,
 ) -> Result<()> {
     serve_with_bind(
-        root, cfg, cache_path, IpAddr::V4(Ipv4Addr::LOCALHOST), port, open_browser, config_path,
+        root, cfg, cache_path, IpAddr::V4(Ipv4Addr::LOCALHOST), port, open_browser, config_path, None,
     )
 }
 
@@ -171,11 +200,19 @@ pub fn serve_with_bind(
     port: u16,
     open_browser: bool,
     config_path: Option<&Path>,
+    public_url: Option<&str>,
 ) -> Result<()> {
-    std::fs::create_dir_all(root.join(".firstcut"))?;
+    anyhow::ensure!(port != 0, "复核服务端口必须为 1–65535");
+    let configured_key = match std::env::var("FIRSTCUT_ACCESS_TOKEN") {
+        Ok(key) => Some(key),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(err) => return Err(err.into()),
+    };
+    let access = Arc::new(access::Access::new(bind, port, public_url, configured_key.as_deref())?);
+    Folder::open(root)?.state(true)?;
     let preferences = load_ui_preferences(root);
     serve_once(root, cfg, cache_path, bind, port, open_browser, config_path,
-        false, preferences.include_raw, true)?;
+        false, preferences.include_raw, true, access)?;
     Ok(())
 }
 
@@ -183,21 +220,18 @@ pub fn serve_with_bind(
 pub fn serve_ui(root: &Path, pick_root: impl Fn() -> Option<PathBuf>) -> Result<()> {
     let mut root = normal_photo_root(root)?;
     let mut open_browser = true;
+    let bind = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    let access = Arc::new(access::Access::new(bind, 8787, None, None)?);
     loop {
         let paths = photo_root_paths(&root);
-        std::fs::create_dir_all(&paths.state_dir)?;
+        Folder::open(&root)?.state(true)?;
         let cache_path = paths.cache;
-        let config_path = paths.config;
-        let config = if config_path.exists() {
-            crate::config::load_config(&config_path)?
-        } else {
-            ScoreConfig::default()
-        };
+        let (config, _) = load_review_config(&root, None)?;
         let preferences = load_ui_preferences(&root);
         let include_raw = preferences.include_raw;
         match serve_once(&root, &config, &cache_path,
-            IpAddr::V4(Ipv4Addr::LOCALHOST), 8787, open_browser, None,
-            true, include_raw, true)? {
+            bind, 8787, open_browser, None,
+            true, include_raw, true, access.clone())? {
             Some(UiAction::Restart) => open_browser = false,
             Some(UiAction::Choose) => {
                 if let Some(next) = pick_root() {
@@ -233,11 +267,12 @@ fn serve_once(
     ui_control: bool,
     include_raw: bool,
     skip_processed: bool,
+    access: Arc<access::Access>,
 ) -> Result<Option<UiAction>> {
     let burst_overrides_path = root.join(".firstcut").join("burst-overrides.json");
-    let burst_overrides = load_burst_overrides(&burst_overrides_path);
+    let burst_overrides = load_burst_overrides(root, &burst_overrides_path)?;
     let scene_feedback_path = scene_feedback::store_path(root);
-    let feedback = scene_feedback::load_latest(&scene_feedback_path)?;
+    let feedback = scene_feedback::load_latest(root, &scene_feedback_path)?;
     let initial_snapshot = if ui_control {
         Snapshot::empty(root, cfg)
     } else {
@@ -264,7 +299,8 @@ fn serve_once(
         burst_overrides_path,
         scene_feedback: RwLock::new(feedback),
         scene_feedback_path,
-        port,
+        image_slots: Arc::new(Semaphore::new(16)),
+        thumb_slots: Arc::new(Semaphore::new(3)),
         snapshot: RwLock::new(initial_snapshot),
         loading: AtomicBool::new(ui_control),
         load_error: Mutex::new(None),
@@ -272,7 +308,7 @@ fn serve_once(
             phase: "准备读取照片".into(), done: 0, total: 0,
         }),
         include_raw,
-        job: Arc::new(JobState::with_log_file(root.join(".firstcut").join("review.log"))),
+        job: Arc::new(JobState::with_log_file(root, root.join(".firstcut").join("review.log"))),
         control: control.clone(),
     });
     let load_state = Arc::clone(&state);
@@ -282,21 +318,7 @@ fn serve_once(
     let shutdown_control = control.clone();
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     runtime.block_on(async move {
-        let app = Router::new()
-            .route("/", get(index))
-            .route("/api/photos", get(photos))
-            .route("/api/load", get(load_status))
-            .route("/thumb", get(thumb))
-            .route("/image", get(image))
-            .route("/api/job", get(job_status))
-            .route("/api/score/run", post(score_run))
-            .route("/api/rate", post(rate))
-            .route("/api/burst/keep", post(burst_keep))
-            .route("/api/scene-feedback", post(scene_feedback_save))
-            .route("/api/config", get(config_get).post(config_save))
-            .route("/api/ui-settings", get(ui_settings_get).post(ui_settings_save))
-            .route("/api/control", get(control_status).post(control_post))
-            .with_state(state);
+        let app = router(state, access.clone());
         let listener = tokio::net::TcpListener::bind((bind, port)).await?;
         if ui_control {
             std::thread::spawn(move || {
@@ -318,15 +340,18 @@ fn serve_once(
                 load_state.loading.store(false, Ordering::Release);
             });
         }
-        let url = format!("http://127.0.0.1:{port}/");
-        if ui_control {
-            quiet_log(format!("[review] 就绪: {url}（页面右上角退出）"));
-        } else {
-            quiet_log(format!("[review] 就绪: {url}（Ctrl+C 退出）"));
-        }
+        let url = access.url();
         if open_browser {
-            // Windows：start 的第一个引号参数是窗口标题，占位空串
-            let _ = std::process::Command::new("cmd").args(["/C", "start", "", &url]).spawn();
+            if let Err(err) = open_review_browser(&url) {
+                quiet_log(format!("[review] 无法自动打开浏览器：{err:#}"));
+            }
+        }
+        if !ui_control {
+            if access.is_managed() {
+                quiet_log(format!("[review] 就绪: {}（使用已配置的访问凭据登录）", access.origin()));
+            } else {
+                quiet_log(format!("[review] 复核链接: {url}（仅供本人使用，Ctrl+C 退出）"));
+            }
         }
         axum::serve(listener, app)
             .with_graceful_shutdown(async move {
@@ -339,6 +364,49 @@ fn serve_once(
             .await
     })?;
     Ok(control.and_then(|control| control.action.lock().unwrap().take()))
+}
+
+fn router(state: Arc<AppState>, access: Arc<access::Access>) -> Router {
+    let session = Router::new()
+        .route("/api/session", post(access::sign_in))
+        .with_state(access.clone());
+    Router::new()
+        .route("/", get(index))
+        .route("/review.js", get(review_js))
+        .route("/healthz", get(|| async { access::HEALTH_MARKER }))
+        .route("/api/photos", get(photos))
+        .route("/api/load", get(load_status))
+        .route("/thumb", get(thumb))
+        .route("/image", get(image))
+        .route("/api/job", get(job_status))
+        .route("/api/score/run", post(score_run))
+        .route("/api/rate", post(rate))
+        .route("/api/burst/keep", post(burst_keep))
+        .route("/api/scene-feedback", post(scene_feedback_save))
+        .route("/api/config", get(config_get).post(config_save))
+        .route("/api/ui-settings", get(ui_settings_get).post(ui_settings_save))
+        .route("/api/control", get(control_status).post(control_post))
+        .layer(axum::extract::DefaultBodyLimit::max(64 * 1024))
+        .with_state(state)
+        .merge(session.layer(axum::extract::DefaultBodyLimit::max(1024)))
+        .layer(axum::middleware::from_fn_with_state(access, access::guard))
+}
+
+pub fn open_review_browser(url: &str) -> Result<()> {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL};
+        let wide: Vec<u16> = url.encode_utf16().chain([0]).collect();
+        let result = unsafe { ShellExecuteW(std::ptr::null_mut(), std::ptr::null(),
+            wide.as_ptr(), std::ptr::null(), std::ptr::null(), SW_SHOWNORMAL) };
+        anyhow::ensure!(result as isize > 32, "系统无法打开默认浏览器（错误 {}）", result as isize);
+    }
+    #[cfg(not(windows))]
+    {
+        let program = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+        std::process::Command::new(program).arg(url).spawn()?;
+    }
+    Ok(())
 }
 
 fn build_review_snapshot(
@@ -374,6 +442,10 @@ async fn index() -> Response {
         .into_response()
 }
 
+async fn review_js() -> Response {
+    ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8")], REVIEW_JS).into_response()
+}
+
 async fn photos(State(state): State<Arc<AppState>>) -> Response {
     if state.loading.load(Ordering::Acquire) {
         return (StatusCode::SERVICE_UNAVAILABLE, "正在读取照片和评分").into_response();
@@ -399,25 +471,53 @@ struct PhotoParam {
 
 /// 缩略图：磁盘缓存命中直出，否则按需生成
 async fn thumb(State(state): State<Arc<AppState>>, Query(q): Query<PhotoParam>) -> Response {
-    match resolve_jpeg(&state, &q.p) {
-        Ok(full) => match thumb::get_or_create(&state.root, &q.p, &full) {
-            Ok(Some(bytes)) => jpeg_response(bytes),
-            Ok(None) => StatusCode::NOT_FOUND.into_response(),
-            Err(err) => internal_error(err),
-        },
-        Err(resp) => resp,
+    let Ok(slot) = state.thumb_slots.clone().acquire_owned().await else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match tokio::task::spawn_blocking(move || {
+        let _slot = slot;
+        let file = resolve_jpeg(&state, &q.p)?;
+        thumb::get_or_create(&state.root, &q.p, file).map_err(internal_error)
+    }).await {
+        Ok(Ok(Some(bytes))) => ([(header::CONTENT_TYPE, "image/jpeg")], bytes).into_response(),
+        Ok(Ok(None)) => StatusCode::NOT_FOUND.into_response(),
+        Ok(Err(response)) => response,
+        Err(err) => internal_error(err.into()),
     }
 }
 
 /// 原图直读（浏览器原生解码，1:1 预览）
 async fn image(State(state): State<Arc<AppState>>, Query(q): Query<PhotoParam>) -> Response {
-    match resolve_jpeg(&state, &q.p) {
-        Ok(full) => match std::fs::read(&full) {
-            Ok(bytes) => jpeg_response(bytes),
-            Err(err) => internal_error(err.into()),
-        },
-        Err(resp) => resp,
-    }
+    let Ok(slot) = state.image_slots.clone().try_acquire_owned() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let (file, size) = match tokio::task::spawn_blocking(move || {
+        let mut file = resolve_jpeg(&state, &q.p)?;
+        let size = file.metadata().map_err(|err| internal_error(err.into()))?.len();
+        if size > crate::decode::MAX_PHOTO_BYTES {
+            return Err(StatusCode::PAYLOAD_TOO_LARGE.into_response());
+        }
+        if !crate::decode::can_preview_jpeg(&mut file).map_err(|err| internal_error(err.into()))? {
+            return Err((StatusCode::UNPROCESSABLE_ENTITY, "JPEG 文件无法预览，或尺寸超出上限").into_response());
+        }
+        Ok((file, size))
+    }).await {
+        Ok(Ok(photo)) => photo,
+        Ok(Err(response)) => return response,
+        Err(err) => return internal_error(err.into()),
+    };
+    use tokio::io::AsyncReadExt;
+    let reader = tokio::fs::File::from_std(file).take(size);
+    use futures_util::Stream;
+    let mut stream = Box::pin(tokio_util::io::ReaderStream::new(reader));
+    let stream = futures_util::stream::poll_fn(move |cx| {
+        let _slot = &slot; // Hold through the whole transfer, including a slow client.
+        stream.as_mut().poll_next(cx)
+    });
+    (
+        AppendHeaders([(header::CONTENT_TYPE, "image/jpeg"), (header::CONTENT_LENGTH, &size.to_string())]),
+        axum::body::Body::from_stream(stream),
+    ).into_response()
 }
 
 // ---- M-UI2：跑批 / 星级 / 配置 ----
@@ -472,12 +572,8 @@ async fn ui_settings_get(State(state): State<Arc<AppState>>) -> Response {
 
 async fn ui_settings_save(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
     axum::Json(request): axum::Json<UiSettingsRequest>,
 ) -> Response {
-    if !valid_local_host(&headers, state.port) || !valid_control_origin(&headers, state.port) {
-        return StatusCode::FORBIDDEN.into_response();
-    }
     if !(1..=25).contains(&request.histogram_sample_percent) {
         return (StatusCode::BAD_REQUEST, "直方图抽样比例必须在 1% 到 25% 之间").into_response();
     }
@@ -499,12 +595,8 @@ struct ControlRequest {
 
 async fn control_post(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
     axum::Json(request): axum::Json<ControlRequest>,
 ) -> Response {
-    if !valid_local_host(&headers, state.port) || !valid_control_origin(&headers, state.port) {
-        return StatusCode::FORBIDDEN.into_response();
-    }
     let Some(control) = &state.control else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -527,13 +619,11 @@ struct ScoreRunParams {
 }
 
 /// POST /api/score/run：触发一次完整评分（单任务互斥；完成后热替换快照）
-async fn score_run(State(state): State<Arc<AppState>>, headers: HeaderMap,
-    body: Option<axum::Json<ScoreRunParams>>) -> Response {
-    if !valid_local_host(&headers, state.port) { return StatusCode::FORBIDDEN.into_response(); }
+async fn score_run(State(state): State<Arc<AppState>>,
+    axum::Json(params): axum::Json<ScoreRunParams>) -> Response {
     if state.loading.load(Ordering::Acquire) {
         return (StatusCode::CONFLICT, "照片仍在加载，请稍后再评分").into_response();
     }
-    let params = body.map(|axum::Json(p)| p).unwrap_or(ScoreRunParams { xmp: false, no_ai: false });
     if !state.job.begin() {
         return (
             StatusCode::CONFLICT,
@@ -553,19 +643,9 @@ async fn score_run(State(state): State<Arc<AppState>>, headers: HeaderMap,
         let started = std::time::Instant::now();
         job.log("[score] 任务开始");
         // 每次跑批都重新加载配置：UI 里的配置编辑保存后下一次跑批即生效
-        let cfg_result = match crate::config::load_config(&config_path) {
-            Ok(c) => Ok(c),
-            Err(err) => {
-                // 未显式指定配置且默认文件不存在时用内置默认
-                if !config_path.exists() && !st.config_explicit {
-                    Ok(ScoreConfig::default())
-                } else {
-                    Err(err)
-                }
-            }
-        };
-        let cfg = match cfg_result {
-            Ok(c) => c,
+        let (cfg, config_exists) = match load_review_config(&root,
+            st.config_explicit.then_some(config_path.as_path())) {
+            Ok(result) => result,
             Err(err) => {
                 job.log(format!(
                     "[score] 配置加载失败（耗时 {:.1} 秒）: {err:#}",
@@ -575,7 +655,7 @@ async fn score_run(State(state): State<Arc<AppState>>, headers: HeaderMap,
                 return;
             }
         };
-        job.log(if config_path.exists() {
+        job.log(if config_exists {
             format!("[score] 配置已加载: {}", config_path.display())
         } else {
             "[score] 使用内置默认配置（照片根目录尚无 UI 配置）".into()
@@ -583,6 +663,7 @@ async fn score_run(State(state): State<Arc<AppState>>, headers: HeaderMap,
 
         let opts = crate::score::ScoreJobOptions {
             output_csv: photo_root_paths(&root).report,
+            raw_csv: false,
             cache_path: cache_path.clone(),
             no_cache: false,
             no_ai,
@@ -590,19 +671,8 @@ async fn score_run(State(state): State<Arc<AppState>>, headers: HeaderMap,
             gpu: false,
             keep_override: None,
             include_raw: st.include_raw,
-            skip_processed: st.control.is_some(),
+            skip_processed: true,
         };
-        if let Some(parent) = opts.output_csv.parent() {
-            if let Err(err) = std::fs::create_dir_all(parent) {
-                let message = format!("无法创建报告目录: {err}");
-                job.log(format!(
-                    "[score] {message}（耗时 {:.1} 秒）",
-                    started.elapsed().as_secs_f64()
-                ));
-                job.fail(message);
-                return;
-            }
-        }
         match crate::score::run_score_job(&root, &cfg, &opts, &|ev| match ev {
             crate::score::ScoreEvent::Info(s) => job.log(format!("[score] {s}")),
             crate::score::ScoreEvent::Progress { done, total } => job.progress(done, total),
@@ -615,7 +685,7 @@ async fn score_run(State(state): State<Arc<AppState>>, headers: HeaderMap,
                 let overrides = st.burst_overrides.read().unwrap().clone();
                 let feedback = st.scene_feedback.read().unwrap().clone();
                 match snapshot::build_snapshot_with_options(&root, &cfg, &cache_path,
-                    &overrides, &feedback, st.include_raw, st.control.is_some(), &|_, _, _| {}) {
+                    &overrides, &feedback, st.include_raw, true, &|_, _, _| {}) {
                     Ok(snap) => {
                         *st.snapshot.write().unwrap() = snap;
                         job.log("[review] 快照已刷新");
@@ -666,9 +736,8 @@ struct BurstKeepParams {
 }
 
 /// POST /api/burst/keep：保存单张照片的手动连拍保留决定。
-async fn burst_keep(State(state): State<Arc<AppState>>, headers: HeaderMap,
+async fn burst_keep(State(state): State<Arc<AppState>>,
     axum::Json(p): axum::Json<BurstKeepParams>) -> Response {
-    if !valid_local_host(&headers, state.port) { return StatusCode::FORBIDDEN.into_response(); }
     if state.job.is_running() {
         return (StatusCode::CONFLICT, "评分任务进行中，暂不能修改连拍标记").into_response();
     }
@@ -691,13 +760,8 @@ async fn burst_keep(State(state): State<Arc<AppState>>, headers: HeaderMap,
         Ok(bytes) => bytes,
         Err(err) => return internal_error(err.into()),
     };
-    if let Some(parent) = state.burst_overrides_path.parent() {
-        if let Err(err) = std::fs::create_dir_all(parent) {
-            restore_override(&mut overrides, &p.p, previous);
-            return internal_error(err.into());
-        }
-    }
-    if let Err(err) = std::fs::write(&state.burst_overrides_path, bytes) {
+    if let Err(err) = FileRef::at(&state.root, &state.burst_overrides_path, true)
+        .and_then(|file| file.write(&bytes)) {
         restore_override(&mut overrides, &p.p, previous);
         return internal_error(err.into());
     }
@@ -718,10 +782,12 @@ fn restore_override(overrides: &mut HashMap<String, bool>, path: &str, previous:
     else { overrides.remove(path); }
 }
 
-fn load_burst_overrides(path: &Path) -> HashMap<String, bool> {
-    std::fs::read(path).ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default()
+fn load_burst_overrides(root: &Path, path: &Path) -> Result<HashMap<String, bool>> {
+    let bytes = FileRef::at(root, path, false)?.read(32 * 1024 * 1024)?;
+    match bytes {
+        Some(bytes) => Ok(serde_json::from_slice(&bytes)?),
+        None => Ok(HashMap::new()),
+    }
 }
 
 #[derive(Deserialize)]
@@ -733,9 +799,8 @@ struct SceneFeedbackParams {
 }
 
 /// POST /api/scene-feedback：记录场景纠错与当前评分线索，供后续校准。
-async fn scene_feedback_save(State(state): State<Arc<AppState>>, headers: HeaderMap,
+async fn scene_feedback_save(State(state): State<Arc<AppState>>,
     axum::Json(p): axum::Json<SceneFeedbackParams>) -> Response {
-    if !valid_local_host(&headers, state.port) { return StatusCode::FORBIDDEN.into_response(); }
     if !scene_feedback::valid_scene(&p.selected_scene) {
         return (StatusCode::BAD_REQUEST, "请选择有效的场景").into_response();
     }
@@ -763,7 +828,7 @@ async fn scene_feedback_save(State(state): State<Arc<AppState>>, headers: Header
         }
     };
     let mut feedback = state.scene_feedback.write().unwrap();
-    if let Err(err) = scene_feedback::append(&state.scene_feedback_path, &record) {
+    if let Err(err) = scene_feedback::append(&state.root, &state.scene_feedback_path, &record) {
         return internal_error(err);
     }
     feedback.insert(record.photo_path.clone(), record.clone());
@@ -777,9 +842,8 @@ async fn scene_feedback_save(State(state): State<Arc<AppState>>, headers: Header
 
 /// POST /api/rate：UI 内改星——只改 `xmp:Rating`，firstcut 子分字段保留；
 /// 他人侧车（无 firstcut 命名空间）不覆盖（沿用 write_sidecar 保护）
-async fn rate(State(state): State<Arc<AppState>>, headers: HeaderMap,
+async fn rate(State(state): State<Arc<AppState>>,
     axum::Json(p): axum::Json<RateParams>) -> Response {
-    if !valid_local_host(&headers, state.port) { return StatusCode::FORBIDDEN.into_response(); }
     if !(1..=5).contains(&p.stars) {
         return (StatusCode::BAD_REQUEST, "星级必须是 1~5").into_response();
     }
@@ -789,7 +853,7 @@ async fn rate(State(state): State<Arc<AppState>>, headers: HeaderMap,
     // 从当前快照取该照片的分数（未评分照片没有可写子分，拒绝）
     let (scores, total, suggested_ev, pair_id, jpg_path, sidecar_entries) = {
         let guard = state.snapshot.read().unwrap();
-        let Some(photo) = guard.photos.iter().find(|x| x.path == p.p) else {
+        let Some(photo) = guard.photos.iter().find(|x| x.path == p.p && !x.is_raw) else {
             return (StatusCode::NOT_FOUND, "照片不在快照中").into_response();
         };
         let Some(s) = &photo.scores else {
@@ -865,7 +929,7 @@ async fn rate(State(state): State<Arc<AppState>>, headers: HeaderMap,
         let sidecar = Path::new(&entry.path)
             .with_file_name(format!("{}.xmp", crate::scan::stem_raw_of(&entry.filename)));
         if !seen.insert(sidecar) { continue; }
-        match crate::output::xmp::write_sidecar(entry, &scores, total, p.stars, suggested_ev) {
+        match crate::output::xmp::write_sidecar(&state.root, entry, &scores, total, p.stars, suggested_ev) {
             Ok(true) => {},
             Ok(false) => warnings.push(format!("{} 已有其他软件的侧车，未覆盖", entry.path)),
             Err(err) => warnings.push(format!("{} 侧车写入失败: {err:#}", entry.path)),
@@ -881,11 +945,11 @@ async fn rate(State(state): State<Arc<AppState>>, headers: HeaderMap,
 
 /// GET /api/config：当前可编辑配置值（文件不存在时为内置默认）
 async fn config_get(State(state): State<Arc<AppState>>) -> Response {
-    match config_edit::load(&state.config_path) {
-        Ok(values) => json_response(serde_json::json!({
+    match load_review_config(&state.root, state.config_explicit.then_some(state.config_path.as_path())) {
+        Ok((cfg, exists)) => json_response(serde_json::json!({
             "path": state.config_path.display().to_string(),
-            "exists": state.config_path.exists(),
-            "values": values,
+            "exists": exists,
+            "values": config_edit::ConfigValues::from_cfg(&cfg),
         })),
         Err(err) => internal_error(err),
     }
@@ -894,11 +958,9 @@ async fn config_get(State(state): State<Arc<AppState>>) -> Response {
 /// POST /api/config：保存编辑值（toml_edit 保留注释；非法值拒绝写盘）
 async fn config_save(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
     axum::Json(values): axum::Json<config_edit::ConfigValues>,
 ) -> Response {
-    if !valid_local_host(&headers, state.port) { return StatusCode::FORBIDDEN.into_response(); }
-    match config_edit::save(&state.config_path, &values) {
+    match config_edit::save_in(&state.root, &state.config_path, &values) {
         Ok(()) => {
             let note = "已保存；下一次 UI 跑批生效";
             json_response(serde_json::json!({ "ok": true, "note": note }))
@@ -915,65 +977,54 @@ fn json_response(v: serde_json::Value) -> Response {
         .into_response()
 }
 
-/// 路径安全：解析并校验在扫描根目录内，且扩展名为 JPG。
-/// Err 分支直接携带要返回的 HTTP 响应（403/404）。
-fn resolve_jpeg(state: &AppState, p: &str) -> std::result::Result<PathBuf, Response> {
-    match snapshot::resolve_under(&state.root, p) {
-        Some(full) => {
-            let ext = full
-                .extension()
-                .map(|e| e.to_string_lossy().to_ascii_lowercase())
-                .unwrap_or_default();
-            if matches!(ext.as_str(), "jpg" | "jpeg") {
-                Ok(full)
-            } else {
-                Err(StatusCode::FORBIDDEN.into_response())
-            }
-        }
-        None => Err(StatusCode::FORBIDDEN.into_response()),
+/// Only an exact indexed JPG identity is accepted, then the file is opened
+/// through the album directory without following replaced path components.
+fn resolve_jpeg(state: &AppState, p: &str) -> std::result::Result<std::fs::File, Response> {
+    let allowed = {
+        let snapshot = state.snapshot.read().unwrap();
+        snapshot.photos.binary_search_by(|photo| photo.path.as_str().cmp(p)).ok()
+            .is_some_and(|i| {
+                let photo = &snapshot.photos[i];
+                !photo.is_raw && matches!(photo.ext.as_str(), "jpg" | "jpeg")
+            })
+    };
+    if !allowed {
+        return Err(StatusCode::NOT_FOUND.into_response());
     }
-}
-
-fn jpeg_response(bytes: Vec<u8>) -> Response {
-    // 缩略图/原图内容只随文件变化；本地服务给 1h 缓存，
-    // 灯箱反复开关不再重复传输几十 MB 原图（DSH 第 2 轮附带观察）
-    (
-        AppendHeaders([
-            (header::CONTENT_TYPE, "image/jpeg"),
-            (header::CACHE_CONTROL, "private, max-age=3600"),
-        ]),
-        bytes,
-    )
-        .into_response()
+    match FileRef::inside(&state.root, &state.root.join(p)).and_then(|file| file.open_read()) {
+        Ok(Some(file)) => Ok(file),
+        Ok(None) => Err(StatusCode::NOT_FOUND.into_response()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound =>
+            Err(StatusCode::NOT_FOUND.into_response()),
+        Err(_) => Err(StatusCode::FORBIDDEN.into_response()),
+    }
 }
 
 fn internal_error(err: anyhow::Error) -> Response {
     (StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")).into_response()
 }
 
-fn valid_local_host(headers: &HeaderMap, port: u16) -> bool {
-    let expected_ip = format!("127.0.0.1:{port}");
-    let expected_name = format!("localhost:{port}");
-    headers.get(header::HOST).and_then(|v| v.to_str().ok())
-        .is_some_and(|host| host.eq_ignore_ascii_case(&expected_ip)
-            || host.eq_ignore_ascii_case(&expected_name))
-}
-
-fn valid_control_origin(headers: &HeaderMap, port: u16) -> bool {
-    if !valid_local_host(headers, port) {
-        return false;
-    }
-    let Some(host) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) else {
-        return false;
-    };
-    let expected = format!("http://{host}");
-    headers.get(header::ORIGIN).and_then(|v| v.to_str().ok())
-        .is_some_and(|origin| origin.eq_ignore_ascii_case(&expected))
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::Body;
+    use axum::http::{Method, Request};
+    use tower::ServiceExt;
+
+    const HOST: &str = "127.0.0.1:8787";
+    const ORIGIN: &str = "http://127.0.0.1:8787";
+
+    fn test_request(method: Method, url: &str, origin: Option<&str>, session: Option<&str>, json: Option<serde_json::Value>) -> Request<Body> {
+        let mut builder = Request::builder().method(method).uri(url).header(header::HOST, HOST);
+        if let Some(origin) = origin { builder = builder.header(header::ORIGIN, origin); }
+        if let Some(session) = session { builder = builder.header(header::AUTHORIZATION, format!("Bearer {session}")); }
+        let body = if let Some(json) = json {
+            builder = builder.header(header::CONTENT_TYPE, "application/json");
+            Body::from(json.to_string())
+        } else { Body::empty() };
+        builder.body(body).unwrap()
+    }
 
     #[test]
     fn photo_root_outputs_share_one_hidden_state_directory() {
@@ -1023,7 +1074,8 @@ mod tests {
             root: PathBuf::new(), cache_path: PathBuf::new(), config_path: PathBuf::new(),
             config_explicit: false, burst_overrides: RwLock::new(HashMap::new()),
             burst_overrides_path: PathBuf::new(), scene_feedback: RwLock::new(HashMap::new()),
-            scene_feedback_path: PathBuf::new(), port: 8787,
+            scene_feedback_path: PathBuf::new(),
+            image_slots: Arc::new(Semaphore::new(2)), thumb_slots: Arc::new(Semaphore::new(1)),
             snapshot: RwLock::new(Snapshot {
                 root: String::new(), weights: snapshot::WeightsJson {
                     sharpness: 0.3, exposure: 0.25, noise: 0.15,
@@ -1035,26 +1087,50 @@ mod tests {
             include_raw: true,
             job: Arc::new(JobState::new()), control: Some(Arc::clone(&control)),
         });
+        let access = Arc::new(access::Access::new(Ipv4Addr::LOCALHOST.into(), 8787, None, None).unwrap());
+        let url = access.url();
+        let (_, key) = url.split_once("#access=").unwrap();
+        let app = router(state.clone(), access);
+        for path in ["/api/photos", "/api/config", "/api/job", "/thumb", "/image"] {
+            let response = app.clone().oneshot(test_request(Method::GET, path, None, None, None)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "private, no-store");
+        }
+        let login = test_request(Method::POST, "/api/session", Some(ORIGIN), None,
+            Some(serde_json::json!({"key": key})));
+        let response = app.clone().oneshot(login).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!response.headers().contains_key(header::SET_COOKIE));
+        let body = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let session = value["session"].as_str().unwrap();
+
         state.loading.store(true, Ordering::Release);
-        assert_eq!(photos(State(Arc::clone(&state))).await.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let request = test_request(Method::GET, "/api/photos", None, Some(session), None);
+        assert_eq!(app.clone().oneshot(request).await.unwrap().status(), StatusCode::SERVICE_UNAVAILABLE);
         state.loading.store(false, Ordering::Release);
-        assert_eq!(photos(State(Arc::clone(&state))).await.status(), StatusCode::OK);
-        let mut headers = HeaderMap::new();
-        headers.insert(header::HOST, "127.0.0.1:8787".parse().unwrap());
-        headers.insert(header::ORIGIN, "http://untrusted.example".parse().unwrap());
-        let response = control_post(State(Arc::clone(&state)), headers.clone(),
-            axum::Json(ControlRequest { action: UiAction::Exit })).await;
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let request = test_request(Method::GET, "/api/photos", None, Some(session), None);
+        assert_eq!(app.clone().oneshot(request).await.unwrap().status(), StatusCode::OK);
+
+        // In-process policy assertions: requests missing the required origin
+        // must stop before entering any of the mutation handlers.
+        for path in ["/api/control", "/api/score/run", "/api/rate", "/api/burst/keep",
+            "/api/config", "/api/scene-feedback", "/api/ui-settings"] {
+            let request = test_request(Method::POST, path, None, Some(session), None);
+            assert_eq!(app.clone().oneshot(request).await.unwrap().status(), StatusCode::FORBIDDEN, "{path}");
+        }
+        assert!(!state.job.is_running());
         assert!(control.action.lock().unwrap().is_none());
 
-        headers.insert(header::ORIGIN, "http://127.0.0.1:8787".parse().unwrap());
         assert!(state.job.begin());
-        let response = control_post(State(Arc::clone(&state)), headers.clone(),
-            axum::Json(ControlRequest { action: UiAction::Exit })).await;
+        let request = test_request(Method::POST, "/api/control", Some(ORIGIN), Some(session),
+            Some(serde_json::json!({"action": "exit"})));
+        let response = app.clone().oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::CONFLICT);
         state.job.finish("完成".into());
-        let response = control_post(State(state), headers,
-            axum::Json(ControlRequest { action: UiAction::Restart })).await;
+        let request = test_request(Method::POST, "/api/control", Some(ORIGIN), Some(session),
+            Some(serde_json::json!({"action": "restart"})));
+        let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(*control.action.lock().unwrap(), Some(UiAction::Restart));
     }
@@ -1062,10 +1138,15 @@ mod tests {
     #[tokio::test]
     async fn jpeg_whitelist_blocks_arw() {
         // 直接测 resolve_jpeg 的白名单逻辑（不依赖真实服务）
-        let dir = std::env::temp_dir().join("firstcut_review_whitelist");
+        let fixture = tempfile::tempdir().unwrap();
+        let dir = fixture.path().to_path_buf();
         std::fs::create_dir_all(dir.join("d")).unwrap();
         std::fs::write(dir.join("d/a.jpg"), b"jpeg").unwrap();
         std::fs::write(dir.join("d/b.ARW"), b"raw").unwrap();
+        let snapshot = snapshot::build_snapshot(&dir, &ScoreConfig::default(),
+            &dir.join("missing.sqlite"), &HashMap::new(), &HashMap::new()).unwrap();
+        // A second file on disk must not be served until the catalogue is refreshed.
+        std::fs::write(dir.join("d/unlisted.jpg"), b"unlisted").unwrap();
         let state = AppState {
             root: dir.clone(),
             cache_path: dir.join("c.sqlite"),
@@ -1075,10 +1156,8 @@ mod tests {
             burst_overrides_path: dir.join(".firstcut").join("burst-overrides.json"),
             scene_feedback: RwLock::new(HashMap::new()),
             scene_feedback_path: scene_feedback::store_path(&dir),
-            port: 8787,
-            snapshot: RwLock::new(Snapshot { root: dir.display().to_string(),
-                weights: snapshot::WeightsJson { sharpness: 0.3, exposure: 0.25, noise: 0.15,
-                    composition: 0.15, aesthetic: 0.15 }, photos: vec![] }),
+            image_slots: Arc::new(Semaphore::new(2)), thumb_slots: Arc::new(Semaphore::new(1)),
+            snapshot: RwLock::new(snapshot),
             job: Arc::new(JobState::new()),
             loading: AtomicBool::new(false), load_error: Mutex::new(None),
             load_progress: Mutex::new(LoadProgress { phase: String::new(), done: 0, total: 0 }),
@@ -1091,13 +1170,14 @@ mod tests {
         assert!(raw.is_err(), "非 jpg 应 403");
         let missing = resolve_jpeg(&state, "d/none.jpg");
         assert!(missing.is_err(), "不存在的路径应 403（canonicalize 失败）");
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(resolve_jpeg(&state, "d/unlisted.jpg").is_err());
     }
 
     #[tokio::test]
     async fn manual_burst_keep_persists_and_can_restore_suggestion() {
         let dir = std::env::temp_dir().join(format!("firstcut_burst_override_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
         let override_path = dir.join(".firstcut").join("burst-overrides.json");
         let photo = snapshot::PhotoJson {
             path: "scene/a.jpg".into(), filename: "a.jpg".into(), ext: "jpg".into(),
@@ -1114,7 +1194,7 @@ mod tests {
             config_explicit: false, burst_overrides: RwLock::new(HashMap::new()),
             burst_overrides_path: override_path.clone(),
             scene_feedback: RwLock::new(HashMap::new()), scene_feedback_path: scene_feedback::store_path(&dir),
-            port: 8787,
+            image_slots: Arc::new(Semaphore::new(2)), thumb_slots: Arc::new(Semaphore::new(1)),
             snapshot: RwLock::new(Snapshot { root: dir.display().to_string(),
                 weights: snapshot::WeightsJson { sharpness: 0.3, exposure: 0.25, noise: 0.15,
                     composition: 0.15, aesthetic: 0.15 }, photos: vec![photo] }),
@@ -1124,10 +1204,7 @@ mod tests {
             include_raw: true,
             control: None,
         });
-        let mut headers = HeaderMap::new();
-        headers.insert(header::HOST, "127.0.0.1:8787".parse().unwrap());
-
-        let response = burst_keep(State(Arc::clone(&state)), headers.clone(), axum::Json(BurstKeepParams {
+        let response = burst_keep(State(Arc::clone(&state)), axum::Json(BurstKeepParams {
             p: "scene/a.jpg".into(), keep: Some(false),
         })).await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -1140,7 +1217,7 @@ mod tests {
             assert_eq!(burst.manual_keep, Some(false));
         }
 
-        let response = burst_keep(State(Arc::clone(&state)), headers, axum::Json(BurstKeepParams {
+        let response = burst_keep(State(Arc::clone(&state)), axum::Json(BurstKeepParams {
             p: "scene/a.jpg".into(), keep: None,
         })).await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -1157,6 +1234,7 @@ mod tests {
     async fn scene_feedback_endpoint_records_actual_score_context() {
         let dir = std::env::temp_dir().join(format!("firstcut_scene_endpoint_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
         let feedback_path = scene_feedback::store_path(&dir);
         let photo = snapshot::PhotoJson {
             path: "a.jpg".into(), filename: "a.jpg".into(), ext: "jpg".into(),
@@ -1173,7 +1251,8 @@ mod tests {
             config_explicit: false, burst_overrides: RwLock::new(HashMap::new()),
             burst_overrides_path: dir.join(".firstcut").join("burst-overrides.json"),
             scene_feedback: RwLock::new(HashMap::new()), scene_feedback_path: feedback_path.clone(),
-            port: 8787, snapshot: RwLock::new(Snapshot { root: dir.display().to_string(),
+            image_slots: Arc::new(Semaphore::new(2)), thumb_slots: Arc::new(Semaphore::new(1)),
+            snapshot: RwLock::new(Snapshot { root: dir.display().to_string(),
                 weights: snapshot::WeightsJson { sharpness: 0.3, exposure: 0.25, noise: 0.15,
                     composition: 0.15, aesthetic: 0.15 }, photos: vec![photo] }),
             job: Arc::new(JobState::new()),
@@ -1182,19 +1261,17 @@ mod tests {
             include_raw: true,
             control: None,
         });
-        let mut headers = HeaderMap::new();
-        headers.insert(header::HOST, "127.0.0.1:8787".parse().unwrap());
-        let response = scene_feedback_save(State(Arc::clone(&state)), headers.clone(),
+        let response = scene_feedback_save(State(Arc::clone(&state)),
             axum::Json(SceneFeedbackParams { p: "a.jpg".into(), selected_scene: "stage".into(),
                 note: "舞台灯光".into() })).await;
         assert_eq!(response.status(), StatusCode::OK);
-        let saved = scene_feedback::load_latest(&feedback_path).unwrap();
+        let saved = scene_feedback::load_latest(&dir, &feedback_path).unwrap();
         assert_eq!(saved["a.jpg"].predicted_scene, "portrait");
         assert_eq!(saved["a.jpg"].selected_scene, "stage");
         assert_eq!(saved["a.jpg"].scores.as_ref().unwrap().total, 57.5);
         assert_eq!(state.snapshot.read().unwrap().photos[0].scene_feedback.as_ref().unwrap().note, "舞台灯光");
 
-        let response = scene_feedback_save(State(state), headers,
+        let response = scene_feedback_save(State(state),
             axum::Json(SceneFeedbackParams { p: "a.jpg".into(), selected_scene: "invalid".into(),
                 note: String::new() })).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);

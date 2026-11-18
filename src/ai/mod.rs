@@ -15,14 +15,82 @@ pub mod facedetect;
 pub mod iqa;
 pub mod pose;
 
-use anyhow::{bail, Result};
-use ort::session::Session;
-use std::path::Path;
+use anyhow::{bail, Context, Result};
+use ort::session::{builder::SessionBuilder, Session};
+use sha2::{Digest, Sha256};
+use std::borrow::Cow;
+use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
 
-/// 模型目录（相对当前工作目录）
+/// 模型目录名。
 pub const MODELS_DIR: &str = "models";
+
+// LFS SHA-256 values at the exact upstream revisions listed in README.
+const MODEL_FILES: [(&str, u64, &str); 4] = [
+    ("clipiqa_model.onnx", 409_923, "4f959db3c321a652ef45915aeade0eb05284a8145cc933dd9feaae4e633cac37"),
+    ("clipiqa_model.onnx.data", 152_764_416, "8c6b5a074405e85cda90155975588a3c4bc500d858ad994423380115610c19b6"),
+    ("scrfd_10g_bnkps.onnx", 16_923_827, "5838f7fe053675b1c7a08b633df49e7af5495cee0493c7dcf6697200b85b5b91"),
+    ("yolov8n_pose.onnx", 13_484_153, "04f6d2416266f2aba6c5ba8b26de33ed9eba3279f972ac02e33f9f1366547586"),
+];
+
+fn model_dir() -> PathBuf {
+    if let Some(path) = std::env::var_os("FIRSTCUT_MODEL_DIR") {
+        return path.into();
+    }
+    PathBuf::from(MODELS_DIR)
+}
+
+struct VerifiedModel {
+    bytes: Vec<u8>,
+    external: Option<&'static [u8]>,
+}
+
+static CLIP_DATA: OnceLock<Box<[u8]>> = OnceLock::new();
+static CLIP_LOAD: Mutex<()> = Mutex::new(());
+// ORT keeps a reference to the external initializer for each session. There
+// is exactly one accepted data file, so all sessions share these bytes.
+fn clip_data(dir: &crate::storage::Folder) -> Result<&'static [u8]> {
+    let _load = CLIP_LOAD.lock()
+        .map_err(|_| anyhow::anyhow!("无法共享模型权重"))?;
+    if CLIP_DATA.get().is_none() {
+        let bytes = verify_model_file(dir, MODEL_FILES[1])?.into_boxed_slice();
+        let _ = CLIP_DATA.set(bytes);
+    }
+    Ok(CLIP_DATA.get().expect("initializer set under lock").as_ref())
+}
+
+impl VerifiedModel {
+    fn commit(&self, mut builder: SessionBuilder) -> Result<Session> {
+        if let Some(data) = self.external {
+            builder = builder.with_external_initializer_file_in_memory(
+                "clipiqa_model.onnx.data", Cow::Borrowed(data)).map_err(ort_err)?;
+        }
+        builder.commit_from_memory(&self.bytes).map_err(ort_err)
+    }
+}
+
+fn verify_model_file(dir: &crate::storage::Folder, spec: (&str, u64, &str)) -> Result<Vec<u8>> {
+    let (name, size, expected) = spec;
+    let content = dir.file(name)?.read(size)?
+        .with_context(|| format!("缺少已支持的模型文件 {name}"))?;
+    anyhow::ensure!(content.len() as u64 == size && format!("{:x}", Sha256::digest(&content)) == expected,
+        "模型 {name} 校验不匹配；请从 README 列出的固定版本重新下载");
+    Ok(content)
+}
+
+fn load_verified_model(model_file: &str) -> Result<VerifiedModel> {
+    let spec = MODEL_FILES.iter().copied().find(|spec| spec.0 == model_file)
+        .with_context(|| format!("未知模型文件 {model_file}"))?;
+    let dir = crate::storage::Folder::open(&model_dir()).context("找不到已支持的模型目录")?;
+    let bytes = verify_model_file(&dir, spec)?;
+    // The supported CLIPIQA graph and its data are verified separately. Feed
+    // the verified bytes directly to ORT so it cannot reopen a changed path.
+    let external = if model_file == "clipiqa_model.onnx" {
+        Some(clip_data(&dir)?)
+    } else { None };
+    Ok(VerifiedModel { bytes, external })
+}
 
 /// ort 的错误不含 Send+Sync（内含裸指针），包装成 anyhow::Error
 pub fn ort_err(e: impl std::fmt::Debug) -> anyhow::Error {
@@ -34,6 +102,7 @@ pub fn ort_err(e: impl std::fmt::Debug) -> anyhow::Error {
 /// `use_gpu` 只有在 `--features gpu` 构建下才生效；DirectML 注册失败
 /// （驱动/系统不支持）时回落 CPU 并不视为致命错误。
 pub fn build_session(model_file: &str, intra: usize, use_gpu: bool) -> Result<Session> {
+    let model = load_verified_model(model_file)?;
     #[cfg(feature = "gpu")]
     if use_gpu {
         use ort::ep::DirectML;
@@ -46,11 +115,9 @@ pub fn build_session(model_file: &str, intra: usize, use_gpu: bool) -> Result<Se
             .map_err(ort_err)?
             .with_execution_providers([DirectML::default().build()])
         {
-            Ok(mut b) => {
+            Ok(b) => {
                 eprintln!("[ai] DirectML GPU 推理已启用（实验性）");
-                return b
-                    .commit_from_file(format!("{MODELS_DIR}/{model_file}"))
-                    .map_err(ort_err);
+                return model.commit(b);
             }
             Err(e) => {
                 eprintln!("[ai] 警告: DirectML 注册失败，回落 CPU: {e:?}");
@@ -60,13 +127,13 @@ pub fn build_session(model_file: &str, intra: usize, use_gpu: bool) -> Result<Se
     #[cfg(not(feature = "gpu"))]
     let _ = use_gpu;
 
-    let mut builder = Session::builder()
+    let builder = Session::builder()
         .map_err(ort_err)?
         .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)
         .map_err(ort_err)?
         .with_intra_threads(intra)
         .map_err(ort_err)?;
-    builder.commit_from_file(format!("{MODELS_DIR}/{model_file}")).map_err(ort_err)
+    model.commit(builder)
 }
 
 /// 轻量 session 池：onnxruntime 的 run 需要 &mut self，
@@ -97,13 +164,9 @@ impl<T> SessionPool<T> {
 
 /// 校验模型文件是否存在；缺失时给出明确指引
 pub fn ensure_models() -> Result<()> {
-    for f in [
-        "clipiqa_model.onnx",
-        "clipiqa_model.onnx.data",
-        "scrfd_10g_bnkps.onnx",
-        "yolov8n_pose.onnx",
-    ] {
-        if !Path::new(MODELS_DIR).join(f).exists() {
+    let dir = model_dir();
+    for (f, _, _) in MODEL_FILES {
+        if !dir.join(f).is_file() {
             bail!(
                 "缺少模型文件 models/{f}\n\
                  请先下载（模型列表见 README.md）：\n\
@@ -114,4 +177,8 @@ pub fn ensure_models() -> Result<()> {
         }
     }
     Ok(())
+}
+
+pub(crate) fn model_path(name: &str) -> PathBuf {
+    model_dir().join(name)
 }

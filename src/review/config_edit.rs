@@ -42,7 +42,7 @@ pub struct ConfigValues {
 }
 
 impl ConfigValues {
-    fn from_cfg(c: &ScoreConfig) -> Self {
+    pub(super) fn from_cfg(c: &ScoreConfig) -> Self {
         ConfigValues {
             w_sharpness: c.weights.sharpness,
             w_exposure: c.weights.exposure,
@@ -87,13 +87,23 @@ pub fn load(path: &Path) -> Result<ConfigValues> {
 /// 保存配置值：不存在先落模板（带注释），再以 toml_edit 做数值替换（保留注释），
 /// 最后用 `load_config` 全量校验写回内容合法才落盘。
 pub fn save(path: &Path, values: &ConfigValues) -> Result<()> {
+    save_to(crate::storage::FileRef::explicit(path, true)?, path, values)
+}
+
+pub fn save_in(root: &Path, path: &Path, values: &ConfigValues) -> Result<()> {
+    save_to(crate::storage::FileRef::at(root, path, true)?, path, values)
+}
+
+fn save_to(file: crate::storage::FileRef, path: &Path, values: &ConfigValues) -> Result<()> {
     for (name, value) in [("keep_k", values.dedup_keep_k),
         ("burst_group_cap", values.dedup_burst_group_cap)] {
         anyhow::ensure!(value.is_finite() && value >= 0.0 && value.fract() == 0.0
             && value <= i64::MAX as f64, "{name} 必须是非负整数");
     }
-    let text = if path.exists() { std::fs::read_to_string(path)? }
-        else { crate::config::config_template() };
+    let text = match file.read(1024 * 1024)? {
+        Some(bytes) => String::from_utf8(bytes)?,
+        None => crate::config::config_template(),
+    };
     let mut doc = text
         .parse::<toml_edit::DocumentMut>()
         .with_context(|| format!("解析配置失败（{}）", path.display()))?;
@@ -146,10 +156,7 @@ pub fn save(path: &Path, values: &ConfigValues) -> Result<()> {
     crate::config::load_config_text(&new_text, &path.display().to_string())?;
 
     // 原子替换：验证通过后才创建文件
-    if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
-    let tmp = path.with_extension("toml.tmp");
-    std::fs::write(&tmp, new_text)?;
-    std::fs::rename(&tmp, path)?;
+    file.write(new_text.as_bytes())?;
     Ok(())
 }
 

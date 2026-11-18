@@ -1,0 +1,77 @@
+name: Build and scan container
+
+on:
+  workflow_call:
+    inputs:
+      staging:
+        description: Push scanned images to GHCR for release promotion
+        type: boolean
+        default: false
+
+jobs:
+  platform:
+    name: Scan Linux ${{ matrix.arch }} image
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+      - name: Build platform image archive
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        with:
+          context: .
+          platforms: linux/${{ matrix.arch }}
+          outputs: type=docker,dest=${{ runner.temp }}/firstcut-${{ matrix.arch }}.tar
+          tags: firstcut-local:${{ matrix.arch }}
+          provenance: false
+          labels: org.opencontainers.image.version=${{ github.ref_name }}
+          cache-from: type=gha,scope=container-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=container-${{ matrix.arch }}
+      - name: Scan the platform image archive
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          input: ${{ runner.temp }}/firstcut-${{ matrix.arch }}.tar
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: '1'
+      - name: Log in to GitHub Container Registry
+        if: inputs.staging
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Stage the scanned image
+        if: inputs.staging
+        env:
+          ARCH: ${{ matrix.arch }}
+          IMAGE_ARCHIVE: ${{ runner.temp }}/firstcut-${{ matrix.arch }}.tar
+        run: |
+          set -euo pipefail
+          stage="ghcr.io/${GITHUB_REPOSITORY,,}:staging-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$ARCH"
+          docker load --input "$IMAGE_ARCHIVE"
+          docker tag "firstcut-local:$ARCH" "$stage"
+          docker push "$stage"
+          digest=$(docker buildx imagetools inspect "$stage" --format '{{json .Manifest}}' | jq -er '.digest')
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          printf '%s\n' "$digest" > "$RUNNER_TEMP/firstcut-$ARCH.digest"
+      - name: Record scanned image digest
+        if: inputs.staging
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: firstcut-digest-${{ matrix.arch }}
+          path: ${{ runner.temp }}/firstcut-${{ matrix.arch }}.digest
+          if-no-files-found: error
+          retention-days: 14

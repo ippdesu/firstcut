@@ -2,9 +2,8 @@
 //!
 //! 同一时刻只允许一个评分任务（全局单 job），状态经 `/api/job` 轮询。
 
-use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 #[cfg(not(windows))]
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -31,7 +30,7 @@ struct JobInner {
 #[derive(Debug)]
 pub struct JobState {
     inner: Mutex<JobInner>,
-    log_file: Option<PathBuf>,
+    log_file: Option<(PathBuf, PathBuf)>,
 }
 
 const LOG_CAP: usize = 200;
@@ -45,11 +44,11 @@ impl JobState {
     }
 
     /// 创建将任务记录追加到指定文件的状态机。文件仅在首次记录时创建。
-    pub fn with_log_file(path: PathBuf) -> Self {
-        Self::with_optional_log_file(Some(path))
+    pub fn with_log_file(root: &Path, path: PathBuf) -> Self {
+        Self::with_optional_log_file(Some((root.to_path_buf(), path)))
     }
 
-    fn with_optional_log_file(log_file: Option<PathBuf>) -> Self {
+    fn with_optional_log_file(log_file: Option<(PathBuf, PathBuf)>) -> Self {
         JobState {
             inner: Mutex::new(JobInner {
                 status: JobStatus::Idle,
@@ -108,8 +107,8 @@ impl JobState {
             g.log.drain(0..overflow);
         }
         if !g.log_file_disabled {
-            if let Some(path) = &self.log_file {
-                if let Err(err) = append_bounded(path, &entry) {
+            if let Some((root, path)) = &self.log_file {
+                if let Err(err) = append_bounded(root, path, &entry) {
                     g.log_file_disabled = true;
                     g.log.push(format!(
                         "{} [log] 磁盘日志写入失败，已停止本次写入: {err}",
@@ -154,15 +153,11 @@ fn bounded_line(mut line: String) -> String {
 }
 
 /// 追加一行并将单个日志文件限制在 256 KiB。超过上限时先保留末尾约 128 KiB。
-fn append_bounded(path: &PathBuf, line: &str) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let mut file = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .open(path)?;
+fn append_bounded(root: &Path, path: &Path, line: &str) -> io::Result<()> {
+    let target = crate::storage::FileRef::inside(root, path)?;
+    let mut file = target.open_update()?;
+    file.try_lock().map_err(std::io::Error::from)?;
+    target.check_opened(&file)?;
     let line = format!("{line}\n");
     let file_len = file.metadata()?.len();
     if file_len.saturating_add(line.len() as u64) > LOG_FILE_CAP_BYTES {

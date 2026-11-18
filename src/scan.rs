@@ -77,9 +77,8 @@ pub fn is_raw_file(name: &str) -> bool {
 
 /// 小写扩展名（不含点）
 pub fn extension_of(name: &str) -> String {
-    name.rsplit('.')
-        .next()
-        .map(|s| s.to_ascii_lowercase())
+    Path::new(name).extension().and_then(|suffix| suffix.to_str())
+        .map(str::to_ascii_lowercase)
         .unwrap_or_default()
 }
 
@@ -132,7 +131,7 @@ pub fn scan_directory(dir: &Path) -> Result<Vec<PhotoEntry>> {
 
 /// 复核启动可沿用最近报告中的 EXIF；照片在报告之后被修改时仍重新读取。
 pub fn scan_directory_with_exif_cache(dir: &Path, report: &Path) -> Result<Vec<PhotoEntry>> {
-    scan_directory_inner(dir, load_report_exif(report), true, false, &|_, _, _| {})
+    scan_directory_inner(dir, load_report_exif(dir, report), true, false, &|_, _, _| {})
 }
 
 /// 复核界面专用：可关闭 RAW 关联，并报告真实扫描阶段和文件进度。
@@ -141,7 +140,7 @@ pub fn scan_review_directory(
     progress: &dyn Fn(&str, usize, usize),
 ) -> Result<Vec<PhotoEntry>> {
     progress("读取已有报告", 0, 0);
-    scan_directory_inner(dir, load_report_exif(report), include_raw, skip_processed, progress)
+    scan_directory_inner(dir, load_report_exif(dir, report), include_raw, skip_processed, progress)
 }
 
 /// 评分跑批可复用相同的照片范围；CLI 默认仍扫描 JPG 与 RAW。
@@ -149,9 +148,14 @@ pub fn scan_directory_with_options(dir: &Path, include_raw: bool, skip_processed
     scan_directory_inner(dir, None, include_raw, skip_processed, &|_, _, _| {})
 }
 
-fn load_report_exif(report: &Path) -> Option<(std::time::SystemTime, HashMap<String, PhotoEntry>)> {
-    let report_time = report.metadata().ok()?.modified().ok()?;
-    let mut reader = csv::Reader::from_path(report).ok()?;
+fn load_report_exif(root: &Path, report: &Path) -> Option<(std::time::SystemTime, HashMap<String, PhotoEntry>)> {
+    use std::io::Read;
+    let file = crate::storage::FileRef::inside(root, report).ok()?.open_read().ok()??;
+    let meta = file.metadata().ok()?;
+    const REPORT_LIMIT: u64 = 128 * 1024 * 1024;
+    if meta.len() > REPORT_LIMIT { return None; }
+    let report_time = meta.modified().ok()?;
+    let mut reader = csv::Reader::from_reader(file.take(REPORT_LIMIT));
     let mut rows = HashMap::new();
     for row in reader.deserialize::<PhotoEntry>() {
         let row = row.ok()?;
@@ -172,10 +176,19 @@ fn scan_directory_inner(
     progress("查找照片文件", 0, 0);
     while let Some(entry) = walker.next() {
         let entry = entry?;
-        if entry.file_type().is_dir() && entry.file_name().to_string_lossy() == CACHE_DIR_NAME {
+        if entry.depth() > 0 && entry.file_name().to_string_lossy().eq_ignore_ascii_case(CACHE_DIR_NAME) {
             // 不递归进缓存目录（walkdir 默认会继续展开子目录）
-            walker.skip_current_dir();
+            if entry.file_type().is_dir() { walker.skip_current_dir(); }
             continue;
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            if entry.depth() > 0 && entry.metadata()?.file_attributes()
+                & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                if entry.file_type().is_dir() { walker.skip_current_dir(); }
+                continue;
+            }
         }
         if skip_processed && entry.depth() > 0 && entry.file_type().is_dir()
             && entry.file_name().to_string_lossy().eq_ignore_ascii_case("Processed") {
@@ -183,8 +196,11 @@ fn scan_directory_inner(
             continue;
         }
         if entry.file_type().is_file() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if is_supported_file(&name) && (include_raw || !is_raw_file(&name)) {
+            // Review identities must round-trip through UTF-8 and refer to
+            // exactly one file. Don't alias a lossy display name.
+            let Some(name) = entry.file_name().to_str() else { continue; };
+            if entry.path().to_str().is_none() { continue; }
+            if is_supported_file(name) && (include_raw || !is_raw_file(name)) {
                 files.push(entry.path().to_path_buf());
                 if files.len() % 100 == 0 { progress("查找照片文件", files.len(), 0); }
             }
@@ -251,7 +267,7 @@ fn scan_directory_inner(
                     focal_length: old.focal_length.clone(),
                     ..Default::default()
                 })
-            }).unwrap_or_else(|| read_exif(&f.path));
+            }).unwrap_or_else(|| read_exif(dir, &f.path));
             if (index + 1) % 25 == 0 || index + 1 == infos.len() {
                 progress("读取照片元数据", index + 1, infos.len());
             }
@@ -316,11 +332,11 @@ fn resolve_pairs(items: &[(String, String, bool)]) -> Vec<(String, bool)> {
 }
 
 /// 读取 EXIF 关键字段；失败或缺失时返回默认（空）值，不阻断扫描
-fn read_exif(path: &Path) -> PhotoEntry {
+fn read_exif(root: &Path, path: &Path) -> PhotoEntry {
     let mut entry = PhotoEntry::default();
-    let mut file = match std::fs::File::open(path) {
-        Ok(f) => std::io::BufReader::new(f),
-        Err(_) => return entry,
+    let mut file = match crate::storage::FileRef::inside(root, path).and_then(|file| file.open_read()) {
+        Ok(Some(f)) => std::io::BufReader::new(f),
+        _ => return entry,
     };
     let buf = match exif::Reader::new().read_from_container(&mut file) {
         Ok(b) => b,

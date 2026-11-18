@@ -151,6 +151,7 @@ pub fn render_xmp(e: &PhotoEntry, s: &PixelScores, total: f64, rating: u8,
 /// 写出侧车；他人侧车（无 firstcut 命名空间）不覆盖。
 /// 返回 Ok(true) 表示已写入，Ok(false) 表示跳过（他人侧车/无分数）。
 pub fn write_sidecar(
+    root: &std::path::Path,
     e: &PhotoEntry,
     s: &PixelScores,
     total: f64,
@@ -166,9 +167,10 @@ pub fn write_sidecar(
     // 必须保留原文件名大小写（大小写敏感的文件系统上小写名会被视为不存在）。
     let stem = crate::scan::stem_raw_of(&e.filename);
     let sidecar = path.with_file_name(format!("{stem}.xmp"));
+    let file = crate::storage::FileRef::inside(root, &sidecar)?;
 
-    let xml = if sidecar.exists() {
-        let content = std::fs::read_to_string(&sidecar)?;
+    let xml = if let Some(bytes) = file.read(16 * 1024 * 1024)? {
+        let content = String::from_utf8(bytes)?;
         if !content.contains(NS_FIRSTCUT) {
             eprintln!("[xmp] 跳过 {}（侧车为其他软件所写，未覆盖）", sidecar.display());
             return Ok(false);
@@ -177,14 +179,7 @@ pub fn write_sidecar(
     } else {
         render_xmp(e, s, total, rating, suggested_ev)
     };
-    // 临时文件写完后替换，避免中断时留下半截侧车。
-    let temp = sidecar.with_extension(format!("xmp.tmp.{}.{}", std::process::id(),
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos()));
-    std::fs::write(&temp, xml)?;
-    if let Err(err) = std::fs::rename(&temp, &sidecar) {
-        let _ = std::fs::remove_file(&temp);
-        return Err(err.into());
-    }
+    file.write(xml.as_bytes())?;
     Ok(true)
 }
 

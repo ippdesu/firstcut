@@ -334,7 +334,7 @@ pub fn analysis_fingerprint(cfg: &ScoreConfig, with_ai: bool) -> i64 {
         for name in ["clipiqa_model.onnx", "clipiqa_model.onnx.data",
             "scrfd_10g_bnkps.onnx", "yolov8n_pose.onnx"] {
             name.hash(&mut h);
-            crate::cache::file_fingerprint(std::path::Path::new("models").join(name).as_path())
+            crate::cache::file_fingerprint(&crate::ai::model_path(name))
                 .hash(&mut h);
         }
     }

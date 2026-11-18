@@ -20,6 +20,9 @@ struct Args {
     dir: PathBuf,
     #[arg(short, long)]
     output: Option<PathBuf>,
+    /// 写出未做表格公式保护的原始文件名
+    #[arg(long)]
+    raw_csv: bool,
 }
 
 /// 直方图分位数（0-255）
@@ -41,24 +44,18 @@ fn percentile(hist: &[u64], q: f64) -> f64 {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let output = args.output.unwrap_or_else(|| {
-        args.dir.join(".firstcut").join("metrics.csv")
-    });
-    if let Some(parent) = output.parent() { std::fs::create_dir_all(parent)?; }
-    let entries = scan::scan_directory(&args.dir)?;
+    let root = pic_process::review::normal_photo_root(&args.dir)?;
+    let output = pic_process::storage::absolute_output(args.output)?
+        .unwrap_or_else(|| root.join(".firstcut/metrics.csv"));
+    let entries = scan::scan_directory(&root)?;
     let jpgs: Vec<_> = entries.iter().filter(|e| !e.is_raw).collect();
-
-    let mut wtr = csv::Writer::from_path(&output)?;
-    wtr.write_record([
-        "filename", "iso", "width", "height", "tenengrad_var", "luma_var",
-        "norm_sharp", "edge_ratio", "reblur_p90", "dark_noise", "over_pct", "under_pct", "mean_luma",
-        "mean_trunc", "p50", "p75", "p85", "p90", "p95",
-    ])?;
 
     let rows: Vec<Vec<String>> = jpgs
         .par_iter()
         .filter_map(|e| {
-            let img = decode::load_analysis_image(Path::new(&e.path)).ok().flatten()?;
+            let file = pic_process::storage::FileRef::inside(&root, Path::new(&e.path)).ok()?
+                .open_read().ok()??;
+            let img = decode::load_analysis_file(file).ok().flatten()?;
             let var = metrics::sharpness::tenengrad_variance(&img);
             let norm = metrics::sharpness::normalized_sharpness(var, img.luma_variance);
             let edge = metrics::sharpness::edge_ratio(&img.luma, img.width, img.height, 40.0);
@@ -67,7 +64,8 @@ fn main() -> Result<()> {
             let stats = metrics::exposure::exposure_stats(&img);
             let iso = e.iso.parse::<u32>().unwrap_or(100);
             Some(vec![
-                e.filename.clone(),
+                if args.raw_csv { e.filename.clone() }
+                else { pic_process::output::csv::spreadsheet_text(&e.filename).into_owned() },
                 iso.to_string(),
                 img.width.to_string(),
                 img.height.to_string(),
@@ -90,17 +88,20 @@ fn main() -> Result<()> {
         })
         .collect();
 
-    for r in rows {
-        wtr.write_record(&r)?;
-    }
-    wtr.flush()?;
+    pic_process::storage::FileRef::at(&root, &output, true)?.replace(|file| {
+        let mut wtr = csv::WriterBuilder::new().quote_style(csv::QuoteStyle::Always).from_writer(file);
+        wtr.write_record([
+            "filename", "iso", "width", "height", "tenengrad_var", "luma_var",
+            "norm_sharp", "edge_ratio", "reblur_p90", "dark_noise", "over_pct", "under_pct",
+            "mean_luma", "mean_trunc", "p50", "p75", "p85", "p90", "p95",
+        ])?;
+        for row in &rows { wtr.write_record(row)?; }
+        wtr.flush()
+    })?;
     eprintln!("[tune] 已写出 {}", output.display());
 
     // 汇总
-    let all: Vec<Vec<String>> = {
-        let mut reader = csv::Reader::from_path(&output)?;
-        reader.records().map(|r| r.unwrap().iter().map(|s| s.to_string()).collect()).collect()
-    };
+    let all = rows;
     if !all.is_empty() {
         let stat = |idx: usize| -> (f64, f64, f64) {
             let mut v: Vec<f64> = all.iter().map(|r| r[idx].parse().unwrap_or(0.0)).collect();

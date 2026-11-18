@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use pic_process::config::ScoreConfig;
 use pic_process::scan::{self};
 use pic_process::score;
 use std::net::IpAddr;
@@ -22,6 +21,9 @@ enum Commands {
         /// 输出 CSV 路径（默认 <照片目录>/.firstcut/scan-report.csv）
         #[arg(short, long)]
         output: Option<PathBuf>,
+        /// 写出未做表格公式保护的原始 CSV，供程序读取
+        #[arg(long)]
+        raw_csv: bool,
     },
     /// 扫描并评分（清晰度/曝光/噪点/构图/美学 + 连拍去重），输出 CSV
     Score {
@@ -30,6 +32,9 @@ enum Commands {
         /// 输出 CSV 路径（默认 <照片目录>/.firstcut/report.csv）
         #[arg(short, long)]
         output: Option<PathBuf>,
+        /// 写出未做表格公式保护的原始 CSV，供程序读取
+        #[arg(long)]
+        raw_csv: bool,
         /// 连拍保留单元（姿态簇/dHash 子簇）内保留前 K 张
         /// （缺省用 `[dedup] keep_k` 配置，默认 3）
         #[arg(short, long)]
@@ -76,6 +81,9 @@ enum Commands {
         /// 监听地址（容器部署时可用 0.0.0.0，并将宿主机端口限制为本机）
         #[arg(long, default_value = "127.0.0.1")]
         bind: IpAddr,
+        /// 浏览器使用的完整地址（端口映射或 HTTPS 反代）；非回环监听需要 FIRSTCUT_ACCESS_TOKEN
+        #[arg(long, env = "FIRSTCUT_PUBLIC_URL")]
+        public_url: Option<String>,
         /// 监听端口
         #[arg(long, default_value_t = 8787)]
         port: u16,
@@ -88,18 +96,19 @@ enum Commands {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Scan { dir, output } => {
+        Commands::Scan { dir, output, raw_csv } => {
             let dir = pic_process::review::normal_photo_root(&dir)?;
             let paths = pic_process::review::photo_root_paths(&dir);
-            let output = output.unwrap_or(paths.scan_report);
-            if let Some(parent) = output.parent() { std::fs::create_dir_all(parent)?; }
+            let output = pic_process::storage::absolute_output(output)?.unwrap_or(paths.scan_report);
             let entries = scan::scan_directory(&dir)?;
             eprintln!("[scan] 发现 {} 个文件（JPG/ARW）", entries.len());
-            pic_process::output::csv::write_csv(&output, &entries)?;
+            pic_process::output::csv::write_csv_in(&dir, &output, &entries, !raw_csv)?;
             eprintln!("[scan] CSV 已写出: {}", output.display());
         }
         Commands::ConfigTemplate { output, preset } => {
-            let output = output.unwrap_or_else(|| PathBuf::from(".firstcut/firstcut-template.toml"));
+            let current = pic_process::review::normal_photo_root(&std::env::current_dir()?)?;
+            let output = pic_process::storage::absolute_output(output)?
+                .unwrap_or_else(|| current.join(".firstcut/firstcut-template.toml"));
             let text = match &preset {
                 Some(name) => match pic_process::config::preset(name) {
                     Some(t) => t.to_string(),
@@ -114,28 +123,20 @@ fn main() -> Result<()> {
                 },
                 None => pic_process::config::config_template(),
             };
-            if let Some(parent) = output.parent() { std::fs::create_dir_all(parent)?; }
-            std::fs::write(&output, text)?;
+            pic_process::storage::FileRef::at(&current, &output, true)?.write(text.as_bytes())?;
             eprintln!("[config] 已写出: {}", output.display());
         }
-        Commands::Score { dir, output, keep, no_ai, xmp, cache, no_cache, config, gpu } => {
+        Commands::Score { dir, output, raw_csv, keep, no_ai, xmp, cache, no_cache, config, gpu } => {
             let dir = pic_process::review::normal_photo_root(&dir)?;
             let paths = pic_process::review::photo_root_paths(&dir);
-            std::fs::create_dir_all(&paths.state_dir)?;
             // 0) 评分配置（默认或文件）
             //    显式传入的配置加载失败必须硬报错：静默回退默认值会让用户
             //    以为参数已生效（M6-4 同类问题的解析层版本）
+            pic_process::storage::Folder::open(&dir)?.state(true)?;
+            let config = pic_process::storage::absolute_output(config)?;
+            let (cfg, exists) = pic_process::review::load_review_config(&dir, config.as_deref())?;
             let selected_config = config.as_ref().unwrap_or(&paths.config);
-            let cfg = if selected_config.exists() {
-                pic_process::config::load_config(selected_config).map_err(|err| {
-                    anyhow::anyhow!("配置加载失败: {}\n{err:#}", selected_config.display())
-                })?
-            } else if config.is_some() {
-                anyhow::bail!("配置加载失败: {}\n文件不存在", selected_config.display());
-            } else {
-                ScoreConfig::default()
-            };
-            if selected_config.exists() {
+            if exists {
                 eprintln!("[score] 配置已加载: {}", selected_config.display());
             } else {
                 eprintln!("[score] 使用内置默认配置（照片根目录尚无 UI 配置）");
@@ -144,8 +145,9 @@ fn main() -> Result<()> {
             // 评分流水线在库内（score::run_score_job），review 界面的"重新评分"共用同一实现
             let preferences = pic_process::review::load_ui_preferences(&dir);
             let opts = score::ScoreJobOptions {
-                output_csv: output.unwrap_or(paths.report),
-                cache_path: cache.unwrap_or(paths.cache),
+                output_csv: pic_process::storage::absolute_output(output)?.unwrap_or(paths.report),
+                raw_csv,
+                cache_path: pic_process::storage::absolute_output(cache)?.unwrap_or(paths.cache),
                 no_cache,
                 no_ai,
                 xmp,
@@ -165,26 +167,18 @@ fn main() -> Result<()> {
                 ),
             })?;
         }
-        Commands::Review { dir, config, cache, bind, port, no_browser } => {
+        Commands::Review { dir, config, cache, bind, public_url, port, no_browser } => {
             let dir = pic_process::review::normal_photo_root(&dir)?;
             let paths = pic_process::review::photo_root_paths(&dir);
             // 与 score 相同的 fail-fast 配置加载
-            let selected_config = config.as_ref().unwrap_or(&paths.config);
-            let cfg = if selected_config.exists() {
-                pic_process::config::load_config(selected_config).map_err(|err| {
-                    anyhow::anyhow!("配置加载失败: {}\n{err:#}", selected_config.display())
-                })?
-            } else if config.is_some() {
-                anyhow::bail!("配置加载失败: {}\n文件不存在", selected_config.display());
-            } else {
-                ScoreConfig::default()
-            };
+            let config = pic_process::storage::absolute_output(config)?;
+            let (cfg, _) = pic_process::review::load_review_config(&dir, config.as_deref())?;
             if config.is_some() {
                 eprintln!("[review] 配置已加载: {}", config.as_ref().unwrap().display());
             }
-            let cache = cache.unwrap_or(paths.cache);
+            let cache = pic_process::storage::absolute_output(cache)?.unwrap_or(paths.cache);
             pic_process::review::serve_with_bind(
-                &dir, &cfg, &cache, bind, port, !no_browser, config.as_deref(),
+                &dir, &cfg, &cache, bind, port, !no_browser, config.as_deref(), public_url.as_deref(),
             )
                 .with_context(|| "复核服务启动失败")?;
         }

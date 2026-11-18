@@ -15,6 +15,49 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  dependencies:
+    name: Audit Rust dependencies
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Run RustSec audit
+        run: |
+          cargo install --locked cargo-audit --version 0.23.0
+          cargo audit --deny warnings
+      - name: Keep photos and private state out of Git
+        run: |
+          python3 - <<'PY'
+          import pathlib
+          import subprocess
+          import sys
+
+          images = {'.arw', '.cr2', '.cr3', '.dng', '.heic', '.jpeg', '.jpg', '.nef', '.raf', '.rw2', '.xmp'}
+          names = subprocess.check_output(['git', 'ls-files', '-z']).split(b'\0')
+          blocked = []
+          for name in names:
+              if not name:
+                  continue
+              path = pathlib.PurePosixPath(name.decode('utf-8', 'replace'))
+              parts = {part.lower() for part in path.parts}
+              if (path.suffix.lower() in images
+                  or path.name.lower() == 'memory.md'
+                  or parts & {'.firstcut', 'testpic'}
+                  or path.parts[0].lower() == 'review'
+                  or path.parts[:2] == ('samples', 'generated')):
+                  blocked.append(path.as_posix())
+          if blocked:
+              for path in blocked:
+                  print(f'Unexpected photo or private state: {path!r}')
+              sys.exit(1)
+          PY
+
+  container:
+    name: Check containers before release
+    uses: ./.github/workflows/container.yml
+
   linux:
     name: Test on Linux (${{ matrix.arch }})
     strategy:
@@ -28,11 +71,13 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       - name: Install stable Rust
         run: rustup toolchain install stable --profile minimal && rustup default stable
       - name: Cache Cargo downloads
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ~/.cargo/registry
@@ -49,14 +94,16 @@ jobs:
     runs-on: windows-2025
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       - name: Install stable Rust
         shell: pwsh
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
       - name: Cache Cargo downloads
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ~/.cargo/registry
@@ -64,5 +111,11 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
       - name: Run tests
         run: cargo test --locked --all-targets
-      - name: Build release programs
-        run: cargo build --release --locked --bin pic_process --bin firstcut-ui --bin pic_process-gallery --bin pic_process-tune
+      - name: Install Rust binary audit tools
+        run: cargo install --locked cargo-auditable@0.7.7 cargo-audit@0.23.0
+      - name: Build release programs with dependency metadata
+        run: cargo auditable build --release --locked --bin pic_process --bin firstcut-ui --bin pic_process-gallery --bin pic_process-tune
+      - name: Audit Rust dependencies embedded in the release programs
+        run: cargo audit --deny warnings bin target/release/pic_process.exe target/release/firstcut-ui.exe target/release/pic_process-gallery.exe target/release/pic_process-tune.exe
+      - name: Smoke test the Windows release binary
+        run: python .github/scripts/check-review.py --binary target/release/pic_process.exe

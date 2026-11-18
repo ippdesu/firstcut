@@ -133,8 +133,8 @@ pub fn build_snapshot_with_options(root: &Path, cfg: &ScoreConfig, cache_path: &
     // 打开缓存并按「size+mtime+version+cfg_hash」过滤出本次可用的分析结果
     let mut analyzed: HashMap<String, AnalysisResult> = HashMap::new();
     let mut mode_by_pair: HashMap<String, bool> = HashMap::new();
-    let cache = match ScoreCache::open(cache_path, pixel_hash) {
-        Ok(c) => Some(c),
+    let cache = match ScoreCache::open_in(root, cache_path, pixel_hash, false) {
+        Ok(c) => c,
         Err(err) => {
             super::quiet_log(format!("[review] 警告: 缓存不可用（{err:#}），全部照片将显示为未评分"));
             None
@@ -143,7 +143,11 @@ pub fn build_snapshot_with_options(root: &Path, cfg: &ScoreConfig, cache_path: &
     if let Some(c) = &cache {
         for (index, e) in entries.iter().filter(|e| !e.is_raw).enumerate() {
             if index % 50 == 0 { progress("匹配评分缓存", index, entries.len()); }
-            let Some((size, mtime)) = cache::file_fingerprint(Path::new(&e.path)) else {
+            let full = Path::new(&e.path);
+            let Some((size, mtime)) = crate::storage::FileRef::inside(root, full).ok()
+                .and_then(|file| file.open_read().ok().flatten())
+                .and_then(|file| file.metadata().ok())
+                .and_then(|meta| cache::metadata_fingerprint(&meta)) else {
                 continue;
             };
             let Some(row) = c.rows().get(&e.path) else { continue };
@@ -240,9 +244,11 @@ fn scene_hint(analysis: Option<&AnalysisResult>, ai_mode: bool) -> SceneHintJson
 
 /// 绝对/相对路径 → 相对 root 的正斜杠路径（越界时退回完整路径展示）
 fn rel_path(root: &Path, p: &Path) -> String {
-    p.strip_prefix(root)
-        .map(|r| r.display().to_string().replace('\\', "/"))
-        .unwrap_or_else(|_| p.display().to_string().replace('\\', "/"))
+    let path = p.strip_prefix(root).unwrap_or(p).to_string_lossy();
+    #[cfg(windows)]
+    { path.replace('\\', "/") }
+    #[cfg(not(windows))]
+    { path.into_owned() }
 }
 
 /// 从快照根目录解析 `p` 参数：越界（`..` 段、盘符/UNC/根锚定、根外）一律拒绝。
@@ -308,5 +314,12 @@ mod tests {
     fn rel_path_uses_forward_slashes() {
         let root = Path::new("F:/photos");
         assert_eq!(rel_path(root, Path::new("F:/photos/JPG/a.JPG")), "JPG/a.JPG");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_filename_is_not_reinterpreted_as_another_path() {
+        let root = Path::new("/album");
+        assert_eq!(rel_path(root, &root.join(r"camera\a.jpg")), r"camera\a.jpg");
     }
 }

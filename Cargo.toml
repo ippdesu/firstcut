@@ -40,29 +40,41 @@ path = "src/bin/debug_exposure.rs"
 
 [features]
 # 实验性 DirectML GPU 推理（score --gpu）。默认关闭：
-# 不改变"主二进制静态链接、单文件免 DLL"的交付承诺。
+# ONNX Runtime 仍静态链接到发行程序。
 gpu = ["ort/directml"]
 
 [dependencies]
 anyhow = "1"
 base64 = "0.23"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 csv = "1"
-image = "0.25"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 kamadak-exif = "0.6"
 ndarray = "0.17"
 ort = { version = "2.0.0-rc.13", features = ["ndarray"] }
 rayon = "1"
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.41.1", default-features = false, features = ["bundled", "serialize"] }
 serde = { version = "1", features = ["derive"] }
 toml = "1.1"
 walkdir = "2"
-jpeg-decoder = "0.3"
+jpeg-decoder = { version = "0.3", default-features = false }
 axum = "0.8"
 serde_json = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync"] }
+tokio = { version = "1.53.3", features = ["rt-multi-thread", "macros", "net", "sync", "fs", "io-util"] }
+tokio-util = { version = "0.7", features = ["io"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 toml_edit = "0.25"
 roxmltree = "0.21"
+cap-std = "4.0.3"
+cap-fs-ext = "4.0.3"
+getrandom = "0.4"
+sha2 = "0.10"
+subtle = "2.6"
 
 [target.'cfg(windows)'.dependencies]
 rfd = { version = "0.17.2", default-features = false }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+
+[dev-dependencies]
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }

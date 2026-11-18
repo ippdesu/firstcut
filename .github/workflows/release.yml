@@ -9,13 +9,53 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: firstcut-release
+  cancel-in-progress: false
+
 jobs:
+  verify:
+    name: Require green checks on main
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify the release commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "Release tags must point to a commit on main." >&2
+            exit 1
+          fi
+          for workflow in ci.yml codeql.yml; do
+            result=$(gh api "repos/$GH_REPO/actions/workflows/$workflow/runs?branch=main&event=push&head_sha=$GITHUB_SHA" \
+              --jq '.workflow_runs[0].conclusion // "missing"')
+            if [ "$result" != success ]; then
+              printf '%s on the release commit must pass first (current: %s).\n' "$workflow" "$result" >&2
+              exit 1
+            fi
+          done
+
   build:
     name: Build Windows release
+    needs: verify
+    if: ${{ !cancelled() && (needs.verify.result == 'success' || (github.event_name == 'workflow_dispatch' && needs.verify.result == 'skipped')) }}
     runs-on: windows-2025
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       - name: Check tag matches Cargo version
         if: github.event_name == 'push'
         shell: pwsh
@@ -35,7 +75,7 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
       - name: Cache Cargo downloads
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ~/.cargo/registry
@@ -43,8 +83,14 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
       - name: Run tests
         run: cargo test --locked --all-targets
-      - name: Build release programs
-        run: cargo build --release --locked --bin pic_process --bin firstcut-ui --bin pic_process-gallery --bin pic_process-tune
+      - name: Install Rust binary audit tools
+        run: cargo install --locked cargo-auditable@0.7.7 cargo-audit@0.23.0
+      - name: Build release programs with dependency metadata
+        run: cargo auditable build --release --locked --bin pic_process --bin firstcut-ui --bin pic_process-gallery --bin pic_process-tune
+      - name: Audit Rust dependencies embedded in the release programs
+        run: cargo audit --deny warnings bin target/release/pic_process.exe target/release/firstcut-ui.exe target/release/pic_process-gallery.exe target/release/pic_process-tune.exe
+      - name: Smoke test the Windows release binary
+        run: python .github/scripts/check-review.py --binary target/release/pic_process.exe
       - name: Package programs and checksums
         shell: pwsh
         run: |
@@ -59,7 +105,7 @@ jobs:
           }
           [IO.File]::WriteAllLines('dist/SHA256SUMS.txt', [string[]]$checksums)
       - name: Save build artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: firstcut-windows-x64
           path: dist/*
@@ -67,86 +113,15 @@ jobs:
           retention-days: 14
 
   publish-container-platform:
-    name: Build and publish Linux ${{ matrix.arch }} image
+    name: Scan and stage both Linux images
     if: github.event_name == 'push'
     needs: build
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: amd64
-            platform: linux/amd64
-            runner: ubuntu-24.04
-          - arch: arm64
-            platform: linux/arm64
-            runner: ubuntu-24.04-arm
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
+    uses: ./.github/workflows/container.yml
+    with:
+      staging: true
     permissions:
       contents: read
       packages: write
-    steps:
-      - uses: actions/checkout@v7
-      - uses: docker/setup-buildx-action@v4
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Resolve image version
-        id: version
-        shell: bash
-        run: echo "value=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
-      - name: Prepare image metadata
-        id: meta
-        uses: docker/metadata-action@v6
-        with:
-          images: ghcr.io/${{ github.repository }}
-          labels: |
-            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
-            org.opencontainers.image.version=${{ steps.version.outputs.value }}
-      - name: Build and push platform image
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          platforms: ${{ matrix.platform }}
-          push: true
-          tags: |
-            ghcr.io/${{ github.repository }}:${{ steps.version.outputs.value }}-${{ matrix.arch }}
-            ghcr.io/${{ github.repository }}:latest-${{ matrix.arch }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=container-${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=container-${{ matrix.arch }}
-      - name: Smoke test the published image
-        shell: bash
-        env:
-          IMAGE: ghcr.io/${{ github.repository }}
-          IMAGE_TAG: ${{ steps.version.outputs.value }}-${{ matrix.arch }}
-        run: |
-          set -euo pipefail
-          photos="$RUNNER_TEMP/firstcut-smoke-photos"
-          mkdir -p "$photos"
-          container=firstcut-container-smoke
-          cleanup() {
-            docker stop "$container" >/dev/null 2>&1 || true
-            docker rm "$container" >/dev/null 2>&1 || true
-          }
-          trap cleanup EXIT
-          docker run -d --name "$container" \
-            --user "$(id -u):$(id -g)" \
-            -p 127.0.0.1:18787:8787 \
-            -v "$photos:/photos" \
-            "$IMAGE:$IMAGE_TAG" review /photos --bind 0.0.0.0 --port 8787 --no-browser
-          for _ in {1..30}; do
-            if curl --fail --silent http://127.0.0.1:18787/ >/dev/null; then
-              echo 'Container review UI returned HTTP 200.'
-              exit 0
-            fi
-            sleep 2
-          done
-          docker logs "$container"
-          exit 1
 
   publish-container-manifest:
     name: Publish multi-architecture image tags
@@ -156,26 +131,56 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write
+      attestations: write
     steps:
-      - uses: docker/setup-buildx-action@v4
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v4
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Create versioned and latest multi-arch tags
+      - name: Download scanned image digests
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          pattern: firstcut-digest-*
+          merge-multiple: true
+          path: digests
+      - name: Assemble the multi-architecture manifest from scanned images
+        id: manifest
         shell: bash
         run: |
           set -euo pipefail
           image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          staging="$image:staging-index-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          read -r amd64 < digests/firstcut-amd64.digest
+          read -r arm64 < digests/firstcut-arm64.digest
+          [[ "$amd64" =~ ^sha256:[0-9a-f]{64}$ && "$arm64" =~ ^sha256:[0-9a-f]{64}$ ]]
+          docker buildx imagetools create --tag "$staging" "$image@$amd64" "$image@$arm64"
+          digest=$(docker buildx imagetools inspect "$staging" --format '{{json .Manifest}}' | jq -er '.digest')
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          printf 'image=%s\ndigest=%s\namd64=%s\narm64=%s\n' "$image" "$digest" "$amd64" "$arm64" >> "$GITHUB_OUTPUT"
+      - name: Attest the compiled container image
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-name: ${{ steps.manifest.outputs.image }}
+          subject-digest: ${{ steps.manifest.outputs.digest }}
+          push-to-registry: true
+      - name: Promote the attested digest and both scanned platforms
+        env:
+          IMAGE: ${{ steps.manifest.outputs.image }}
+          DIGEST: ${{ steps.manifest.outputs.digest }}
+          AMD64: ${{ steps.manifest.outputs.amd64 }}
+          ARM64: ${{ steps.manifest.outputs.arm64 }}
+        run: |
+          set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
-          docker buildx imagetools create \
-            --tag "$image:$version" \
-            "$image:$version-amd64" "$image:$version-arm64"
-          docker buildx imagetools create \
-            --tag "$image:latest" \
-            "$image:$version-amd64" "$image:$version-arm64"
+          docker buildx imagetools create --prefer-index=false --tag "$IMAGE:$version-amd64" \
+            --tag "$IMAGE:latest-amd64" "$IMAGE@$AMD64"
+          docker buildx imagetools create --prefer-index=false --tag "$IMAGE:$version-arm64" \
+            --tag "$IMAGE:latest-arm64" "$IMAGE@$ARM64"
+          docker buildx imagetools create --tag "$IMAGE:$version" --tag "$IMAGE:latest" "$IMAGE@$DIGEST"
 
   publish:
     name: Publish GitHub Release
@@ -184,12 +189,18 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
       - name: Download build artifact
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: firstcut-windows-x64
           path: dist
+      - name: Attest Windows release artifacts
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: dist/*.exe
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}

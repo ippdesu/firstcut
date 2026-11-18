@@ -1,608 +1,192 @@
-# 照片初筛评分工具（Rust）— 设计与实现文档
+# firstcut — 当前设计与实现约定
 
-> 状态：**v1.4.1** 加固人工评分状态目录并完成依赖兼容性维护；v1.4.0 已增加 Linux amd64/ARM64 容器发布与 Apple Silicon Docker 支持说明。此前已完成本地复核界面、有限任务日志、直方图、缩放显示和 UI/CLI 行为统一。当前图像兼容范围为 SDR JPEG；HDR 增益图、PQ/HLG 未实现。
-> 日期：2026 规划稿 / 2026 实施完成
-> 需求来源：索尼相机 JPG+ARW 连拍/风景/人像选片地狱，需要自动初步评分
-> 配套文档：`README.md`（用户手册）/ `release_notes.md`（版本说明）/ `REVIEW.md`（历次评审记录）/ `ASTRA_REVIEW.md`（本轮过程与结果）/ `firstcut.toml`（配置模板）
+> 整理日期：2026-11-05；代码基线：`fad69a1` / v1.4.1。本次仅整理文档，未改变程序行为。
+> 本文件是当前设计的唯一维护入口；历史方案、模型取舍、评审证据统一见 [历史档案](docs/HISTORY.md)。使用方法见 [README](README.md)，发行变化见 [版本说明](release_notes.md)，漏洞报告见 [安全政策](SECURITY.md)。
 
-## 0. 目标（根据确认的需求）
+## 1. 产品边界与交付状态
 
-### 0.1 当前有效的设计约定（2026-09-29）
+firstcut 是 Rust 编写的本地照片初筛与复核工具。扫描索尼 JPG+ARW，分析 JPG 的清晰度、曝光、噪点、构图和美学，生成连拍候选，把结果映射给配对 ARW，输出 CSV 与供 Lightroom 使用的 XMP。工具不会删除、移动或修改照片像素；分析和人工反馈留在本机。
 
-本节优先于后文旧里程碑和实验记录。产品聚焦本地初筛、连拍候选、人工复核，以及给 Lightroom 的 XMP 星级和曝光建议。darktable 批量 RAW 开发已停止；§9.1–§9.6 是历史调研，不作为实施清单。
-
-数据分为四层：
-
-1. **照片资产**：JPG 文件路径是人工决定的持久身份；扫描器的 `pair_id` 在当前批次内将 JPG 映射到 ARW。跨目录无歧义配对仍按 §10 M8-1 规则。
-2. **分析结果**：五维分数、dHash、主体及曝光建议保存在可重建的 SQLite 缓存。缓存键区分 `ai` 与 `pixel`，并包含模型文件大小和修改时间。CSV 的 `analysis_mode` 显示来源；单张 AI 推理失败不伪装成中性分数，而是报告分析失败。
-3. **算法建议**：每次跑批根据分析结果、当前权重、连拍参数和本批照片集合，重新计算总分、星级与保留建议。相对星级仍只在本批次内可比。
-4. **人工决定与导出**：人工星级保存在 `<照片根>/.firstcut/decisions.sqlite`，独立于分析缓存。最终星级为人工值优先，否则用算法值；CLI、review 快照、CSV、XMP 均从这条规则合成。XMP 只合并 firstcut 管理字段，保留其他 XML 内容；无 firstcut 标记的侧车不改动。
-
-`PhotoEntry` 目前仍是扫描与 CSV 导出的共享结构，`AnalysisResult` 是内部数值结果，`selection::SelectionResult` 统一合成算法星级、人工星级覆盖与连拍候选，CLI/review 共用；`decision` 模块负责持久化人工星级。人工连拍保留标记目前单独保存在 `.firstcut/burst-overrides.json`，只覆盖 review 中的建议结果；后续需接入统一决定与导出路径，避免 CLI/CSV 与复核界面不一致。
-
-场景预设是用户选择的评分配置，不是逐张照片的自动场景识别。复核面板目前只依据已检测到的人脸给出“人像候选”，其他照片显示“未识别”；面板同时展示实际五维权重和分数贡献。用户标注的场景、备注及当时评分线索追加到 `.firstcut/scene-feedback.jsonl`，用于后续训练与校准。场景初判不自动修改评分权重。
-
-本轮暂不校准评分算法或选片效果。真实图库的“好片被排除率”、连拍最佳帧覆盖率及 Lightroom 导入效果仍需单独验收。
-
-### 0.2 文件位置与启动方式一致性（2026-09-29）
-
-UI 启动器、CLI `score` 和 CLI `review` 对同一照片根目录使用相同默认状态位置、RAW 偏好和 `Processed/` 跳过规则。默认分析缓存、评分报告、扫描报告、配置、界面偏好、人工决定、连拍覆盖、场景反馈、缩略图和有界任务日志都位于 `<照片根>/.firstcut/`。CLI 显式传入 `--cache`、`--output`、`--config` 时才覆盖对应默认路径；旧版本保存在工作目录中的缓存不自动猜测或迁移，避免误用其他图库的记录。
-
-XMP 侧车是面向 Lightroom 的明确导出，不属于内部应用状态；它仍与照片放在同一目录，以符合 Lightroom 侧车发现规则。当前直方图和像素分析读取 SDR JPEG 解码结果，不解析 HDR 增益图或 HDR 传递函数；HDR 支持需单独设计色彩管理、亮度域和输出语义。
-
-一个 **Rust 编写的本地 CLI 工具**：扫描索尼相机的 JPG+ARW 照片目录 → 对 JPG 做 **5 维评分（清晰度/曝光/噪点/构图/美学）+ 连拍去重** → 把分数映射到同名 ARW → 输出 **XMP 星级 + CSV 报告**。目标吞吐：上万张照片可接受的处理时间（分钟级），增量重跑秒级（SQLite 缓存）。
-
-约束：全程本地、离线运行（仅首次下载 ONNX 模型）；CLI 优先，GUI 后续规划。
-
-## 1. 开源项目参考（已调研）
-
-| 项目 | 参考点 |
+| 能力 | 当前状态与边界 |
 |---|---|
-| [pixcull](https://github.com/ChrisChen667788/pixcull) | 6 轴评分维度划分、XMP/IPTC 导出、近重复分组 —— 维度设计与输出格式直接参考 |
-| [facet](https://github.com/ncoevoet/facet) | "传统指标 + AI 美学"混合打分架构 |
-| [best-photo-picker](https://github.com/Arkalogy/best-photo-picker) | 质量评分 + 感知去重组合 |
-| [RAWviewer](https://github.com/markyip/RAWviewer) | RAW 选片 + 星级 + XMP 的本地工作流 |
-| [digiKam Image Quality Sorter](https://docs.digikam.org/es/_sources/maintenance_tools/maintenance_quality.rst.txt) | 纯算法基线：清晰度/噪点/曝光的经典实现 |
-| [NIMA](https://github.com/bencoster/Neural-IMage-Assessment) | AI 美学模型（PyTorch 权重，需转 ONNX） |
+| 评分与复核 | CLI 和本地 Web UI 均已实现，共用评分与星级合成；Windows 可双击启动 |
+| 人工决定 | 人工星级持久化并统一导出；人工连拍保留覆盖目前仅作用于 review，尚未统一到 CLI/CSV |
+| 场景 | 有五份手动选择的评分预设；自动提示仅是基于人脸的“人像候选”，没有通用场景分类或自动调权 |
+| 图像 | 当前只支持 SDR JPEG 分析和直方图；RAW 不解码，仅配对与导出；HDR 增益图、PQ/HLG 未实现 |
+| Windows 发行 | `pic_process.exe`、`firstcut-ui.exe`、`pic_process-gallery.exe`、`pic_process-tune.exe` 与 SHA256 校验文件 |
+| Linux / Apple Silicon | GHCR 发布 Linux amd64/arm64 CPU 镜像；Apple Silicon 通过 Docker 运行 ARM64 Linux 镜像，原生 macOS 尚未列入发行范围 |
+| 后期处理 | 曝光补偿仅作为 XMP 建议交接给 Lightroom；darktable 批量 RAW 开发路线已停止，不列入待办 |
 
-## 2. 技术选型（Rust 全链路，已实现）
+模型文件单独准备，不打包进 Release。运行时模型缺失会提示并降级到纯像素模式，用户也可显式 `--no-ai`；分析来源必须可识别。历史吞吐数据只作参考，真实选片质量与 Lightroom 导入效果尚需单独验收。
 
-| 用途 | Crate/方案 | 说明（实际实现） |
+## 2. 统一数据模型
+
+| 层 | 内容与身份 | 责任 |
 |---|---|---|
-| CLI | `clap` | 子命令：`scan`（建索引）/ `score`（分析+评分）/ `config-template`（生成配置模板）/ `review`（本地 Web 复核界面，见 §12）。**`report` / `download-models` 已规划但未实现**——CSV 由 `score` 直接产出；模型缺失时给出下载链接并自动降级。 |
-| JPG 解码 | `jpeg-decoder`（快速路径）+ `image` 兜底 | JPEG 全解码后 **box 块平均降采样**到 ~1MP 分析尺寸（~50ms/张 33MP；jpeg-decoder 0.3 无 DCT 缩放，故全解码+块平均） |
-| EXIF | `kamadak-exif` | ISO、光圈、快门、拍摄时间（连拍聚类用）；多值 ASCII 字段取首个非空值 |
-| 像素处理 | `image` / 自写 | 灰度（BT.601 加权）、直方图、Sobel 梯度、3×3 box blur（未用 `imageproc`）；EXIF Orientation 1-8 在降采样后应用（5/7 为"先旋转后镜像"，见 §10 M8-3） |
-| AI 推理 | `ort` 2.0.0-rc.13（onnxruntime-rs，静态链接自包含，无需 DLL） | 跑 CLIPIQA + SCRFD + YOLOv8-pose；实验性 `--gpu`（DirectML，`--features gpu` 构建，实测 119 张 16.7s vs CPU 17.4s，无显著收益，不默认开启）；CPU 池化收益不显著 |
-| 美学评分 | **CLIPIQA+ ONNX**（[86Cao/IQA-ONNX-Models](https://huggingface.co/86Cao/IQA-ONNX-Models)） | 224×224、CLIP 归一化、`(x/255 - mean) / std`、sigmoid 输出 ×100 → 0-100 分；M5 决策从 MUSIQ 换到 CLIPIQA（区分度更高） |
-| 人脸检测 | **SCRFD 10g**（[RuteNL/SCRFD-face-detection-ONNX](https://huggingface.co/RuteNL/SCRFD-face-detection-ONNX)） | 640×640 输入、(x-127.5)/128 归一化、9 个输出张量（score/bbox/**kps** × stride [8,16,32]，布局 [N,dim] 行主序、score 已 sigmoid）；阈值 0.3 + 贪心 NMS；M5 决策从 YuNet 换到 SCRFD（检出 23→75/119，M6 修 EXIF 方向后 109/119）；M9 起解码 kps（5 关键点）做姿态描述子 |
-| 人体姿态 | **YOLOv8n-pose**（[Xenova/yolov8n-pose](https://huggingface.co/Xenova/yolov8n-pose)） | 640×640 输入、/255 归一化、输出 [1, 56, 8400]；SCRFD 漏检时用头部关键点定位主体区域 |
-| 并行 | `rayon` | JPG 解码 + 像素指标并行分块；AI 推理经 Mutex 串行（实测池化无收益）；上万张走分块并行 |
-| 缓存 | `rusqlite`（bundled） | 按 (path, size, mtime, CACHE_VERSION, 配置指纹) 缓存；命中跳过解码与推理 |
-| XMP 写出 | 自写轻量 XML 侧车 | 只写 `xmp:Rating` + `firstcut:` 命名空间存子分；他人侧车（无 `firstcut` 标记）不覆盖 |
-| 序列化/日志 | `serde`+`csv` | CSV 报告 + 进度日志到 stderr |
+| 照片资产 | `PhotoEntry`；扫描时生成批次内 `pair_id`；人工星级以根目录下 JPG 的相对路径为键 | 扫描、EXIF、配对、CSV 行数据 |
+| 分析结果 | `AnalysisResult`；五维子分、dHash、姿态描述子及曝光建议 | 可重建缓存，区分分析模式、曲线参数和模型文件来源 |
+| 算法建议 | `selection::SelectionResult`；总分、算法星级、连拍簇/排名/保留建议 | 每次按当前配置和批次重新合成，CLI 与 review 共用 |
+| 人工决定 | `EffectiveRating` 与独立决定库；最终星级 = 人工值优先，否则算法值 | 重评分不覆盖用户决定，统一用于 review、CLI、CSV 与 XMP |
 
-> ARW 解码（rawler/rawloader）**本期不做** —— 已确认用 JPG 评分、分数映射到同名 ARW。后续若想精确分析动态范围再加。
+人工星级的持久身份不等于内容指纹：移动或重命名照片、改变所选根目录后，相对路径可能变化，不承诺自动迁移。JPG 与其配对 RAW 使用同一最终星级。XMP 是导出结果，不是人工决定的唯一存储；旧版仅写进 XMP 的人工星级不会自动导入决定库。
 
-## 3. 评分引擎（5 评分维度 + 连拍去重）【已实现】
+**已知一致性缺口**：人工连拍保留状态单独保存在 `burst-overrides.json`，目前只覆盖 review 中的建议，尚未通过 `selection` 统一导出。不能把“UI/CLI 共用算法建议”表述为“所有人工覆盖已完全一致”。后续应先统一决定模型再扩展相关操作。
 
-1. **清晰度/合焦**：下采样 1024px → Tenengrad（Sobel 梯度方差）÷ 亮度方差归一化（消除场景纹理差异），饱和曲线映射（k=800k，实测范围 12 万~172 万）。
-   - **M5 主体感知三层兜底**：SCRFD 人脸命中 → 人脸区域 reblur P80（半宽/半高 = 脸框尺寸 ×1.5，即实际区域约 3× 脸框；避开皮肤平滑区，捕眼睛/发丝锐边）；无主体级人脸（含"检出的脸全部 <4%"）→ YOLOv8-pose 头部关键点包围盒 ×1.4/×1.6 区域 reblur P80；都无 → 50 分中性下限（大光圈浅景深照片不误判，真糊由人工 gallery 复核）。
-   - 区域分与全局分**取高者**（不是"命中即用区域分"）：区域估计偶发偏低时不至于把整张拉下去；代价是跑焦但背景纹理繁杂的照片可能被全局分救回。
-2. **曝光**：直方图过曝（≥250）与欠曝（≤5）像素比例（4× 系数惩罚）+ 判定亮度偏离理想值的 **EV 容差带**。
-   - **M6 决策：从"码值高斯"改为"EV 容差带"**。旧做法（平均亮度偏离 `exposure_target=128` 的高斯衰减）会把两类**合法**场景判成曝光失误：舞台黑幕布把全图均值拉到 40 以下、白裙白背景把全图均值推到 200 以上。
-   - 容差带按曝光档位定义：±1 EV（码值 92~176）内满分（AE 正常波动范围），超出后线性衰减，暗侧到 -4 EV、亮侧到 +2 EV 降为 0。**两侧独立**（`ev_full_lo/hi`、`ev_lo/hi`）：舞台放宽暗侧但不放宽亮侧，雪景反之。亮侧更陡是因为高光溢出在 JPG 里不可恢复，暗部在 RAW 里通常还能救。
-   - **主体感知单向修正**：有主体级人脸（高度 ≥ 4%）时取最亮的一张主体脸区域均值，把判定值往中灰方向拉（夹在"全图 ~ 中灰"之间，不越过中灰）。所以暗色/亮色误检框不会把正常照片打下去，同时暗背景/亮背景场景能被救回。
-   - 全图侧仍用**截尾均值**（排除最暗 25% 像素）作为基准。
-3. **噪点**：暗部（<40）8×8 块标准差 **P15**（最平滑暗块，避开暗部场景纹理污染）+ ISO 容忍度曲线 `k = K0·(1 + 0.3·log10(iso/100))`，`K0=3.0`。
-4. **构图**：SCRFD 人脸框 → 三分法交点（4 点）距离（最大 0.47）+ 人脸高度占比（8%~30% 理想，<8% 线性递减至 0.5，>30% 视为怼脸降至 0.75）+ 多人降权（1→1.0、2-4→0.95、5+→0.85）；无人脸给中性 60 分（不惩罚风景/静物）。**只统计主体级人脸（高度 ≥ 4%）**：贴纸脸/背景路人不参与，避免误判。多人降权计数用 **5%** 门槛（4%~5% 的脸计构图分但不计合影人数）。
-5. **美学**：CLIPIQA+ 0-100 分（224×224、CLIP 归一化、sigmoid×100）；M5 从 MUSIQ 换入，分布区分度提升至 26-76 区间。
-6. **连拍去重**（M2 + M9 自适应保留）：按 `DateTimeOriginal` 时间戳聚类（间隔 ≤2s 为一组）→ 组内 dHash 感知哈希（9×8 → 64 bit、汉明距离 ≤10 为同一子簇）→ **保留单元**内按总分排序保留 top-K（默认 3）并标记"组内第 N 名 / 是否保留"。
-   - **M9 自适应保留（默认开启，`dedup.adaptive_keep=false` 回退 M2 行为）**：dHash 子簇内再按 SCRFD 关键点姿态描述子聚类——5 个关键点（双眼/鼻/双嘴角）按人脸框归一化成 10 维向量（对位置/尺度不变），欧氏距离 > `pose_cluster_threshold`（默认 0.25，定标：棚拍同姿势 0.02~0.06 / 跨姿势 0.46~0.51 双峰）判为不同姿势，**每个姿势簇各自保留 top-K**。解决"30fps 连拍不同姿势被 dHash 判重只留 2 张"的问题。
-   - 无人脸/关键点退化的帧共享一个伪簇（保留行为与 M2 等价）；单组保留总量受 `burst_group_cap`（默认 20）上限，超出按总分截断。
-   - **永不删除/移动任何文件**：`burst_keep` 只是建议标记。
+`analysis_mode` 标明 `ai` / `pixel`；`rating_source` 标明 `algorithm` / `manual`。模型整体不可用时可显式降级；已进入 AI 分析的单张推理失败应报告分析失败，不伪装成正常中性分。CSV 的 `analysis_ok` 可用于过滤失败或无配对 RAW；review 缓存没有失败记录表，无法完整区分“尚未评分”和“之前分析失败”。
 
-**汇总权重（默认，M5 决策 A+修复）**：清晰 0.30 / 曝光 0.25（M5 从 0.20 提升）/ 噪点 0.15 / 构图 0.15 / 美学 0.15（和 = 1.0）。总分 0-100 + 5 个子分 + 人脸数全部进 CSV。
+## 3. 目录、配置与缓存
 
-## 4. 流水线设计（上万张性能）
+### 3.1 扫描及 JPG/RAW 配对
 
-```
-scan（读 EXIF 建索引，SQLite 增量）
-  → analyze（解码+像素指标，rayon 并行，box 降采样 ~1024px）
-  → detect（CLIPIQA + SCRFD + 姿态，ort 推理，缓存命中跳过）
-  → selection（时间聚类 + dHash + 姿态、加权总分、算法星级、人工覆盖）
-  → output（XMP 星级 + CSV；review 使用同一 selection 结果）
-```
+选一次拍摄活动的根目录，支持同目录 JPG+ARW，也支持 `JPG/`、`RAW/` 子目录布局。配对先匹配同目录同主干，再对剩余同名且无歧义的 JPG/ARW 跨目录兜底；遇到歧义不猜测，避免相机编号回绕导致错误合并。
 
-- 缓存命中即跳过（SQLite，键 = path+size+mtime+CACHE_VERSION+**曲线/分析模式/模型文件指纹**），重跑只处理新照片或来源变化的照片。
-  - 配置指纹（`config_fingerprint`）是 M6 修复的一个静默 bug：此前换 `--config` 后缓存仍然命中，用户改了权重/曲线却看到完全一样的结果。
-  - 指纹**只覆盖影响缓存值的曲线参数**（`sharpness_k`/`noise_k0`/`exposure_*`）；权重与星级阈值在运行期合成总分/星级，改它们不会触发重算（M8 性能修正）。
-  - `flush` 只写本次新增/更新的行（dirty set），不再每次重写全部行。
-- 实测吞吐：119 张 33MP（含 3 模型）约 17.4s（16 核，~146ms/张）；**M9 实测 1447 张真实图库（含 1272 张连拍）冷跑 2m55s（~121ms/张）**；增量重跑秒级（1447 张全命中 2.06s）。1 万张冷跑约 20 分钟。
-- 缓存行含姿态描述子（M9，`pose_desc BLOB`，10×f32）；当前 `CACHE_VERSION` 15，旧行会重建。
-- 处理中不移动/删除任何文件，只写 XMP 侧车和 CSV（安全）。
-- CSV 含 `analysis_ok` 列（M8 遗留项，M9 落地）：解码失败/无配对 ARW 可过滤，运行结束 stderr 给失败清单。
-- CSV 另含 `analysis_mode`（`ai`/`pixel`）和 `rating_source`（`algorithm`/`manual`）；人工决定库应随照片备份，分析缓存可重建。
+“关联同名 RAW 照片”是照片根目录级偏好，UI、CLI `score` 和 `review` 共用；关闭后只处理 JPG。扫描跳过 `.firstcut/` 与所选根下的 `Processed/` 输出子树；直接选择 `Processed/` 本身则可以浏览成片。根目录顶层的成片 JPG 无法自动区分，建议单独放在 `Processed/`。
 
-## 5. XMP 输出约定
+照片根统一规范化，Windows 去掉影响旧缓存匹配的 `\\?\` 路径形式。同一根目录不应因启动器、CLI 或进程工作目录不同而产生不同默认状态位置。
 
-- 为每张照片写侧车 `<stem>.xmp`（`DSC00001.xmp`），含 `xmp:Rating`（1-5 星）+ `firstcut:` 命名空间（5 维子分/人脸/连拍信息）。同目录的 JPG/ARW 共用一个侧车；分目录配对时两端各写一份。
-- **命名兼容性（M7 已解决）**：`<stem>.xmp` 是 **Lightroom/ACR** 的约定，**darktable 也读**该格式（它自己的 `<stem>.<ext>.xmp` 也认，见 [darktable 文档](https://docs.darktable.org/usermanual/4.2/en/overview/sidecar-files/sidecar-import/)）→ 一份侧车两边通用。此前写成 `<stem>.<ext>.xmp`，Lightroom 读不到。
-- 他人侧车（无 firstcut 命名空间，如 LR 写的调色参数）**不覆盖**；已有 firstcut 侧车仅按 XML 节点合并受管理字段，未知字段保留，解析失败保留原文件。
-- **星级（M7）**：默认 `star_mode = "relative"`，按本次批次内百分位给星（10/30/65/90）。绝对阈值模式保留（`rating_5..2`）。理由见 §10。
-- CSV 每行：文件、拍摄时间、相机、ISO/光圈/快门、5 维子分、总分、**星级**、人脸数、连拍组号、组内排名、建议操作。
+### 3.2 默认文件布局
 
-## 6. 项目结构
-
-```
-pic_process/
-├── Cargo.toml
-├── firstcut.toml            # 通用评分配置模板（config-template 生成）
-├── presets/                 # 场景预设（编译进二进制，config-template --preset 输出）
-│   ├── portrait.toml  stage.toml  highkey.toml  sports.toml  lowlight.toml
-├── models/                  # 首次下载的 ONNX 模型（gitignore）
-├── src/
-│   ├── main.rs              # clap CLI（scan / score / config-template [--preset]）
-│   ├── scan.rs              # 扫描 + EXIF + JPG/ARW 配对
-│   ├── decode.rs            # JPEG box 降采样解码 + EXIF 方向 + 灰度/直方图
-│   ├── metrics/             # sharpness / exposure / noise / composition
-│   ├── ai/                  # iqa(CLIPIQA) / facedetect(SCRFD) / pose(YOLOv8)
-│   ├── dedup.rs             # 连拍分组 + dHash 聚类 + M9 姿态聚类 + 排序
-│   ├── score.rs             # 分析调度 + 加权汇总 + 缓存接入 + 姿态描述子
-│   ├── output/              # csv.rs / xmp.rs
-│   ├── cache.rs             # SQLite 增量缓存（键含配置指纹，含 pose_desc）
-│   ├── config.rs            # 权重/曲线/星级/曝光 EV 容差 + [dedup] + 场景预设（--config 可配）
-│   ├── review/              # M-UI1：本地 Web 复核服务（axum + 内嵌前端）
-│   └── lib.rs
-├── src/bin/                 # tune / gallery / debug_scrfd / debug_pose / debug_exposure / probe
-└── tests/
-```
-
-## 7. 里程碑（每步可交付、可验证）
-
-- ✅ **M0 骨架**：CLI + 目录扫描 + EXIF + CSV 输出（268 张真实照片实测通过）
-- ✅ **M1 像素指标**：清晰度/曝光/噪点 + 加权总分（纯算法，无 AI 依赖）
-- ✅ **M2 连拍去重**：时间聚类 + dHash 子簇聚类 + 组内排序 top-K（6 项单元测试）
-- ✅ **M3 AI 接入**：CLIPIQA 美学 + SCRFD 人脸检测 + 构图维度，5 维评分（后期从 MUSIQ/YuNet 升级，见 M5）
-- ✅ **M4 输出完善**：XMP 星级侧车（`<名>.<原扩展名>.xmp`，xmp:Rating + firstcut 子分，他人侧车保护）+ SQLite 增量缓存（size+mtime+版本键，二次运行 16/16 命中 0.78s；M6 追加配置指纹）
-- ✅ **M5 调参与验证**：性能优化（21.5s→10.6s/119张）、噪点 P15 修复、浅景深清晰度误判修复（主体感知三层链路：SCRFD 人脸区域 reblur → YOLOv8-pose 头部区域 → 50 中性下限）、人脸漏检换 SCRFD（检出 23→75/119）、gallery 联系表；**用户决策落地**：A=多场景配置文件（--config/config-template，权重+曲线+星级+曝光目标可配）、B=星级放宽 75/60/45/30、C=换 CLIPIQA（美学分布 26-76，区分度提升）
-- ✅ **M6 缺陷修复**（2026-07，见 §10 决策记录）：AI 预处理通道顺序 bug、EXIF 方向未处理、构图被贴纸脸/背景脸污染、曝光模型改为 EV 容差带 + 主体感知单向修正、缓存键缺配置指纹、场景预设落地
-- 🔄 **M7 交付与兼容**（2026-07，见 §10）：XMP 侧车命名改 Lightroom 约定、星级改批次内相对分档、配对键含目录、连拍排序用实际权重；**待办**：LR 真实导入验证、自适应连拍保留、ground truth 校准
-- ✅ **M8 评审修复**（2026-07，见 §10）：外部评审（GLM）13 项问题逐条核实并修复——配对回归（P0）、配置 fail-fast、EXIF 5/7 互换、清晰度兜底缝隙、指纹收窄、缓存 flush 收窄、文档批次修正、pose sigmoid 定案
-- ✅ **M9 自适应连拍保留**（2026-09，见 §7.1 / §10）：SCRFD kps 解码 + 姿态描述子缓存化 + dHash 子簇内姿态聚类（每姿势簇保留 3 张、单组上限 20、默认启用可关闭）；阈值 0.25 经棚拍双峰定标；archive 119 张回归星级逐档一致（12/24/41/31/11）；搭车：`analysis_ok` 列、实验性 `--gpu`（DirectML，无显著收益）
-- ✅ **M-UI1 复核界面**（2026-09，见 §12）：`pic_process review <目录>` 本地 Web 界面——缩略图墙 + 筛选排序 + 1:1 原图灯箱 + 连拍组并排同步缩放对比；只读
-- 🔄 **M7 遗留待办**：LR 真实导入验证、ground truth 校准
-
-**M5 决策的历史边界**：当时夜景配置使样片 DSC00898 排名从 #51 升到 #7；绝对星级阈值 75/60/45/30 在当时的 119 张样本上得到 5 星 24 张、4 星 74 张、3 星 21 张。A/B/C 的备选曾分别是“提高曝光权重或保持原样”“保持或放宽阈值”“继续 MUSIQ、多尺度或换模型”，最终选择多场景可配置、放宽阈值与 CLIPIQA+。这些是 M5 样本和决策过程，**当前默认星级已经改为 M7 的批次相对分档**；重调参数应使用新的人工选片标注，不把旧分布当验收基线。浅景深验证样片还包括 DSC00893（人脸）和 DSC00974/976（人体定位）。
-
-### 7.1 M9 自适应连拍保留（已实现）：按姿态自适应保留连拍
-
-**问题**：`keep_k` 固定、按 dHash 子簇保留。30fps 连拍时同一个人的**不同姿势/表情**会被 dHash 判为近似重复，只留 2 张 → 丢掉不同瞬间。
-
-**实现**（利用已有算力，零额外推理成本）：
-1. SCRFD `scrfd_10g_bnkps` 的 **5 个关键点（双眼/鼻/双嘴角）**在 M9 起参与解码（kps 张量 [N,10]，格中心 + offset×stride，与 bbox 同一距离约定；debug_scrfd 实测 40 点 100% 落框内自检）。按人脸框归一化成 10 维**姿态描述子**（`score::pose_descriptor`），对位置/尺度不变。
-2. 描述子进缓存（`pose_desc BLOB`，`CACHE_VERSION` 13）。
-3. dHash 子簇内**贪心种子姿态聚类**（与 dHash 聚类同风格、扫描顺序确定）：距离 > 0.25 → 新姿势簇；无描述子帧共享伪簇。
-4. 每个**姿势簇**各自保留 top-K（默认 3）；单组保留总量上限 20（超出按总分截断）；`adaptive_keep=false` 一键回退 M2 行为（逐字节一致）。
-
-**定标**：棚拍 18 帧同主体连拍——同姿势两两距离 0.02~0.06、跨姿势 0.46~0.51，双峰清晰，0.25 居中（两侧余量 4×+）；舞台连拍（萤火虫）姿态连续变化时无真空带，0.25 给出合理"瞬间"粒度。
-
-**规模实测**：真实图库 1447 张（88% 在连拍组）——姿态簇规模分布 1~9 张、组保留数 ≤ 20，行为符合预期；M9 只改 burst 列，五维分与星级与 M8 完全一致（回归断言）。
-
-> 当前状态（Phase 1 + M6/M7/M8/M9 + M-UI1）：`pic_process score <目录> [--xmp] [--config x.toml] [--cache <文件>] [--no-ai] [-k N] [--gpu]`，42 项单元测试 + 6 项集成测试全过；冷跑 ~121-146ms/张（含 SCRFD+姿态，16 核）。
-
-## 8. 风险与开放问题（当前状态）
-
-- **美学模型**：~~MUSIQ~~ → **已定案：CLIPIQA+ ONNX**（M5 切换，86Cao/IQA-ONNX-Models，224×224、CLIP 归一化、sigmoid×100，分布区分度 26-76 高于 MUSIQ 的 36-65；已下载至 `models/clipiqa_model.onnx{,.data}`）。
-- **人脸检测**：~~YuNet~~ → **已定案：SCRFD 10g**（M5 切换，RuteNL/SCRFD-face-detection-ONNX，640×640、9 输出解码、阈值 0.3 + 贪心 NMS；119 张真实照片检出 23→75，M6 修 EXIF 方向后 109/119）。
-- **onnxruntime Windows GPU**：DirectML provider 支持 OK；无 GPU 时自动回落 CPU。AI_POOL_SIZE=1（Mutex 串行）——实测池化无收益（AI 非瓶颈且每 session 线程减半变慢）。**M9 实验性 `--gpu`（`--features gpu` 构建）实测：119 张 16.7s vs CPU 17.4s（~4%）——单张小批量 DML 吃不满 GPU，无显著收益，保持实验性、默认关闭**。
-- **权重校准**：默认权重 0.30/0.25/0.15/0.15/0.15（和=1.0，M5 决策 A：曝光 0.25 压欠曝虚高）；多场景用 `--config` 按需调整，内置 `presets/` 5 份（portrait/stage/highkey/sports/lowlight）。
-- **Lightroom 读 XMP 星级**：命名已改为 LR 约定（`<stem>.xmp`），但**仍缺一次真实导入验证**（用户在 LR 里导入目录，确认星级/子分显示）。Phase 1 唯一没被实测过的交付物。
-- **配对键（M7 已修）**：此前所有索引/配对/侧车去重都只用"文件名主干"，而索尼编号在 DSC09999 后回绕 → 上万张跨目录必然出现同名文件，会让分数/连拍/侧车互相覆盖。现改为「目录 + 主干」配对键。
-- **遮挡脸/超大脸漏检**（未解决）：口罩/头盔遮挡时 SCRFD 置信度会掉到 0.2 附近，超大人脸特写也会漏检（PORTRAIT_TEST 0.117）。当前对评分的影响已通过"主体感知单向修正 + 构图只计主体脸"降级处理，未换模型。
-
-## 9. Phase 2（远期）：批量 RAW 开发，替代 Lightroom 手动流程
-
-> **⚠️ 状态更新（2026-09-18）：darktable 批量开发管线已停。**
-> 方向由用户拍板：firstcut 回归**筛选工具本位**——新增"建议曝光 EV → XMP"
-> （`firstcut:suggestedEV` 信息字段 + `crs:Exposure2` Lightroom 开发字段，
-> 带外才给建议、±2 EV 钳位、1/3 档取整；配置 `exposure_suggest_cap`），
-> 星级/筛选名单本就在 XMP 里，**实际开发仍由 Lightroom 完成**。
-> 本章 §9.1~§9.4d 的调研结论（darktable-cli / 侧车模板 / 16bit TIFF / EV patch）
-> **全部留档备查、不再实施**。设计文档由用户重写，本章仅作历史档案。
-
-> 需求：选片后不想进 LR，希望自动完成"自动曝光/色调 + 镜头校正 + AI 降噪"批量出图。
-> 结论（已调研）：**可行**，采用"Rust 编排 + darktable-cli 引擎"分工。
-
-### 9.1 开源方案调研结论
-
-| 需求 | 方案 | 状态 |
-|---|---|---|
-| 批量 RAW 开发引擎 | [darktable-cli](https://darktable-org.github.io/dtdocs/en/special-topics/program-invocation/darktable-cli/)（无头批处理，Windows 有官方构建，索尼 ARW 支持好） | ✅ 成熟 |
-| 镜头校正 | [lensfun](https://github.com/lensfun/lensfun)（darktable 内置，开源镜头数据库）；冷门头可自校准（[lens_calibrate](https://gitlab.com/cryptomilk/lens_calibrate)） | ✅ 成熟，覆盖视镜头而定 |
-| AI 降噪 | ~~darktable neural restore~~ **实测不可用于 CLI**（见下）→ 改用 `rawdenoise`（RAW 域小波）+ `denoise (profiled)`（主） | ❌ neural restore 仅 GUI；替代方案 ✅ 已实测 |
-| 自动曝光/色调 | darktable exposure 模块 auto-exposure + Lua（[autostyle](https://darktable-org.github.io/luadocs/lua.scripts.manual/scripts/contrib/autostyle/)）；**Phase 1 的曝光分析直接产出每张补偿值写入 XMP** | 🟡 可达成，8 成效果 |
-| 备选（不推荐） | 纯 Rust 自研：rawler 解码 + 自写色调映射 + `ort` 跑 NAFNet/SCUNet ONNX（[NAFNet](https://github.com/megvii-research/NAFNet)、[ONNX 权重](https://huggingface.co/qualcomm/NAFNet-DeNoise)） | 色彩科学差距大，工作量巨大 |
-
-### 9.2 Phase 2 架构（已确认）
-
-```
-[Phase 1 评分工具] → 保留照片清单 + 每张曝光补偿建议
-        ↓
-[Phase 2 Rust 编排器]
-  1. 为每张 ARW 生成 XMP 侧车（darktable 可读）：
-     - lens correction: auto（lensfun）
-     - exposure: 补偿值（来自 Phase 1 分析）
-     - denoise: `rawdenoise` + `denoise (profiled)`（按 ISO 调 `strength`；
-       **不是** neural restore——它没有 CLI 入口，见 §9.3）
-     - 白平衡: 按场景（日光/阴天/自动）简单预设
-  2. 循环调用 darktable-cli 批量导出：
-     - 16bit TIFF（归档，保留后期空间）
-     - 高质量 JPG（分享/预览）
-  3. 输出到 developed/ 目录，不动原片
-```
-
-### 9.3 Phase 2 风险
-
-- **lensfun 对用户镜头的覆盖**：需实测；缺失时用 lens_calibrate 自校准（一次性的活）。
-- **neural restore 无法用于 CLI 批量（已实测定案，2026-09-09）**：
-  模块**存在**且 **RAW 域降噪（RawNIND / PR #20854）确已合入 5.6**，但它是 `dt_lib_module_t`
-  （GUI 工具面板）**而非 iop**：不接收 XMP 参数、不在 pixelpipe 里、靠人点 Process 触发，
-  自己跑后台任务写新 DNG/TIFF 再重新导入，源码里没有 `dt_dev_add_history_item`。
-  `darktable-cli` 侧证据：① `--help` 无任何 AI/模型选项；② `--luacmd` 脚本**从不执行**
-  （Lua 走 `dt_lua_async_call()` 异步投递，而 CLI 是同步直线流程从不进主循环，
-  `init_gui=FALSE` 还导致 `dt_lib_init()` 不跑、模块连注册都没发生）；
-  ③ 二进制里确有 `darktable.ai` Lua API，但只有 GUI 版接受 `--luacmd`。
-  **点一次 GUI 也救不回来**（不是一次性下载问题）。
-  → **替代方案（已实测）**：`rawdenoise`（RAW 域小波，轻）+ `denoise (profiled)`（主）。
-  两者都是标准 iop、可走 XMP。**`denoise (profiled)` 内置相机噪声 profile 并按 ISO
-  自动插值**，"按 ISO 分级降噪"是它的原生行为，`strength` 即分级主旋钮。
-  modversion / `op_params` 二进制布局见 `p2_notes/neural_restore.md`；
-  验证方式：同源同参数只改 `<darktable:enabled>` 1→0，两个 16bit TIFF 的 md5 不同。
-  保留未来路径：若上游给 neural restore 加 CLI 入口再重评。
-- **darktable 读 XMP 侧车的字段**：需用真实照片验证一遍（M4 阶段已计划验证 XMP 星级，可一并做）。
-- **GPU 需求**：neural restore 走 ONNX Runtime，无 GPU 会慢，需确认机器配置。
-
-### 9.4 镜头清单与校正策略（**已按实机实测重写**，2026-09-09）
-
-> 原表基于"听说有哪几支镜头"填写，与实际库存严重不符：实测（`pic_process scan F:\PS_Process`，
-> 全库 15979 文件 / 8603 ARW）发现占比最高的 FE 24mm GM、E 18-135、Viltrox 23 都没被列出，
-> 而 200-600G 是**已购入但尚未拍摄**（保留，不删）。
-> lensfun 结论由解析本机全部 56 个 XML / 1563 条 `<lens>` 条目 + 上游 master 交叉验证得出。
-
-**实际镜头与 lensfun 覆盖实测**：
-
-| 镜头 | ARW 张数 | Sony E 口 lensfun 条目 | 支持校正项 | 结论 |
-|---|---|---|---|---|
-| FE 24mm F1.4 GM | 2569 | ✅ `mil-sony.xml` | 畸变+色差+暗角 | 直接用 lensfun |
-| E 18-135mm F3.5-5.6 OSS | 1731 | ✅ `mil-sony.xml` | 畸变+色差+暗角 | 直接用 lensfun |
-| **Sigma 50mm F1.4 DG DN \| Art 023** | **1518** | ❌ **无条目** | — | **🔴 必须兜底（占 17.6%，最高优先级）** |
-| Viltrox 23mm F1.4 E | 1397 | ✅ `misc.xml` | 畸变+色差+暗角 | 可用；**标定源自富士 X-T20**（cropfactor 1.53 vs E 口 1.534），失真/TCA 可靠、**暗角可能略偏**，建议抽样目视 |
-| E 70-350mm F4.5-6.3 G OSS | 1231 | ✅ `mil-sony.xml` | 畸变+色差+暗角 | 直接用 lensfun |
-| FE 24-70mm F2.8 GM II | 151 | ✅ `mil-sony.xml` | 畸变+色差；**暗角缺** | 用 lensfun，暗角另想办法（**一代 GM 的暗角系数不可套用二代**） |
-| Sigma 70-200mm F2.8 DG DN OS \| Sports 023 | 4 | ❌ 无条目 | — | 需兜底（优先级极低） |
-| FE 200-600mm F5.6-6.3 G OSS | 0（**已购入未拍摄**） | ✅ `mil-sony.xml` | 畸变+色差+暗角 | 已确认覆盖，拍到即可用 |
-
-**关键背景**：
-- darktable 的 lens correction 模块只走 **lensfun 数据库**，按 EXIF 自动匹配，匹配不到则"无 profile"（[官方文档](https://darktable-org.github.io/dtdocs/en/module-reference/processing-modules/lens-correction/)、[社区反馈](https://github.com/darktable-org/darktable/issues/11022)）；内嵌校正数据（embedded DNG corrections）仅 DNG 支持（[PR #12880](https://github.com/darktable-org/darktable/pull/12880)），**ARW 不适用**。
-- 索尼 ARW 的 maker notes 里**内嵌镜头校正数据**（畸变/暗角/色差），RawTherapee 的 Lens/Geometry 可读取（[参考](https://photo.stackexchange.com/questions/114615/raw-therapee-lens-geometry-correction-sony-a6100/114621)）→ 可作**备用引擎**。
-- 本机 lensfun 版本 **0.3.4**（随 darktable 5.6.1）。
-- **对 Phase 1 无影响**：索尼 JPG 出厂即烘焙镜头校正，评分用 JPG 天然已校正。
-- `18-135mm` 与 `23mm f/1.4` 在 `mil-fujifilm.xml` 里也有同名条目（`XF18-135mmF3.5-5.6R LM OIS WR`、`XF23mmF1.4 R`），**那是富士 X 口，不是命中**；两支镜头各自另有真正的 Sony E 口条目。
-- **不要假定"命中 Sony E 口 = 三项校正齐全"**：`FE 24-70 GM II` 缺暗角；`FE 70-200mm f/2.8 GM OSS` 只有畸变。通用判定逻辑必须**逐条目解析 `<calibration>`**，不能只看是否命中。
-
-**兜底链路（按优先级）**：darktable lensfun 命中 → RawTherapee 读索尼内嵌数据（同一张 ARW 换引擎出图）→ lens_calibrate 自校准 → 跳过（仅限畸变可忽略的镜头）。
-
-> ⚠️ **`lensfun-update-data` 类的升级路径救不了**：已抓上游 master 验证，
-> **两支适马（50/1.4 DG DN、70-200 DG DN OS）上游同样没有条目**，只能自建 profile 或跳过。
-> 真正"完全无 lensfun"的合计 **1522 张 / 8603 = 17.7%**。
-> 建议把"两支适马是否进入上游"做成**周期性检查项**。
-
-### 9.4b P2-M1 侧车方案（已实测定案，2026-09-09）
-
-> 结论来源：对 darktable 5.6.1 逐字段/逐偏移实测 + 源码核对（详见 `p2_notes/xmp_fields.md`，
-> 成品侧车 `p2_notes/reference/DSC00886.ARW.xmp`，机器可读模板 `xmp_template_ILCE-7M5_dt5.6.1.json`）。
-
-**① 侧车命名：两条命名各司其职，不冲突**
-
-| 文件名 | 谁读 | 读什么 |
-|---|---|---|
-| **`<原文件名含扩展名>.xmp`**（`DSC00886.ARW.xmp`） | **darktable 正牌侧车** | 全部，**含 `darktable:history`** |
-| `<stem>.xmp`（`DSC00886.xmp`） | darktable 仅经 `dt_lightroom_import()` | **只有 rating / Label / 关键词；`darktable:history` 被静默忽略** |
-| `<stem>.xmp` | **Lightroom / ACR（M7 决策）** | rating 等 |
-
-→ **Phase 1 保持现状不动**（写 `<stem>.xmp` 给 Lightroom）。
-**Phase 2 编排器另写 `<原名>.ARW.xmp`**（含完整 history + 同时带上 `xmp:Rating` / `firstcut:*`，
-因为正牌侧车存在时 LR 风格那份不再被合并）。两者共存，darktable 优先读正牌侧车。
-`darktable-cli` 会**自动发现**输入同目录的同名侧车，且 **CLI 全程不写侧车**（只读不写，安全）。
-
-**② 四个"写错就静默失效"的点**
-
-- 顶层 `darktable:xmp_version` **合法范围只有 2..5**（缺失/0/1 → legacy 解析 → history 静默丢弃；≥6 → 不支持）。
-- 每条 history 必须齐 `operation` + `params` + `modversion`，缺任一 → **整条丢弃**。
-- `darktable:enabled` 默认是 **0（关闭）**，必须显式写 1。
-- `darktable:history_end` = 实际应用条数。
-
-**③ 落地方式：完整栈模板 + 定点补丁（不能用"部分侧车"）**
-
-部分侧车实测不可用：只写 1 条 exposure 时 darktable 只补 9 条强制模块（**不补 sigmoid / color
-calibration**），结果 512px mean 128.1（无侧车默认 138.7）并随参数剧烈漂移（EV=2.2 时过曝 65.6%）。
-→ 做法：用 `darktable-cli <copy.ARW> <out> --library <tmp>/library.db --core --configdir <tmp>/cfg`
-导入一张该机型 ARW，从临时库 `history` 表抓**默认栈**（本机 ILCE-7M5 = 11 条、ILCE-6700 = 13 条，
-含 modversion 与原始 hex；6700 的 lens/denoiseprofile 自带，见 §9.4d ⑦ 重抓流程），
-之后只做三件事：**原地** patch exposure 的 EV、**原地替换** temperature 的系数、**patch-or-append**
-lens 与 denoiseprofile（栈里有则原地、无则追加，§9.4d ②）。
-实测完整栈原样回灌与"无侧车导出"逐像素几乎一致（Δmean 0.002/255）→ 模板法可靠。
-
-**④ 四个模块的 `op_params` 结构（小端 hex，均无指针/变长，可安全手写）**
-
-| 模块 | modversion / 大小 | 关键字段 |
-|---|---|---|
-| `lens` | v10 / 356B | 偏移 332 `has_been_set=0` → 走 EXIF+lensfun **自动匹配**（camera[]/lens[] 留空）。默认栈里没有，需追加 |
-| `exposure` | v7 / 28B | 偏移 8 = EV。**陷阱**：本机 ARW 机身曝光补偿 −1.3EV，默认 `comp_bias=1` 会补上 → 我们的 ΔEV 要**原地读模板自带 EV 再加 Δ**（7M5 基线 0.7 / **6700 基线 1.2**，§9.4d ②），且**保持 comp_bias=1**。**不得硬编码 0.7** |
-| `denoiseprofile` | v12 / 416B | `a[0]` 必须 **−1.0f** = 按相机+ISO 自动取 profile（**写 0 实测导出几乎全黑**）；偏移 8 = `strength`；mode=4 为 wavelets-auto |
-| `temperature` | v4 / 20B | **没有 Kelvin/tint**，只有红绿蓝系数；`preset=2` 才用给定系数（`preset=0` as-shot 会被 EXIF 覆盖）；**必须原地替换**默认栈那条（追加会变两个实例叠加） |
-
-**⑤ 版本强绑定（相机绑定已实测弱化）→ 必须做防御性校验**
-
-模板与 **darktable 版本**强绑定（modversion/params 长度随版本变），但 2026-09-18 实测
-7M5 与 6700 默认栈共有模块**逐字节相同**，机型相关值只有 exposure 的 EV 基线（§9.4d ②）
-→ 按机身+版本存模板保留（防升级），不必再为颜色矩阵担心跨机型。Rust 侧用
-`darktable-cli --version` 做模板键，并且**导出后必须校验非全黑**——版本或 params 长度写错时
-darktable **不报错**，直接给黑图或未初始化内存（`modversion` 偏新 → params 是未初始化内存）。
-
-**⑥ 仍待确认**：`firstcut:*` 在 GUI「改图→保存侧车」后是否 100% 保留（源码上会保留）；
-自定义 `iop_order_version`；Kelvin/tint → 相机 RGB 系数的精确换算（`wb_presets.json` 无 ILCE-7M5）；
-降噪强度分级最优值需目视。~~16bit TIFF 导出参数~~ → 已解决（§9.4d ③：
-`--core --conf plugins/imageio/format/tiff/bpp=16`）；另新增 LR 对 darktable 16bit TIFF 的兼容性待测（§9.4d ④）。
-
-### 9.4c P2-M2 编排器方案（已实测定案，2026-09-09）
-
-> 结论来源：darktable-cli 5.6.1 Windows 下 27 组用例 + 并发压测 + 基准（详见 `p2_notes/cli_batch.md`）。
-
-**① 并发模型：一张一进程 + worker 池，默认并发 6**
-
-实测（12 张全分辨率 16bit TIFF）：P=4 → 27.4s，**P=6 → 24.0s（最优，2.0s/张）**，
-P=8 → 26.2s（退化），**P=12 → 81.2s（比串行还慢 2×，灾难）**。
-原因：单进程已能吃满 16 逻辑核，超订导致线程爆炸 + 换页（P=12 时单张 CPU 从 12s 涨到 48s，约 200 线程）。
-→ `并发 = clamp(cores/3, 2, 8)`，并加**内存闸门**（全分辨率每张预留 1.2GB，2048px JPG 预留 0.6GB）。
-**不要用"一进程多图"**：位置参数传多个输入只有第一张被导出（其余静默忽略、exit 0）；
-只有重复 `--import` 才真多图，但牺牲逐图错误归因、内存线性增长且不更快。
-
-**② 成功判定：必须以文件系统为准，绝不能靠退出码**
-
-实测 3 张里 2 张成功 + 1 张损坏 → **退出码仍是 1**（整批聚合，无法区分全败/部分败）。
-
-```
-运行前：create_dir_all(outdir)；记录 outdir 已有文件
-spawn ：darktable-cli <输入正斜杠绝对路径> <输出目录正斜杠>/ --out-ext <ext> --apply-custom-presets 0
-判定  ：exists(outdir/(stem+"."+ext)) && size > MIN_BYTES   # jpg ≥ 10KB，tif ≥ 1MB
-```
-日志兜底**只能匹配英文模块名前缀**（`[export_job] exported to`、`[imageio_storage_disk] could not export`、
-`[rawspeed] ... corrupt`）——**本机运行期错误提示是中文的**（随 locale 变），匹配中文必失效。
-
-**③ 三个必须做的前置动作（否则静默产出垃圾）**
-
-1. **路径全部 `\` → `/` 并在构造参数后断言不含 `\`**：反斜杠被**直接删除**而非转义，
-   `F:\p2cli\out\` 会落盘到 `F:\p2cli\p2cliout\`，exit 0 且无警告。
-2. **自己先 `create_dir_all` 输出目录**：目录不存在时 `$(FILE_NAME)` 不展开，
-   写出字面名文件 `$(FILE_NAME).jpg` 且 **exit 0、日志照样写 exported**。
-3. **加 `--apply-custom-presets 0`**：GUI 在跑时 CLI 默认 0.66s 内 `database lock ... aborting` exit 1；
-   该选项是官方给的"multiple instances"开关。注意 `--library` **不能**绕过锁。
-
-**④ 另外 7 个坑**
-
-- 加了 `--apply-custom-presets 0` 后 **`--style` 必然失败**（style 存数据库里）→ **渲染方案必须走预生成
-  含 history 的 XMP，不能用 `--style`**。
-- **重跑不覆盖**：同目录已有产物时新文件叫 `_01`/`_02`，导致"按预期文件名判成功"的编排器第二次跑会误判全失败。
-  → 每 worker 独立输出目录，或跑前清空，并按"本次新增文件"判定。
-- 位置参数传第二张图被静默忽略（exit 0）；`--import DIR` **不递归**。
-- **配置目录无法隔离**（`libdarktable.dll` 里没有 `DARKTABLE_CONFIGDIR`/`XDG_CONFIG_HOME`，"假 LOCALAPPDATA"无效）；
-  CLI 每次运行都会重写 `darktablerc`（幂等，未观测到损坏）→ 当**共享资源**处理。
-- **中文路径其实可用**：之前的"不可用"是 PowerShell 5.1 把 UTF-8 无 BOM 的 `.ps1` 按 GBK 解码造成的假象；
-  Rust 用宽字符 API 无此问题。但反斜杠的 `--library` 路径会触发 `GLib-CRITICAL g_utf8_to_utf16` 断言。
-- **不要用 `--library`**（它的语义是"从库读 history **而非** XMP 侧车"，指向没导入过这些照片的库 = 全部按默认导出）。
-- `--verbose` 无帮助；无 `--bpp`（help 标 unsupported）、无 `--format`。
-
-**⑤ 性能与资源（写 Rust 用得上）**
-
-| 输出 | 单张墙钟 | 峰值工作集 | 产物 |
-|---|---|---|---|
-| 全分辨率 16bit TIFF | **~8.1s** | 870MB~1.1GB | 45.5MB |
-| 全分辨率 JPG | ~5.0s | ~1.05GB | 8.77MB |
-| 2048px JPG | ~3.7s | ~0.36GB | 736KB |
-
-内存是阶梯式：~70MB 解码 → ~360MB → **865MB 平台**。TIFF 已验证：4688×7032、16bit、3 通道、
-Compression=8 (Adobe Deflate)、内嵌 ICC 9012B。**产物体积随机身/内容差异大**：6700 全幅样片实测
-117–127MB（§9.4d ③）→ 磁盘预算按 **130MB/张**（8000 张 ≈ 1TB），45.5MB 只是下限参考。
-
-**⑥ 安全结论（重要）**：CLI **不写也不改 XMP 侧车**（前后 MD5 一致），源图无侧车也不新建
-→ **`F:\PS_Process` 原库可以安全只读使用**。
-
-**⑦ 建议命令模板（2026-09-18 更新，含 16bit 强制，见 §9.4d ③）**
-
-```
-darktable-cli.exe <正斜杠输入绝对路径> <已创建的正斜杠输出目录>/ --out-ext tif --apply-custom-presets 0 ^
-  --core --conf plugins/imageio/format/tiff/bpp=16
-# 勿用 --style / --library / --bpp / --verbose（--bpp 被 help 标 unsupported；
-# 位深只能经 --core --conf 覆盖，profile 默认 bpp=8 会静默出 8bit 图）
-# JPG 输出同理可带该参数（对 jpg 无效但无害），用于 P2-M2 验收交叉核对（§9.4d ⑤）
-```
-
-**⑧ 待确认**：`--apply-custom-presets 0` 在"用户已配置自定义预设"时是否影响成像
-（本机无自定义预设，无法实测差异；P2 用预生成 XMP 正好规避该依赖）；OpenCL 是否真启用
-（`cltest` 跑 10 分钟未返回，本轮 CPU 时间占比像纯 CPU）。
-
-### 9.4d 动作 A 真图冒烟实录（2026-09-18，样片来自 ILCE-6700 机身，修订 §9.4b/§9.4c）
-
-> 执行人：DSH（qwen/qwen3.8 与用户结对）。样片从 `F:\PS_Process` **只读**挑出并拷入
-> `p2_notes/_smoke/input/`（全库 15,979 文件重扫 `_main_scan.csv` 复核镜头普查，与 §9.4 完全一致）。
-> 样片：**DSC02906**（20240324_机场，E 70-350 G，lensfun 命中路径）+ **DSC08051**
-> （20241006_家里随拍，Sigma 50/1.4 Art，lensfun 无条目兜底路径）。
-> **机身普查**：ILCE-6700 = 8360 ARW（97%）、ILCE-7M5 = 239、ILCE-7RM5 = 4 → 模板必须按机身备，6700 是主力。
-
-**① EV 补丁生效（隔离实验，同图同模板只变 delta）**
-
-| delta-ev | 写入 EV（6700 基线 1.2） | JPG mean/255 |
-|---|---|---|
-| 0 | 1.2 | 131.0 |
-| +0.5 | 1.7 | 154.6 |
-| +3.0 | 4.2 | 233.1（近裁剪，符合 3 档预期）|
-
-同 EV 下 16bit TIFF 与 JPG 像素对拍 5 点差 ≤2/255 → 侧车被读、EV 浮点补丁落地、管线非全黑。
-
-**② 模板发现（修订 §9.4b ③/④/⑤）**：7M5 与 6700 的默认栈**共有 11 个模块逐字节相同**
-（rawprepare/demosaic/colorin/colorout/temperature/gamma/highlights/channelmixerrgb/flip/sigmoid +
-exposure 的 black/percentile/comp 字段）。唯一机型相关值：**exposure 默认 EV 基线 7M5=0.7、6700=1.2**。
-且 6700 默认栈**自带** lens(v10, 356B) + denoiseprofile(v12, 416B)（共 13 条），7M5 不带（11 条）——
-6700 自带的两个 blob 与我们设计的 auto blob（`has_been_set=0` / `a[0]=-1.0f`）**逐字节一致**。
-→ 生成器逻辑定案为 **patch-or-append**（栈里有则原地补丁，无则追加，`history_end`=最终条数）；
-→ EV 补丁定案为"**原地读模板 EV 加 delta**"，**不得硬编码 0.7**（那是 7M5 的值）。
-→ 按机身+版本存模板的做法保留（防 darktable 升级），但实测机型相关面远小于预期。
-
-**③ 16bit TIFF 解锁（修订 §9.4b ⑥ 与 §9.4c ⑤/⑦）**：profile 默认
-`plugins/imageio/format/tiff/bpp=8`（此前导出全 8bit 的根因）；`--bpp` 被 help 标 unsupported。
-强制 16bit 的正式姿势（P2-M2 命令模板必须带）：
-
-```
---core --conf plugins/imageio/format/tiff/bpp=16
-```
-
-实测 6700 全分辨率（6520×4176 = 27MP 全幅，**非降采样**，`--width/--height` 默认 0）16bit TIFF
-= **117–127MB/张**（§9.4c ⑤ 的 45.5MB 是另一机身的样片，压缩比随画面内容变化很大）
-→ **磁盘预算按 130MB/张**，8000 张 ≈ 1TB。
-
-**④ TIFF 压缩怪癖（进坑清单，待用户周末 LR 实测）**：darktable 5.6.1 写的 TIFF `Compression`
-tag = 8（TIFF 规范名义 = LZW），但 strip 流实际是 **zlib**（`78 9c` 魔数，4176 条 strip 逐条
-精确解压尺寸吻合）。GDI+/.NET 读取正常且像素正确；**严格 LZW 阅读器（Lightroom 是否算）未知**
-→ 验收项：周末 LR 导入 `p2_notes/_smoke/deliv/` 的 16bit TIFF。若打不开，杠杆是 profile 的
-`plugins/imageio/format/tiff/compress`（当前 =2，可试 0=不压缩/其他档）。
-
-**⑤ P2-M2 验收策略（修订 §9.4c ②）**：本轮自写 Python TIFF 解码器在 strip→行映射上有 bug
-（8bit 文件解出二值数据、16bit 文件中心像素与 GDI+ 不符，原因未定位，**不要再信任自解 TIFF
-像素**）。定案：每张图**另导一份同 EV 的 JPG**（darktable 自己当解码器），用 JPG 做
-mean/峰值/过曝率交叉核对；TIFF 本体只验"存在 + 大小 + BPS tag=16"。
-
-**⑥ 暗角实测**：70-350（lensfun 路径）JPG 3×3 网格 corner/center=**0.947**、
-edge/center=**0.968**（未校正约 0.7）→ 镜头校正生效；Sigma 50（兜底路径）导出干净无畸变，
-该场景光照不均（人物阴影）径向指标不适用，符合 §9.4 预期。
-
-**⑦ 默认栈重抓流程（新机身/darktable 升级时用）**：新目录放空 `library.db`（0 字节）→
-`darktable-cli <图> <out>/ --out-ext jpg --apply-custom-presets 0 --library <dir>/library.db`
-→ 读该 db 的
-`select num,module,operation,op_params,enabled,blendop_params,blendop_version,multi_priority,multi_name,multi_name_hand_edited from history where imgid=1 order by num`
-（6700 抓得 13 条，数据全在 library.db 本体，无独立 data.db）。
-
-**⑧ 产物与资产**（`p2_notes/_smoke/`，随 p2_notes 不入库）：`deliv/` 4 件待用户肉眼验收
-（DSC02906/DSC08051 各 16bit TIFF + 同 EV JPG，EV=1.7、降噪开）；`make_sidecar2.py`（v2
-机身感知生成器，**P2-M1 Rust 移植蓝本**：模板 JSON + 版本键 + patch-or-append + 双命名）、
-`stack6700.json`、`tiff_probe.py`/`probe16.py`/`cross_cmp.py`/`check_sidecar.py`（验收工具）、
-`lib6700/`（抓栈用临时库）。`reference/xmp_template_ILCE-6700_dt5.6.1.json` 已就位。
-
-**⑨ 仍未决**（沿用 §9.4b ⑥/⑧ + 本轮新增）：`firstcut:*` GUI 保存后保留性；OpenCL；
-Kelvin→RGB 换算；降噪强度分级目视；**LR 对本轮 16bit TIFF 的兼容性**。
-
-### 9.5 历史里程碑（已停止，不实施）
-
-- **P2-M1**：环境验证 —— 安装 darktable，darktable-cli 手动跑通一张 ARW 全流程（校正+降噪+导出 TIFF/JPG）
-- **P2-M2**：Rust 编排器 —— 生成 XMP 侧车 + 调用 darktable-cli + 并发批处理 + 进度/日志
-- **P2-M3**：联动 Phase 1 —— 曝光补偿值写入侧车、按评分阈值决定开发名单
-- **P2-M4**：实测调优 —— 你的镜头跑一轮，调 lensfun 覆盖、降噪强度分级、输出验证
-
-### 9.6 历史实施清单（已停止，不实施）
-
-> 以下是已停止的 darktable 路线原始清单，仅供追溯；未勾选项不代表当前产品待办。
-
-**P2-M0 环境与可行性（历史记录；后续结论汇总于 §9.3–§9.4d）**
-- [x] 装 darktable 5.x（Windows 官方构建），确认版本 ≥ 5.0（实装 5.6.1）
-- [x] `darktable-cli` 命令行跑通一张 ARW → TIFF/JPG（正斜杠路径、`--out-ext` 等用法纠错见 §9.4c）
-- [x] `darktable-cltest` 确认 OpenCL/GPU 状态（10 分钟未返回 → 按纯 CPU 对待；neural restore CLI 批量不可用）
-- [x] 确认 neural restore 是否有 RAW 域降噪（实测不可用：GUI 面板非 iop，CLI 不执行 → 降噪改 rawdenoise + denoise profiled）
-- [x] lensfun 对 4 支镜头（24-70 GM II / Sigma 50 DG DN / 70-350G / 200-600G）的覆盖实测（已按实测重写 §9.4，并扩展为 8 支镜头全库普查）
-
-**P2-M1 侧车模板与字段映射——方案已实测定案（2026-09-18 冒烟，见 §9.4d），Rust 未开工**
-- [x] 确定写哪些模块：lens(auto) / exposure / denoiseprofile；白平衡暂缓（preset=2 路径已调研，Kelvin 换算未决）
-- [x] 手工造一份侧车，验证 darktable 确实读取并生效（EV 阶梯隔离实验 + 同 EV TIFF/JPG 像素对拍，§9.4d ①）
-- [x] Phase 1 的 EV 偏移 → darktable exposure 模块参数换算（**原地读模板 EV 加 delta**，7M5=0.7/6700=1.2，§9.4d ②）
-- [ ] 降噪强度分级策略（按 ISO？按 Phase 1 噪点分？）——需目视
-- [ ] `src/sidecar.rs` Rust 移植（蓝本 `p2_notes/_smoke/make_sidecar2.py`）+ 四模块 blob 字节级单测 + 模板版本键校验
-
-**P2-M2 Rust 编排器**
-- [ ] 新子命令 `develop <目录>`：读 Phase 1 CSV → 写 XMP → 调 `darktable-cli` → 输出 `developed/`
-- [ ] 并发批处理（darktable-cli 是独立进程，可并行 N 个）+ 进度日志
-- [ ] `--min-stars` 只开发达标的照片；断点续跑（已有输出跳过）
-- [ ] 失败重试与错误汇总；不动原片
-- [ ] 输出格式：16bit TIFF（归档）+ 高质量 JPG（分享），路径/命名规则
-
-**P2-M3 联动与验收**
-- [ ] 曝光补偿回写 Phase 1 侧车（LR 里也能看到建议值）
-- [ ] 开发结果与原片/ Lightroom 出图对比（主观 + 直方图）
-- [ ] 逐支镜头验证校正效果
-
-**P2-M4 性能与规模**
-- [ ] 100 张 ARW 批处理耗时基线
-- [ ] 磁盘占用（16bit TIFF 体积）；上万张的排队/中断恢复
-
-**需要你拍板的开放项**
-- [x] 输出只要 JPG，还是 TIFF 归档 + JPG 都要？→ **16bit TIFF 归档 + JPG**（Phase 2 原始需求；TIFF 兼容性待 LR 周末实测，§9.4d ④）
-- [ ] 要不要保留 darktable 的 `.xmp` 调色参数（方便以后手改）？注意这会让目录多一批文件
-- [ ] 白平衡：完全自动 / 按场景预设 / 保留机内？
-- [ ] 降噪强度按 ISO 分级，还是按 Phase 1 的噪点分分级？
-- [ ] 是否额外导出"高分片名单"（CSV/文本）给 LR 用？
-
-## 10. 决策记录（M6 / M7 / M8 / M9，2026-07 ~ 2026-09）
-
-> 原则：**默认值必须对任何场景站得住脚，不能是对某一批样片的拟合**；
-> 场景差异交给 `--config` / `presets/`，而不是塞进默认曲线。
-
-| # | 问题 | 决策 | 依据 |
-|---|---|---|---|
-| M6-1 | 曝光用"偏离中灰多少码值"判定，舞台黑幕布/白裙白背景被误判 | 改为 **EV 容差带**（±1 档满分，-4/+2 档归零，两侧独立） | ±1 EV 由 sRGB 传输函数算出恰好是码值 92~176，是 AE 的正常波动范围；容差带只惩罚真正越界的曝光 |
-| M6-2 | 主体脸亮度参与曝光会不会过度依赖人脸检测 | 只做**单向修正**（夹在"全图 ~ 中灰"之间） | 暗色/亮色误检框无法压低或反向推高分数；误检代价可控 |
-| M6-3 | 场景差异怎么落地 | 内置 **5 份场景预设**（`config-template --preset`），预设只调权重与 EV 容差 | 回应"不同场景要搞配置"的要求，避免把场景特例写进默认值 |
-| M6-4 | 换 `--config` 后结果不变 | 缓存键加入**配置指纹** | 此前是静默 bug：缓存命中直接返回旧的五维分数，用户会以为配置没生效 |
-| M6-5 | 如何验证曲线不是"拟合样片" | 单元测试断言 **sRGB↔EV 换算、容差带内满分、带外单调、两侧独立、单向修正** | 测试输入是合成码值而非真实照片，结论与样本集无关 |
-| M7-1 | 侧车命名 LR 读不到（实际是 darktable 约定） | 改为 `<stem>.xmp` | 该格式 LR/ACR 与 darktable **都能读**；一份侧车两边通用（用户确认最终用 LR） |
-| M7-2 | 绝对星级阈值失去区分度（119 张全落 4~5 星） | 默认改为**批次内相对分档**（10/30/65/90 百分位），绝对模式保留 | 各维度为防误杀都带中性地板，绝对分数下限被抬高；用户确认"批次内保持标准即可"。总分仍写 CSV，跨批次比较看分数 |
-| M7-3 | 同名文件跨目录互相覆盖 | 配对/索引键改为「目录 + 主干」 | 索尼编号 9999 回绕，上万张场景必然重名；实测两目录同名文件分数现已独立 |
-| M7-4 | 连拍排序用默认权重而非 `--config` 权重 | 传入实际权重 | 配置与结果不一致属静默 bug |
-| M8-1 | M7-3 的「目录+主干」配对键把"JPG/RAW 分放两个子目录"也排除了（**回归**，集成测试失败） | 改为两步配对：同目录优先 + 无歧义跨目录兜底；有歧义不配对 | 两种场景必须区分：回绕是"不同照片同名"，分目录是"同一张照片分放"；实测 testpic 31 文件 30 配对 |
-| M8-2 | `--config` 失败只警告后用默认值跑完 | 改为硬报错退出；未知字段拒绝；`star_mode`/百分位校验 | 与 M6-4 同类：显式传参却静默失效后果更重 |
-| M8-3 | EXIF Orientation 5/7 变换互换 | 改为 `flip_horizontal(rotate90(img))` / `flip_horizontal(rotate270(img))` | 5=转置、7=反对角线；原写法得到的是 rot180/transpose 互换（CACHE_VERSION 10→12） |
-| M8-4 | pose 兜底只在 `faces == 0` 时触发，只有小脸时被跳过 | 条件改为 `sharpness_region.is_none()` | 与"SCRFD 漏检 → pose"的设计意图对齐 |
-| M8-5 | 配置指纹含权重/星级阈值，改权重触发全量重算 | 指纹只保留曲线参数 | 改权重是最高频调参动作，却不需要重算 |
-| M8-6 | pose 输出是否需 sigmoid 两处注释矛盾 | 实测 248 个置信度全在 (0,1) → **已 sigmoid**，只统一注释 | 换模型前需重新核验值域 |
-| M9-1 | 每个姿态簇保留几张 | **3 张**（`keep_k` 默认 2→3，CLI `-k` 同步） | 用户定；表情成功率低的连拍留足备选 |
-| M9-2 | 单组保留总量失控（90 帧连拍多姿势） | `burst_group_cap = 20`，超出按总分从高到低截断 | 用户定；截断只动 keep 标记，不动排名 |
-| M9-3 | 默认启用还是加开关 | **默认启用** + `dedup.adaptive_keep = false` 回退旧行为（逐字节一致） | 对日常使用零操作成本；旧行为可复现 |
-| M9-4 | 姿态聚类阈值怎么定 | 0.25（描述子欧氏距离），`pose_cluster_threshold` 可配 | 棚拍实测双峰（同姿势 0.02~0.06 / 跨姿势 0.46~0.51），0.25 居中余量 4×；舞台连续场景粒度合理 |
-| M9-5 | M9 会不会改变评分 | 不会：只改 burst 三列；archive 119 张回归星级逐档一致（12/24/41/31/11） | 描述子仅进去重，不参与五维分数 |
-
-## 11. 交付方式
-
-初筛和复核工具已通过 v1.0–v1.2 Release 交付；当前产品约定以 §0.1 为准。§9 的 darktable Phase 2 已停止。
-每次改动必须同步更新 `README.md` / `DESIGN.md`，不允许文档与实现状态不一致。
-
-## 12. UI 规划（M-UI1 复核 + M-UI2 操作台，已实现）
-
-> 需求来源：gallery 是按 119 张验证规模做的（base64 内嵌、单文件 HTML、每次全量重新解码），
-> 上万张时 HTML 达数百 MB 且无法交互对比；选片复核需要"缩略图看不清是否合焦时
-> 能随时开 100% 原图、连拍组内并排对比"。
-
-### 12.1 选型结论（2026-09 定案）
-
-**axum 本地服务 + 内嵌 vanilla JS 前端（浏览器即客户端）**。
-
-| 候选 | 结论 |
+| 照片根目录下的路径 | 用途 / 保留方式 |
 |---|---|
-| **axum + 浏览器**（选定） | 纯 cargo、零 npm 工具链；图片密集体验是浏览器主场；HTML/JS 对 AI 协作开发最友好；HTTP API 将来可平移进 Tauri |
-| **Windows 原生选目录启动器** | 已实现为 `firstcut-ui.exe`：双击弹出目录选择器，先启动 axum 与浏览器，再异步构建快照；页面显示扫描阶段和文件计数，并可随时换目录、切换 JPG/RAW 关联。未命中评分可选择原评分目录或继续未评分浏览。复核页面提供重启服务/退出程序入口，评分期间拒绝关闭；再次双击可找回仍在运行的页面。启动器会从 exe 邻近目录定位模型；CLI 与 UI 共用照片根 `.firstcut/` 默认缓存、配置、RAW 偏好和跳过 Processed 规则；扫描根目录使用缓存兼容的普通 Windows 绝对路径。保留 CLI 主程序，不引入 WebView 或 Node 工具链 |
-| Tauri 2（Rust+WebView2） | 当前不需要桌面壳；前端资产仍可在未来复用 |
-| egui / Slint | 立即模式/声明式 GUI 做大图缩略图墙+自由缩放对比的开发成本高，弃 |
-| Dioxus | Rust 写 UI心智成本高，生态不如直接写 JS，弃 |
+| `.firstcut/cache.sqlite` | 可重建的分析缓存 |
+| `.firstcut/decisions.sqlite` | 人工星级决定，随照片备份 |
+| `.firstcut/burst-overrides.json` | review 人工保留/舍弃覆盖，需保留 |
+| `.firstcut/scene-feedback.jsonl` | 场景纠正、备注与当时评分线索，需保留 |
+| `.firstcut/config.toml` | 当前评分配置；不存在时使用内置默认值 |
+| `.firstcut/ui-preferences.json` | RAW 关联和直方图抽样比例等照片根级偏好 |
+| `.firstcut/report.csv`、`scan-report.csv`、`metrics.csv` | 评分、扫描和调参报告 |
+| `.firstcut/thumbs/v2/` | 按照片清单身份生成；8192 个固定槽、每槽最多 64 KiB，碰撞时可重新生成 |
+| `.firstcut/review.log` | 评分任务时间日志，严格限制为单文件 256 KiB |
+| 照片旁的 `<stem>.xmp` | 唯一有意放在照片旁的元数据导出，供 Lightroom 发现 |
 
-### 12.2 M-UI1 已实现范围（复核视图）
+默认应用状态集中到 `.firstcut/`。CLI 显式 `--cache`、`--output`、`--config` 可覆盖对应路径；旧工作目录缓存不自动猜测或搬移，可用 `--cache` 明确读取。`config-template` 没有照片根参数，默认写当前目录 `.firstcut/firstcut-template.toml`；gallery 默认输出到输入报告旁，常规工作流因此仍在 `.firstcut/`。
 
-- **形态**：CLI `pic_process review <目录> [--config x.toml] [--cache x.sqlite] [--bind 127.0.0.1] [--port 8787]`，或 Windows 双击 `firstcut-ui.exe` 选择目录。桌面启动默认仅绑定 127.0.0.1；容器可显式绑定 `0.0.0.0` 接收 Docker 转发，并应把宿主端口限制在 127.0.0.1。图像位于 `JPG/`、`RAW/` 子目录时应选择它们的共同上级目录。UI 可随时重新选目录；RAW 关联是每个照片根目录单独保存的偏好，关闭后扫描和跑批均只处理 JPG。CLI 与 UI 默认跳过所选根目录下的 `Processed/` 输出子树，需复核成片时可直接选择该目录。`score`、`review` 默认共同使用 `.firstcut/cache.sqlite` 和 `.firstcut/config.toml`；其他默认报告及状态也统一置于 `.firstcut/`，避免因进程工作目录变化而漏掉已有评分。XMP 侧车保留在照片旁，供 Lightroom 识别。
-- **数据流**：不依赖 CSV——`scan_directory` + 按当前配置指纹过滤缓存行 → 内存快照；**星级/连拍信息在启动时用当前配置现算**（与 `score` 同一函数，保证逐张一致）；缓存未命中的照片显示"未评分"。
-- **API**：`GET /`（内嵌前端）、`GET /api/photos`（JSON 快照）、`GET /thumb?p=`（320px 缩略图，按需生成落盘 `<照片根>/.firstcut/thumbs/`，已存在按 size+mtime 跳过）、`GET /image?p=`（原图直读，100% 预览零预生成成本）。
-- **安全**：默认服务仅绑定 127.0.0.1，API 校验本机 Host/Origin；Docker 示例只发布到宿主 127.0.0.1。所有 `p` 参数 canonicalize 后强制在扫描根目录内（越界 403）；扩展名白名单。
-- **前端**（无构建步骤）：缩略图墙（分页 500/页 + lazy）；筛选（星级/保留/五维下限/有人脸/文件名搜索）+ 排序，条件持久化 localStorage；**单图 1:1 灯箱**（滚轮缩放 + 拖拽平移 + 双击复位，`←/→` 同连拍组切换）；**连拍组并排对比**（2~4 窗格共享同一 transform，滚轮/拖拽同步缩放，检查合焦的眼睛）。
+### 3.3 缓存与配置语义
 
-### 12.3 M-UI2 已实现范围（操作台）
+缓存命中依据为文件路径、大小、修改时间、`CACHE_VERSION`、配置曲线、分析模式与模型文件大小/修改时间指纹。当前缓存版本为 15；它是实现常量，不是发行版本。缓存命中跳过解码与 AI，写入只更新 dirty 行。
 
-- **score 流程抽库**：`score::run_score_job(dir, cfg, opts, on_event)`——`score` 子命令
-  与 UI 跑批共用同一实现（重构等价性验收：CSV 逐字节一致）；进度经回调上报。
-- **UI 内跑批**：侧栏触发，全局单任务互斥，`/api/job` 轮询进度与日志；
-  完成后快照热替换（无需重启服务）。
-- **UI 内改星**：`/api/rate` 写 XMP 侧车（只改 Rating、firstcut 子分保留、
-  他人侧车 409 保护）；跑批进行中禁改。
-- **配置编辑**：`/api/config` GET/POST，`toml_edit` 保留注释与字段顺序；
-  写盘前经 `load_config_text` 全量校验，非法值拒绝。
-- **扫描器防污染**：`scan_directory` 跳过 `.firstcut/` 缓存子树
-  （缩略图不会被当成照片重新评分——M-UI2 实测发现的 bug）。
+权重、星级阈值和连拍参数在运行期重新合成建议，不应触发无必要的图片分析；清晰度/噪点/曝光曲线等缓存输入变化才重新分析。模型文件指纹不是内容加密哈希，不保证识别大小和修改时间均未变的替换。
 
-### 12.4 后续里程碑
+显式配置文件不存在、未知字段、非法模式、NaN/无穷值、越界参数或错误的容差带顺序均须报错退出，不静默回退默认值。UI 保存前执行同一配置校验，使用 `toml_edit` 保留注释与字段顺序。默认权重和应为 1.0，校验容差为 ±0.05。
 
-- **后续**：用用户真实选片结果验证候选覆盖率与误删率，再决定是否扩展复核工作流；darktable develop 操作台不再计划实施。
-- **Linux 容器**：实现 Dockerfile、Compose 本机目录挂载和 GHCR 双架构发布；CI 使用 x86_64 与 ARM64 原生 runner 分别构建和冒烟测试。Apple Silicon 用户使用 Docker Desktop 的 `linux/arm64` 镜像；原生 macOS ARM64 需另外启用并验证 CoreML，Intel macOS 当前受锁定 ONNX Runtime 预编译目标限制。
+## 4. 评分、星级与连拍
+
+### 4.1 五维分析
+
+| 维度 | 默认权重 | 当前规则与取舍 |
+|---|---|---|
+| 清晰度 | 0.30 | 全局 Tenengrad 归一化与饱和映射；主体区域使用 reblur P80。SCRFD 主体脸 → 无可用主体脸时 pose 头部区域 → 都无则中性 50 下限；区域与全局取高者 |
+| 曝光 | 0.25 | 极暗 ≤5 / 极亮 ≥250 像素比例惩罚 + EV 容差带；全图截尾均值排除最暗 25%，主体脸只向中灰方向修正 |
+| 噪点 | 0.15 | 暗部 <40 的 8×8 块标准差 P15，取平滑暗块减轻纹理污染；ISO 容忍度 `k = 3.0 × (1 + 0.3 × log10(iso/100))` |
+| 构图 | 0.15 | 主体脸三分法位置、大小和多人降权；主体脸高度 ≥4%，多人计数门槛为 5%；无人脸中性 60 |
+| 美学 | 0.15 | CLIPIQA+，224×224、CLIP 归一化、sigmoid 输出 ×100 |
+
+清晰度人脸区域半宽/半高为脸框尺寸 ×1.5，实际约 3× 脸框；pose 使用头部关键点包围盒 ×1.4/×1.6。区域与全局取最大值可以保护浅景深照片，但背景纹理也可能救回真实跑焦照片，这项取舍尚未改为只取主体分。
+
+曝光目标默认 128；±1 EV（约码值 92–176）内满分，暗侧到 -4 EV、亮侧到 +2 EV 归零，两侧容差独立。主体级人脸中取最亮脸区域均值，只把判断值往中灰方向拉且不越过中灰，避免误检框压低正常照片分数。舞台、雪景等差异由预设配置表达，不为某批样片改全局默认值。
+
+构图中脸高 8%–30% 为理想大小，小于 8% 线性降至 0.5，大于 30% 系数降至 0.75；三分法距离上限 0.47；多人系数为 1 人 1.0、2–4 人 0.95、5 人以上 0.85。当前预处理使用 resize_exact，尚未实现保长宽比的 letterbox；遮挡脸和极大脸仍可能漏检。
+
+五个子分按实际配置权重合成总分。场景预设 `portrait`、`stage`、`highkey`、`sports`、`lowlight` 是用户手动选择的配置，不是逐张自动识别的结果。
+
+### 4.2 星级
+
+默认批次相对排名，0 表示最好：前 10% 为 5★，10%–30% 为 4★，30%–65% 为 3★，65%–90% 为 2★，其余为 1★。同分并列用平均位次，不拆分星级。小批次不保证出现所有星档；建议整场活动一次评分，跨批次比较应看同配置/模式下的总分。
+
+`star_mode = "absolute"` 可切到绝对阈值，默认 75/60/45/30。人工星级优先于以上算法值；修改评分配置不能覆盖人工决定。
+
+### 4.3 连拍候选
+
+按 EXIF 时间排序，非负且 ≤2s 的相邻间隔聚为连拍组；组内 dHash（9×8 → 64 bit，汉明距离 ≤10）分近似子簇，再按 SCRFD 五关键点归一化的 10 维姿态描述子贪心聚类。姿态距离阈值默认 0.25；每个姿态簇按实际加权总分保留 top-K，默认 3 张，单组总保留上限 20。
+
+无有效姿态描述子的帧共用伪簇；`adaptive_keep = false` 回退到 dHash 子簇保留；`-k` 显式值优先于配置。`burst_size` / `burst_rank` 对应保留单元，不一定是整组张数。姿态只影响候选，不改变五维分数和星级。保留/舍弃是建议或人工标记，不是文件删除操作。
+
+## 5. 处理链路与模块职责
+
+```text
+扫描/EXIF/配对 → 缓存匹配 → JPG 解码与像素指标 → AI/主体/美学
+    → selection（当前权重、星级、连拍、人工星级）
+    → CSV / XMP / review 快照
+```
+
+| 模块 | 职责 |
+|---|---|
+| `main.rs`、`bin/firstcut_ui.rs` | CLI 参数和 Windows 选目录启动器 |
+| `scan.rs`、`decode.rs` | 扫描配对、EXIF、JPEG 快速解码与安全兜底、方向应用 |
+| `metrics/`、`ai/`、`score.rs` | 五维指标、ort 模型推理、分析调度和共用跑批入口 |
+| `cache.rs`、`config.rs` | 缓存匹配/增量写入、配置与指纹、预设 |
+| `dedup.rs`、`selection.rs`、`decision.rs` | 连拍算法、最终星级合成、人工星级持久化 |
+| `output/` | CSV 与 XMP 渲染、管理字段合并 |
+| `review/` | axum 服务、快照、任务/日志、配置编辑、场景反馈、缩略图和内嵌前端 |
+| `bin/tune.rs`、`gallery.rs`、`debug_*`、`probe.rs` | 调参、联系表和模型/像素诊断 |
+
+JPEG 使用 `jpeg-decoder` 快速路径、`image` 兜底，全解码后 box 块平均到约 1024px 分析图；灰度 JPEG 走安全路径。EXIF Orientation 1–8 在降采样后应用，5/7 为先旋转后镜像。像素任务使用 rayon；AI 使用 ort 池化 Session/Mutex，当前单 Session 策略，历史实测增加池未改善性能。
+
+三模型为 SCRFD 10g（640×640、阈值 0.3 与 NMS）、YOLOv8n-pose（640×640、输出 `[1,56,8400]`）和 CLIPIQA+。模型元数据、输出值域和通道布局应在换模型时重新验证。实验性 Windows DirectML 通过 `gpu` feature 和 `--gpu` 启用，默认 CPU；历史样本加速不显著。
+
+## 6. XMP 与曝光建议
+
+侧车命名固定为 `<stem>.xmp`。同目录 JPG/ARW 共用侧车，跨目录配对则两端各写一份同名侧车，星级一致。导出包含 `xmp:Rating`、firstcut 五维子分与连拍信息；曝光容差带外才给建议，按 1/3 EV 取整、默认钳位 ±2 EV，`exposure_suggest_cap = 0` 关闭建议。
+
+`firstcut:suggestedEV` 是信息元数据，`crs:Exposure2` 是给 Lightroom 的开发参数；程序不修改照片像素。含 firstcut 命名空间的已有侧车仅合并受管理字段，保留其他 XML；无 firstcut 标记的侧车不覆盖，解析失败保护原文件。用户在 Lightroom 中改过的 firstcut 管理字段仍可能在再次导出时被更新，不能承诺保护这些字段的后续人工修改。
+
+人工决定保存与侧车写入不是同一个事务：XMP 同步失败应提示，但已保存的人工星级仍有效。真实 Lightroom 导入与曝光效果尚未验收，不能用 XML 测试替代。
+
+## 7. 本地 Web UI 与交互约定
+
+选择 axum + 内嵌 vanilla JS，纯 Cargo 构建，无 npm/WebView 依赖。CLI `review` 与 Windows 启动器共用服务；启动后先显示页面，再异步读取快照，报告扫描阶段、计数与可确定总量时的进度，完成后自动刷新。评分缺失时提示选择原评分目录或继续未评分浏览，不强制重算。
+
+- 缩略图墙分页懒加载，筛选和排序自动记忆；默认按连拍组聚合，每组显示当前排序最靠前的一张，指定组后显示全部。照片右键可快速筛组及设置 review 保留覆盖。
+- 星级、分数下限及说明可折叠，桌面侧栏可拖宽，双击边界复位，窄屏可收起。筛选、折叠状态及面板位置等部分设置保存在浏览器 localStorage。
+- 灯箱支持原图缩放/拖动、双击复位、组内切换、2–4 张并排对比与百分比显示；对比共用图像归一化锚点及缩放状态。EXIF 光圈/快门/焦段用 `f/`、`s`、`mm` 明确标识。
+- 评分面板跟随活动照片，可拖动和调整大小；列出子分、实际权重与贡献。人像候选只是规则线索；用户可保存真实场景与备注，供后续校准，不自动切换评分参数。
+- 配置表单提供说明、建议范围、滑块与输入框，不把 M9、M-UI2 等规划编号暴露在产品文案中。
+- UI 内跑批使用 `score::run_score_job`，全局单任务互斥；轮询进度与日志，完成后热替换快照。跑批期间限制改星和服务控制，避免竞争。
+- Windows 启动器页面提供选目录、RAW 关联、重启与退出；关闭浏览器不等于停止服务，再次双击可打开仍在运行的页面。CLI review 使用 Ctrl+C 退出。
+
+### 7.1 直方图与性能边界
+
+半透明可拖动面板默认位于图像文件名下方，可显示/隐藏；W/R/G/B 通道可分别开关，并跟随对比中的活动照片。横轴为解码后 JPEG 8-bit 码值 0–255，纵轴为当前可见通道共同峰值归一化的相对频数；W 用 `.2126R + .7152G + .0722B` 近似亮度，不是物理亮度单位或 HDR nits。
+
+浏览器以关闭平滑的 Canvas 最近邻缩图近似网格抽样，默认 10%，照片根级设置允许 1%–25%。只缓存在内存（最多 8 个结果），不生成直方图文件。它独立于后端约 1024px 的评分分析图，不因调整直方图比例而改变评分。
+
+抽样比例主要影响 Canvas、RGBA 读取及逐像素计数，开销随样本数近似线性；不会同比缩短原图解码耗时。33MP 图像的 10% 约 330 万采样点，单份 RGBA 像素数组约 13.2 MB（12.6 MiB），还需 Canvas、原图解码等额外内存，不能当作整个浏览器的峰值。10% →25% 的采样阶段工作量约为 2.5 倍；这些是规模估算，没有跨设备耗时保证。固定网格可能漏掉少量极值，暗部/亮部百分比仅作估计，不能替代精确裁切检查；当前仅适用于 SDR JPEG。
+
+### 7.2 日志与接口
+
+任务日志带本地时间，页面显示有界缓冲，落盘仅 `.firstcut/review.log`；上限 256 KiB，超限保留最近约 128 KiB，超长单行截断，不无限叠加轮转文件。
+
+主要接口：`/api/photos` / `/api/load` 读取快照与加载状态，`/thumb` / `/image` 提供图片，`/api/job` / `/api/score/run` 查询/启动评分，`/api/rate` / `/api/burst/keep` / `/api/scene-feedback` 保存人工操作，`/api/config` / `/api/ui-settings` 管理设置，`/api/control` 提供启动器服务控制。
+
+## 8. 安全、验证与发布
+
+默认只监听 `127.0.0.1:8787`。复核链接中的访问凭据不进入普通 HTTP 请求地址；页面兑换服务会话后清除链接片段。会话按浏览器的协议、主机名和端口保存，由请求头显式发送，完整进程退出后失效。访问校验在路由统一处理：公开页只返回页面框架与脚本，图片与照片元数据需要有效会话；写接口还要求匹配服务地址的 Origin 和 JSON 请求体。响应禁止第三方站点加载；原图只按当前快照的 JPG 身份读取并流式传输。
+
+`.firstcut/`、自动导出的 XMP 与相册照片通过打开的目录句柄定位，逐级拒绝符号链接、Windows 重解析点与有多条硬链接的文件。数据库从安全打开的文件读入，SQLite 不直接操作相册内的文件名；拒绝未关闭或有待恢复日志的库，保留原件。普通状态以新文件完整写入后原子替换；日志与场景反馈受大小和文件身份约束。场景反馈达到 16 MiB 时拒绝继续追加并提示归档。分析限制为单图 128 MiB、1.1 亿像素和进程内最多两次并行解码；原图接口发送体积同样上限 128 MiB。
+
+HTML 联系表转义所有元数据，只允许运行固定的排序脚本；读取的 JPG 必须位于选定照片根内。面向表格使用的 CSV 默认保护可能被当作公式的文本，显式 `--raw-csv` 留给程序读取。推理仅加载 README 中固定 SHA‑256 的模型。
+
+容器显式监听 `0.0.0.0` 接收 Docker 转发，必须配置访问凭据；Compose 将宿主端口限定在 `127.0.0.1`。照片根以读写方式挂载，以保存状态和 XMP，模型单独挂载。运行用户映射到宿主 UID/GID。构建上下文按源码清单纳入文件，排除本地 `memory.md`、照片和状态。
+
+| 工作流 | 触发与交付 |
+|---|---|
+| CI | main push / PR，Windows、Linux x64/ARM64 测试、构建与 RustSec 依赖审计；Windows 发行程序使用合成照片验证登录、取图和评分，Linux 双架构镜像以归档执行静态漏洞扫描 |
+| CodeQL | main push / PR、定时或手动，扫描 Rust 与 Actions |
+| Dependabot | 提出依赖更新 PR；须验证配置/XMP/缓存兼容性，不能只凭版本号合并 |
+| Release | 标签必须指向通过 CI 和 CodeQL 的 main 提交；核对 Cargo 版本，构建 Windows 程序与 SHA256，两架构镜像通过静态扫描后按摘要发布，附构建证明；手动触发只留临时工件 |
+
+发布前对齐 Cargo.toml / Cargo.lock / 版本说明，main CI 通过后推 tag。源码、文档、无敏感内容的测试可以提交；私人照片、真实本地测试集、模型、凭据与本地沟通记录不得发布。仅更新文档时检查内容、链接与 diff，不需为此重跑与变化无关的全量代码测试。本次未重新查询远端发行或告警状态，历史通过记录见档案。
+
+涉及行为变化时运行适当测试；完整测试命令为 `cargo test --locked --all-targets`，内嵌前端脚本提取后执行 `node --check`。记录平台、命令、退出码、跳过项及真实图库验收范围，不把旧测试数当当前实时结果。缓存值语义变化应递增 `CACHE_VERSION`，仅权重/阈值变化不应无谓清空缓存。代码改动同步更新 README / 设计约定，历史过程只追加到档案。
+
+## 9. 后续工作与未验收项
+
+| 优先顺序 | 方向 | 理由与验收重点 |
+|---|---|---|
+| 1 | 统一人工连拍保留决定与导出 | 接入独立决定模型和 selection，验证 CLI、review、CSV/XMP 同一规则；不让 UI 覆盖孤立在 JSON |
+| 2 | 建立真实选片标注集 | 检查好片被排除率、每组最佳帧候选覆盖率，再决定权重/阈值优化；单次“界面可用”不能代表算法质量验收 |
+| 3 | Lightroom 实际导入 | 核对 JPG/ARW 配对、星级、firstcut 字段和 `crs:Exposure2` 的实际显示及效果 |
+| 4 | 模型输入和主体可靠性 | letterbox/坐标反算、遮挡和超大脸、主体分策略均需检出率与选片回归，不能无验证直接替换 |
+| 待单独设计 | 原生 macOS / HDR | Apple Silicon 原生需验证 CoreML 与发行链路；HDR 需设计色彩管理、亮度域及增益图语义，不能把 SDR 直方图直接当 HDR 支持 |
+
+旧 M 系列编号只用于查历史；停止的 darktable 编排器、旧 GUI 验证清单不属于本表的计划。本文件不将后续方向视为已授权实现，本次只做文档整合。

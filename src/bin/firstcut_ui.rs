@@ -1,13 +1,12 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+#[cfg(windows)]
 use std::path::PathBuf;
 
 #[cfg(windows)]
 fn main() {
     if already_running() {
-        let _ = std::process::Command::new("cmd")
-            .args(["/C", "start", "", "http://127.0.0.1:8787/"])
-            .spawn();
+        let _ = pic_process::review::open_review_browser("http://127.0.0.1:8787/");
         return;
     }
 
@@ -42,11 +41,13 @@ fn already_running() -> bool {
         return false;
     };
     let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
-    if stream.write_all(b"GET /api/control HTTP/1.1\r\nHost: 127.0.0.1:8787\r\nConnection: close\r\n\r\n").is_err() {
+    if stream.write_all(b"GET /healthz HTTP/1.1\r\nHost: 127.0.0.1:8787\r\nConnection: close\r\n\r\n").is_err() {
         return false;
     }
     let mut response = String::new();
-    stream.read_to_string(&mut response).is_ok() && response.contains("\"enabled\":true")
+    stream.take(4096).read_to_string(&mut response).is_ok()
+        && response.starts_with("HTTP/1.1 200 ")
+        && response.ends_with("\r\n\r\nfirstcut-review")
 }
 
 #[cfg(windows)]
@@ -65,7 +66,7 @@ fn run_review(root: &std::path::Path) -> anyhow::Result<()> {
 
 #[cfg(windows)]
 fn use_model_directory_beside_executable() -> anyhow::Result<()> {
-    if pic_process::ai::ensure_models().is_ok() {
+    if std::env::var_os("FIRSTCUT_MODEL_DIR").is_some() || pic_process::ai::ensure_models().is_ok() {
         return Ok(());
     }
     let exe = std::env::current_exe()?;

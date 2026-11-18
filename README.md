@@ -5,13 +5,15 @@
 **CSV 报告**和 **XMP 星级侧车**。全程本地运行、照片不上传。
 
 > 当前状态：**v1.4.1** 加固人工评分存储路径并更新兼容依赖；继续提供 Windows 程序、Linux amd64/ARM64 容器与 Apple Silicon Docker 使用方式。现有配置、评分缓存和 XMP 无需迁移。当前只支持 SDR JPEG。
-> 当前方向：本地初筛、人工复核、Lightroom 元数据交接。darktable 批量 RAW 开发路线已停止；历史调研保存在 `DESIGN.md` §9。
+> 当前方向：本地初筛、人工复核、Lightroom 元数据交接。darktable 批量 RAW 开发路线已停止；历史调研保存在 [项目历史档案](docs/HISTORY.md#5-已停止的-darktable-raw-开发研究原设计-9)。
+>
+> 文档入口：[使用说明](#构建) · [当前设计](DESIGN.md) · [版本说明](release_notes.md) · [评审与历史决策](docs/HISTORY.md) · [安全政策](SECURITY.md)。文档于 2026-11-05 基于 v1.4.1 代码整理；旧里程碑不作为当前待办。
 
 ## 构建
 
 ```bash
 cargo build --release
-# 可选：实验性 DirectML GPU 推理（score --gpu；实测无显著收益，见 DESIGN §8）
+# 可选：实验性 DirectML GPU 推理（score --gpu；历史实测无显著收益，见设计文档）
 cargo build --release --features gpu
 ```
 
@@ -28,8 +30,8 @@ cargo build --release --features gpu
 | `pic_process-debug-exposure` | 诊断工具：全图亮度 vs 主体脸亮度 |
 | `pic_process-probe` | 诊断工具：打印 ONNX 输入输出元数据 |
 
-> `pic_process.exe` 主二进制已静态链接 onnxruntime，单文件免 DLL；
-> 辅助二进制也随 release 一同构建，可按需取用。
+> Windows 程序静态链接 ONNX Runtime，依赖 Windows DirectML 和 Visual C++ 运行时。
+> Release 提供 UI、CLI、gallery、tune 四个程序；诊断工具可从源码按需构建。
 
 ### 双击启动复核 UI（Windows）
 
@@ -41,6 +43,10 @@ cargo build --release --features gpu
 
 命令行用户继续运行 `pic_process review <照片目录>`。`scan`、`score` 和 `review` 默认都以照片目录作为状态归属位置，将缓存、报告和配置放到 `<照片目录>/.firstcut/`；显式传入 `--cache`、`--output` 或 `--config` 时以指定路径为准。`config-template` 没有照片目录参数，默认写入当前目录的 `.firstcut/firstcut-template.toml`；`tune` 默认写入照片目录 `.firstcut/metrics.csv`，`gallery` 默认把 HTML 联系表写在输入报告同目录。已有旧版工作目录缓存不会自动搬移；如需继续读取，CLI 可用 `--cache <旧缓存文件>` 显式指定，避免错误地把另一图库的缓存当成本目录数据。
 
+复核链接会自动登录。`--no-browser` 模式请复制终端给出的完整链接；链接里的访问凭据不要分享。直接打开不带凭据的地址时，需要已有会话或手动登录。正常关闭的旧版评分库与人工评分库无需迁移；如果程序提示有数据库旁路日志，请保留原库及日志，在可信位置恢复并正常关闭，再重新打开。程序会拒绝通过链接或 Windows 重解析点读取、写入相册状态。
+
+`scan`、`score` 和 `tune` 默认将可能被电子表格解释为公式的文本单元格加上文本标记；供脚本读取的原始 CSV 可用 `--raw-csv`，不要直接用表格应用打开来源不可信的原始报告。联系表只读取照片根内的 JPG；报告在别处时用 `--photo-root <照片目录>` 明确指定。
+
 XMP 是唯一有意写在照片旁边的导出物：Lightroom 通过照片同目录的标准侧车文件识别星级和曝光建议。其他 firstcut 状态和报告不会散落在照片根目录。
 
 ## Linux 容器（Linux / macOS）
@@ -49,11 +55,12 @@ Release 工作流在 Windows 测试通过后，会构建并发布 `linux/amd64` 
 
 首次发布后，需要在 GitHub 仓库关联的 `firstcut` container package 设置中把可见性改成 Public，朋友才能匿名拉取镜像。GHCR 新建的 package 默认是 Private。
 
-macOS 上先安装并启动 Docker Desktop，然后克隆仓库，把 `.env.example` 复制为 `.env` 并填写照片与模型目录：
+macOS 上先安装并启动 Docker Desktop，然后克隆仓库，把 `.env.example` 复制为 `.env` 并填写照片与模型目录。运行 `openssl rand -hex 32` 生成访问凭据，把输出写入 `FIRSTCUT_ACCESS_TOKEN`：
 
 ```dotenv
 PHOTO_DIR=/Users/你的用户名/Pictures/活动目录
 MODEL_DIR=/Users/你的用户名/firstcut-models
+FIRSTCUT_ACCESS_TOKEN=<上一步生成的随机凭据>
 ```
 
 在终端启动时，把照片目录写权限映射给当前 macOS 用户，再启动容器：
@@ -65,15 +72,15 @@ docker compose pull
 docker compose up -d
 ```
 
-访问 <http://localhost:8787>；结束后运行 `docker compose down`。`PHOTO_DIR` 必须是活动照片根目录，容器会在其 `.firstcut/` 下读取和保存评分、配置、缓存、缩略图及日志，因此该目录以读写方式挂载。端口只发布到本机回环地址。模型目录挂载到容器的 `/app/models`；没有模型时仍可浏览已有评分，AI 重评分会按程序现有规则降级或提示。
+访问 <http://127.0.0.1:8787>，在登录页输入刚配置的凭据；结束后运行 `docker compose down`。`PHOTO_DIR` 必须是活动照片根目录，容器会在其 `.firstcut/` 下读取和保存评分、配置、缓存、缩略图及日志，因此该目录以读写方式挂载。端口只发布到本机回环地址。模型目录挂载到容器的 `/app/models`；没有或未通过校验的模型会让重评分降级为纯像素模式。
 
-Linux 主机也使用同一 Compose 配置。若要直接运行 CLI，可用 `pic_process review <照片目录> --bind 0.0.0.0 --no-browser`；容器使用此监听地址是为了接收 Docker 转发的连接，宿主端口应像 Compose 示例一样只绑定 `127.0.0.1`。
+Linux 主机也使用同一 Compose 配置。直接运行 CLI 时默认只监听本机。需要 `--bind 0.0.0.0` 时必须提供 `FIRSTCUT_ACCESS_TOKEN`。宿主端口映射有变化时，将 `FIRSTCUT_PUBLIC_URL` 设为浏览器实际打开的地址；使用反向代理时，需要保留外部 Host 和 Origin，非本机地址须用 HTTPS。
 
 当前锁定的 ONNX Runtime 版本提供 Linux x86_64 与 ARM64 CPU 运行库；CI 和镜像发布会分别在 x86_64、ARM64 原生 runner 上测试和构建。M 芯片用户通过 ARM64 容器可用 CPU 推理。原生 macOS Apple Silicon 也有继续支持的路径，但需要启用并实际验证 CoreML；当前先不把原生 macOS 程序列入发行承诺。该 ONNX Runtime 版本没有 Intel Mac 预编译目标。
 
 ## 自动检查与发布
 
-GitHub Actions 的 [CI 工作流](.github/workflows/ci.yml) 在提交到 `main`、向 `main` 提交 PR 时运行 Windows、Linux x86_64 和 Linux ARM64 测试，Windows job 同时构建发行程序。[Release 工作流](.github/workflows/release.yml) 在推送版本标签时重新测试、构建 Windows 发行程序和 Linux 双架构容器；两种容器镜像均成功后才创建 GitHub Release。GHCR 提供不带架构后缀的多架构版本标签及 `latest`。手动运行 Release 工作流只构建并保存 14 天的 Windows 临时工件，不会发布新版本。
+GitHub Actions 的 [CI 工作流](.github/workflows/ci.yml) 在提交到 `main`、向 `main` 提交 PR 时运行 Windows、Linux x86_64 和 Linux ARM64 测试，并检查 RustSec 公告。Windows 构建后对四个 EXE 执行 `cargo audit bin`，主程序用合成照片检查登录、原图、缩略图和重新评分。AMD64 和 ARM64 容器以镜像归档为输入，由 Trivy 静态扫描系统包和嵌入程序的 Rust 依赖。[Release 工作流](.github/workflows/release.yml) 要求标签指向 `main` 上已通过 CI 与 CodeQL 的提交。发布时 Windows 验证和两架构镜像扫描通过后，才更新 GHCR 的版本标签和 `latest`，随后发布带 GitHub 构建证明的 Windows 产物。手动运行 Release 工作流只保留 14 天的 Windows 临时工件。
 
 发布新版本时，先将 `Cargo.toml` 中的版本号和 `Cargo.lock` 更新并合入 `main`，确认 CI 通过，然后推送对应标签。例如 `1.4.1` 使用 `v1.4.1`。发布任务会核对标签与版本号，GitHub 自动生成发行说明。`v1.2` 是此前手动发布的版本；后续版本使用自动发布流程。模型文件和本地照片不会进入发行包。
 
@@ -83,12 +90,11 @@ GitHub Actions 的 [CI 工作流](.github/workflows/ci.yml) 在提交到 `main`�
 
 | 文件 | 来源 | 大小 |
 |---|---|---|
-| `clipiqa_model.onnx` + `.onnx.data` | [86Cao/IQA-ONNX-Models](https://huggingface.co/86Cao/IQA-ONNX-Models)（CLIP-IQA+，learned prompts 烘焙进模型） | ~153MB |
-| `scrfd_10g_bnkps.onnx` | [RuteNL/SCRFD-face-detection-ONNX](https://huggingface.co/RuteNL/SCRFD-face-detection-ONNX)（InsightFace SCRFD 10g，小脸检测强） | 16.9MB |
-| `yolov8n_pose.onnx` | [Xenova/yolov8n-pose](https://huggingface.co/Xenova/yolov8n-pose)（人体姿态，人脸漏检时定位头部） | 13.5MB |
+| `clipiqa_model.onnx` + `clipiqa_model.onnx.data` | [86Cao/IQA-ONNX-Models 固定版本](https://huggingface.co/86Cao/IQA-ONNX-Models/tree/2e32ab1ad40c592da9d199f4c7fb8a2383bbae94)（保留原文件名） | ~153MB |
+| `scrfd_10g_bnkps.onnx` | [RuteNL 的 10g_bnkps.onnx](https://huggingface.co/RuteNL/SCRFD-face-detection-ONNX/blob/3d9a1b3bc9f8a50635817929118fb9184f5bc30b/10g_bnkps.onnx)（下载后改成左侧文件名） | 16.9MB |
+| `yolov8n_pose.onnx` | [Xenova 的 onnx/model.onnx](https://huggingface.co/Xenova/yolov8n-pose/blob/da4224085e2f6ce4c9ff9b670e28765194619db2/onnx/model.onnx)（下载后改成左侧文件名） | 13.5MB |
 
-模型缺失时 `score` 自动降级为纯像素评分并提示；`--no-ai` 可显式跳过。CSV 的 `analysis_mode` 标明本次是 `ai` 还是 `pixel`；两种结果使用不同缓存指纹，模型文件变化也会使 AI 缓存失效。
-下载后放到 `models/` 即可，无需 `download-models` 子命令。
+推理前会核对这些固定版本的 SHA‑256。模型缺失或无法通过校验时，`score` 会提示并降级为纯像素评分；`--no-ai` 可显式跳过。CSV 的 `analysis_mode` 标明本次是 `ai` 还是 `pixel`；两种结果使用不同缓存指纹，模型文件变化也会使 AI 缓存失效。下载后放到 `models/`，或通过 `FIRSTCUT_MODEL_DIR` 显式指定模型目录。
 
 ## 用法
 
@@ -257,7 +263,7 @@ pic_process review <目录> --port 9000 --config stage.toml
   重启复核界面、重新评分或导出后仍使用人工星级；他人侧车不覆盖。侧车同步失败时，界面会提示，人工决定仍然保存。
 - **配置编辑**：权重/星级阈值/EV 容差/[dedup] 表单化编辑，
   保存保留 TOML 注释，非法值（权重和越界等）拒绝写盘。
-- 默认 UI 配置位于照片根目录的 `.firstcut/config.toml`，再次打开 review 会自动加载；UI 跑批报告位于 `.firstcut/report.csv`。CLI 使用 UI 配置时传 `--config <照片目录>/.firstcut/config.toml`。
+- 默认配置位于照片根目录的 `.firstcut/config.toml`，UI、CLI `score` 和 `review` 均自动加载；不存在时使用内置默认值。UI 跑批报告位于 `.firstcut/report.csv`；CLI 可用 `--config` 显式选择其他配置。
 - **图像兼容范围**：目前直方图与分析基于解码后的 SDR JPEG 像素；HDR 增益图、PQ/HLG 等 HDR 内容尚未识别或保留 HDR 亮度信息。HDR 照片暂按 SDR JPEG 兼容范围处理。
 - 数据来源：扫描目录 + SQLite 分析缓存 + 独立的人工决定库（星级/连拍与 `score` 同一逻辑在线计算）。
   未跑过评分的照片显示为未评分。
@@ -269,7 +275,9 @@ pic_process review <目录> --port 9000 --config stage.toml
 - 实验性 `--gpu`（DirectML）：119 张 16.7s vs CPU 17.4s——无显著收益，保持实验性
 - 纯像素冷缓存：约 **90ms/张**（`--no-ai`）
 - 增量重跑：秒级（SQLite 缓存，键 = `path` + `size` + `mtime` + `CACHE_VERSION` + 配置/分析模式/模型文件指纹）
-- 评分参数/`--config` 变更会自动使缓存失效（配置指纹参与缓存键），无需手动换缓存文件
+- 曲线参数、分析模式或模型文件来源变更时自动重新分析，无需手动换缓存；仅改权重/星级阈值会复用子分并重新合成结果
+
+这些是历史样本和硬件上的测量，不是本次文档整理重新跑出的性能保证。直方图抽样的工作量与内存估算见[设计文档](DESIGN.md#71-直方图与性能边界)。
 
 ## 目录结构
 
@@ -304,18 +312,23 @@ presets/                  # 场景预设（编译进二进制，config-template 
 
 ```bash
 cargo test --locked
-# 前端脚本检查：将 index.html 中的 <script> 内容提取到临时 .js 文件后执行 node --check
+node --check src/review/assets/review.js
+
+# 已构建 Windows 发行程序时，验证登录、取图、重新评分和落盘
+python .github/scripts/check-review.py --binary target/release/pic_process.exe
 ```
 
 测试覆盖扫描和配对、分数与连拍、配置边界、灰度 JPEG、XMP 字段保留，以及“评分 → 人工改星 → 重跑 → CSV/XMP/快照”流程。少数旧集成测试依赖 gitignore 中的私人 `testpic/`；该目录不存在时会跳过这些用例。
 
 ## 相关文档
 
-- [`DESIGN.md`](DESIGN.md) — 当前设计约定、技术选型及已停止路线的历史记录
-- [`release_notes.md`](release_notes.md) — 版本说明
-- [`REVIEW.md`](REVIEW.md) — 外部评审记录与处理状态（长期累积，每轮评审追加）
-- [`ASTRA_REVIEW.md`](ASTRA_REVIEW.md) — 本轮评审的过程、实施结果、验证和后续建议
+- [`DESIGN.md`](DESIGN.md) — 当前有效的产品边界、数据模型、评分/缓存/UI 约定与后续工作
+- [`docs/HISTORY.md`](docs/HISTORY.md) — 合并的历次评审、实施证据、旧里程碑与停止路线研究；取代独立的 REVIEW / ASTRA_REVIEW 文档
+- [`release_notes.md`](release_notes.md) — 用户可见的版本变化
+- [`SECURITY.md`](SECURITY.md) — 安全支持范围与私密漏洞报告方式
+
+原始工单和被合并文档的全文仍可从 Git 历史找回，方法见历史档案。后续设计改动维护 `DESIGN.md`，评审过程统一追加到 `docs/HISTORY.md`，不再按模型或里程碑新建重复文件。本地沟通记忆不属于公开项目文档，已通过 Git 忽略规则排除。
 
 ## 方向与后续工作
 
-当前产品聚焦选片与复核；曝光补偿只作为 Lightroom 侧车建议输出。`DESIGN.md` §9 中的 darktable 批量开发方案已停止，属于历史调研。下一步是用用户真实选片结果校准“误删好片”和连拍候选覆盖率；这项校准尚未完成。
+当前产品聚焦选片与复核；曝光补偿只作为 Lightroom 侧车建议输出。优先统一人工连拍保留覆盖与 CLI/CSV 导出：当前人工星级已统一，连拍覆盖仍只作用于 review。真实选片质量校准和 Lightroom 实际导入仍未验收；需要用用户标注检查好片被排除率与连拍最佳帧覆盖率。完整边界和优先顺序见[后续工作](DESIGN.md#9-后续工作与未验收项)。

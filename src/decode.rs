@@ -3,6 +3,8 @@
 //! 解码 JPG → 下采样到分析尺寸（长边 ≤ 1024px）→ 灰度 + 直方图。
 //! RAW 文件（ARW）在此阶段不做解码（Phase 1 约定：JPG 评分、映射到 ARW）。
 
+use std::fs::File;
+use std::io::{BufReader, Cursor, Read, Seek, SeekFrom};
 use std::path::Path;
 
 use anyhow::Result;
@@ -24,6 +26,47 @@ pub struct AnalyzedImage {
 
 /// 分析用长边上限（px）。解码后先缩到该尺寸再做指标计算，吞吐与精度折中。
 pub const ANALYSIS_MAX_DIM: u32 = 1024;
+/// Budget for one input, before any full raster allocation. Fits 100 MP photos.
+pub const MAX_PHOTO_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_PHOTO_PIXELS: u64 = 110_000_000;
+const MAX_PHOTO_SIDE: u32 = 32_768;
+// Load at most two full rasters at once, including CLI jobs and UI thumbnails.
+static DECODES: std::sync::Mutex<usize> = std::sync::Mutex::new(2);
+static DECODE_READY: std::sync::Condvar = std::sync::Condvar::new();
+
+struct DecodePermit;
+impl DecodePermit {
+    fn acquire() -> Self {
+        let ready = DECODES.lock().unwrap_or_else(|e| e.into_inner());
+        let mut ready = DECODE_READY.wait_while(ready, |slots| *slots == 0)
+            .unwrap_or_else(|e| e.into_inner());
+        *ready -= 1;
+        Self
+    }
+}
+impl Drop for DecodePermit {
+    fn drop(&mut self) {
+        *DECODES.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+        DECODE_READY.notify_one();
+    }
+}
+
+fn reasonable_dimensions(w: u32, h: u32) -> bool {
+    w > 0 && h > 0 && w.max(h) <= MAX_PHOTO_SIDE && u64::from(w) * u64::from(h) <= MAX_PHOTO_PIXELS
+}
+
+/// Verify the original preview's size before sending it to a browser for
+/// full-size decoding. Bound work on JPEGs with very large metadata headers.
+pub(crate) fn can_preview_jpeg(file: &mut File) -> std::io::Result<bool> {
+    const HEADER_LIMIT: u64 = 8 * 1024 * 1024;
+    let valid = {
+        let mut reader = jpeg_decoder::Decoder::new((&mut *file).take(HEADER_LIMIT));
+        reader.read_info().is_ok() && reader.info().is_some_and(|info|
+            reasonable_dimensions(u32::from(info.width), u32::from(info.height)))
+    };
+    file.seek(SeekFrom::Start(0))?;
+    Ok(valid)
+}
 
 /// 解码并预处理照片；非 JPG 或解码失败返回 None（不阻断流水线）
 ///
@@ -31,29 +74,44 @@ pub const ANALYSIS_MAX_DIM: u32 = 1024;
 /// 其他格式回退 image crate 全解码。
 /// **EXIF Orientation 在降采样后应用**（1MP 图旋转成本远低于 33MP）。
 pub fn load_analysis_image(path: &Path) -> Result<Option<AnalyzedImage>> {
-    let orientation = read_orientation(path);
+    match File::open(path) {
+        Ok(file) => load_analysis_file(file),
+        Err(_) => Ok(None),
+    }
+}
 
-    // 先看文件头是否为 JPEG（避免大 ARW 被整体读入）
-    let mut head = [0u8; 4];
-    let is_jpeg = match std::fs::File::open(path) {
-        Ok(mut f) => {
-            use std::io::Read;
-            f.read_exact(&mut head).is_ok() && head == [0xFF, 0xD8, 0xFF, 0xDB]
-                || (head[0] == 0xFF && head[1] == 0xD8 && head[2] == 0xFF)
-        }
-        Err(_) => false,
-    };
-
-    if is_jpeg {
-        if let Ok(bytes) = std::fs::read(path) {
-            if let Some(rgb) = decode_jpeg_to_rgb(&bytes) {
-                return Ok(Some(build_analysis_image(apply_orientation(rgb, orientation))));
-            }
+pub fn load_analysis_file(file: File) -> Result<Option<AnalyzedImage>> {
+    let meta = file.metadata()?;
+    if !meta.is_file() || meta.len() > MAX_PHOTO_BYTES {
+        return Ok(None);
+    }
+    let _permit = DecodePermit::acquire();
+    let mut bytes = Vec::new();
+    file.take(MAX_PHOTO_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_PHOTO_BYTES {
+        return Ok(None);
+    }
+    let Ok(format) = image::guess_format(&bytes) else { return Ok(None); };
+    if !matches!(format, image::ImageFormat::Jpeg | image::ImageFormat::Png) {
+        return Ok(None);
+    }
+    let reader = || image::ImageReader::with_format(Cursor::new(&bytes), format);
+    let Ok((w, h)) = reader().into_dimensions() else { return Ok(None); };
+    if !reasonable_dimensions(w, h) {
+        return Ok(None);
+    }
+    let orientation = orientation_from(&mut BufReader::new(Cursor::new(&bytes)));
+    if format == image::ImageFormat::Jpeg {
+        if let Some(rgb) = decode_jpeg_to_rgb(&bytes) {
+            return Ok(Some(build_analysis_image(apply_orientation(rgb, orientation))));
         }
     }
-
-    // 兜底：image crate 全解码
-    let img = match image::open(path) {
+    let mut bounded = reader();
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_PHOTO_SIDE);
+    limits.max_image_height = Some(MAX_PHOTO_SIDE);
+    bounded.limits(limits);
+    let img = match bounded.decode() {
         Ok(img) => img,
         Err(_) => return Ok(None),
     };
@@ -86,7 +144,11 @@ pub fn read_orientation(path: &Path) -> u16 {
         Ok(f) => std::io::BufReader::new(f),
         Err(_) => return 1,
     };
-    match exif::Reader::new().read_from_container(&mut file) {
+    orientation_from(&mut file)
+}
+
+fn orientation_from(file: &mut (impl std::io::BufRead + std::io::Seek)) -> u16 {
+    match exif::Reader::new().read_from_container(file) {
         Ok(exif) => exif
             .get_field(exif::Tag::Orientation, exif::In::PRIMARY)
             .and_then(|f| f.value.get_uint(0))
@@ -122,21 +184,31 @@ pub fn apply_orientation(img: image::RgbImage, orientation: u16) -> image::RgbIm
 /// JPEG 解码 + box 降采样，返回分析尺寸的 RGB（未应用 EXIF 旋转）
 fn decode_jpeg_to_rgb(bytes: &[u8]) -> Option<image::RgbImage> {
     let mut decoder = jpeg_decoder::Decoder::new(bytes);
-    let pixels = decoder.decode().ok()?;
+    decoder.read_info().ok()?;
     let info = decoder.info()?;
     let (w, h) = (info.width as u32, info.height as u32);
-    if w == 0 || h == 0 {
+    if !reasonable_dimensions(w, h) {
         return None;
     }
     // jpeg-decoder 返回灰度或 CMYK 时不能按 RGB 三通道索引。
     if info.pixel_format != jpeg_decoder::PixelFormat::RGB24 {
         return None; // 交给 image crate 的通用解码路径
     }
+    decoder.set_max_decoding_buffer_size(MAX_PHOTO_PIXELS as usize * 3);
+    let pixels = decoder.decode().ok()?;
     if w.max(h) <= ANALYSIS_MAX_DIM {
         return image::RgbImage::from_raw(w, h, pixels);
     }
     // box 降采样：步长 = ceil(长边/1024)
     let step = (w.max(h) as f32 / ANALYSIS_MAX_DIM as f32).ceil() as u32;
+    if step > w.min(h) {
+        let image = image::RgbImage::from_raw(w, h, pixels)?;
+        let ratio = ANALYSIS_MAX_DIM as f32 / w.max(h) as f32;
+        return Some(image::imageops::resize(&image,
+            (w as f32 * ratio).round().max(1.0) as u32,
+            (h as f32 * ratio).round().max(1.0) as u32,
+            image::imageops::FilterType::Triangle));
+    }
     let (nw, nh, out) = box_downsample(&pixels, w, h, step);
     let img = image::RgbImage::from_raw(nw, nh, out)?;
     // 极少情况下（非整数倍）仍略超 1024，用 image crate 收尾

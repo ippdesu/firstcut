@@ -1,64 +1,84 @@
-//! 缩略图生成与磁盘缓存（M-UI1）
-//!
-//! 首次访问某张照片时从分析级解码（≤1024px，复用 decode.rs 的 box 降采样）
-//! 缩到 320px 写入 `<照片根>/.firstcut/thumbs/`，此后直接命中文件。
-//! 文件名含 path 哈希 + size + mtime，原文件变化自动换新缩略图。
+//! 缩略图按需生成。每个磁盘槽只留一张，照片改名或更新不会无限增长。
 
-use std::path::{Path, PathBuf};
+use std::fs::File;
+use std::path::Path;
 
-use crate::cache;
 use crate::decode;
+use crate::storage::Folder;
+use sha2::{Digest, Sha256};
 
-/// 缩略图长边（px）
 pub const THUMB_MAX_DIM: u32 = 320;
+const SLOT_COUNT: u16 = 8192;
+const ENTRY_BYTES: u64 = 64 * 1024;
 
-/// 缩略图缓存目录（`<root>/.firstcut/thumbs`）
-pub fn thumb_dir(root: &Path) -> PathBuf {
-    root.join(".firstcut").join("thumbs")
+fn cache_key(photo: &str, size: u64, mtime: i64) -> (String, String) {
+    let digest = Sha256::digest(photo.as_bytes());
+    let slot = u16::from_le_bytes([digest[0], digest[1]]) % SLOT_COUNT;
+    (
+        format!("{slot:04x}.bin"),
+        format!("{digest:x}:{size}:{mtime}\n"),
+    )
 }
 
-/// 稳定且不冲突的缓存文件名：path 哈希 + 文件指纹
-fn cache_name(rel: &str, size: u64, mtime: i64) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut h = DefaultHasher::new();
-    rel.hash(&mut h);
-    format!("{:016x}-{}-{}.jpg", h.finish(), size, mtime)
-}
-
-/// 取缩略图字节：命中磁盘缓存直接读，否则解码生成（写缓存后返回）。
-///
-/// 返回 None = 原文件解码失败（坏图）；Err = IO 层问题。
-pub fn get_or_create(root: &Path, rel: &str, full: &Path) -> anyhow::Result<Option<Vec<u8>>> {
-    let Some((size, mtime)) = cache::file_fingerprint(full) else {
+pub fn get_or_create(root: &Path, rel: &str, photo: File) -> anyhow::Result<Option<Vec<u8>>> {
+    let meta = photo.metadata()?;
+    if meta.len() > decode::MAX_PHOTO_BYTES {
         return Ok(None);
-    };
-    let dir = thumb_dir(root);
-    let cache_file = dir.join(cache_name(rel, size, mtime));
-    if let Ok(bytes) = std::fs::read(&cache_file) {
-        return Ok(Some(bytes));
+    }
+    let mtime = meta
+        .modified()?
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_nanos() as i64;
+    let (key, identity) = cache_key(rel, meta.len(), mtime);
+    // Generated files are optional. If this album contains an unsafe or
+    // read-only cache directory, don't touch it and render from the photo.
+    let cache = Folder::open(root)
+        .and_then(|dir| dir.state(true))
+        .and_then(|dir| dir.child("thumbs", true))
+        .and_then(|dir| dir.child("v2", true))
+        .and_then(|dir| dir.file(&key))
+        .ok();
+    if let Some(cache) = &cache {
+        if let Ok(Some(bytes)) = cache.read(ENTRY_BYTES) {
+            if let Some(jpeg) = bytes.strip_prefix(identity.as_bytes()) {
+                if jpeg.starts_with(&[0xff, 0xd8, 0xff]) {
+                    return Ok(Some(jpeg.to_vec()));
+                }
+            }
+        }
     }
 
-    let Some(img) = decode::load_analysis_image(full)? else {
+    let Some(img) = decode::load_analysis_file(photo)? else {
         return Ok(None);
     };
     let rgb = image::RgbImage::from_raw(img.width, img.height, img.rgb)
         .ok_or_else(|| anyhow::anyhow!("RGB 数据尺寸不一致"))?;
-    // 保持长宽比缩到 320 盒内（卡片上的方形单元格由前端 object-fit 裁剪展示）
-    let small =
-        image::DynamicImage::ImageRgb8(rgb).resize(THUMB_MAX_DIM, THUMB_MAX_DIM, image::imageops::FilterType::Triangle);
-    let rgb8 = small.to_rgb8();
+    let small = image::DynamicImage::ImageRgb8(rgb)
+        .resize(
+            THUMB_MAX_DIM,
+            THUMB_MAX_DIM,
+            image::imageops::FilterType::Triangle,
+        )
+        .into_rgb8();
+    let mut data = Vec::new();
+    let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut data, 72);
+    enc.encode(
+        small.as_raw(),
+        small.width(),
+        small.height(),
+        image::ExtendedColorType::Rgb8,
+    )?;
 
-    let mut buf = Vec::new();
-    let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 72);
-    enc.encode(rgb8.as_raw(), rgb8.width(), rgb8.height(), image::ExtendedColorType::Rgb8)?;
-
-    // 先写临时文件再改名，避免并发请求读到半截文件
-    std::fs::create_dir_all(&dir)?;
-    let tmp = dir.join(format!(".tmp-{}", cache_name(rel, size, mtime)));
-    std::fs::write(&tmp, &buf)?;
-    let _ = std::fs::rename(&tmp, &cache_file);
-    Ok(Some(buf))
+    if let Some(cache) = cache {
+        if (identity.len() + data.len()) as u64 <= ENTRY_BYTES {
+            let _ = cache.replace(|file| {
+                use std::io::Write;
+                file.write_all(identity.as_bytes())?;
+                file.write_all(&data)
+            });
+        }
+    }
+    Ok(Some(data))
 }
 
 #[cfg(test)]
@@ -66,13 +86,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cache_name_stable_and_sensitive() {
-        let a = cache_name("JPG/a.JPG", 100, 5);
-        let b = cache_name("JPG/b.JPG", 100, 5);
-        let a2 = cache_name("JPG/a.JPG", 100, 5);
-        let a3 = cache_name("JPG/a.JPG", 101, 5);
-        assert_eq!(a, a2, "同参数文件名稳定");
-        assert_ne!(a, b, "不同路径不同名");
-        assert_ne!(a, a3, "文件变化换新缓存");
+    fn new_photo_revision_reuses_the_same_slot_but_has_a_new_identity() {
+        let (key, identity) = cache_key("JPG/a.JPG", 100, 5);
+        let (updated_key, updated_identity) = cache_key("JPG/a.JPG", 101, 6);
+        assert_eq!(key, updated_key);
+        assert_ne!(identity, updated_identity);
     }
 }

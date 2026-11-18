@@ -4,6 +4,9 @@ services:
     pull_policy: always
     user: "${FIRSTCUT_UID:-1000}:${FIRSTCUT_GID:-1000}"
     command: ["review", "/photos", "--bind", "0.0.0.0", "--port", "8787", "--no-browser"]
+    environment:
+      FIRSTCUT_ACCESS_TOKEN: ${FIRSTCUT_ACCESS_TOKEN:?Generate a random access token and set it in .env}
+      FIRSTCUT_PUBLIC_URL: ${FIRSTCUT_PUBLIC_URL:-http://127.0.0.1:8787}
     ports:
       - "127.0.0.1:8787:8787"
     volumes:

@@ -18,7 +18,7 @@ pub const CACHE_VERSION: i64 = 15;
 
 /// 照片分析缓存
 pub struct ScoreCache {
-    conn: rusqlite::Connection,
+    db: crate::storage::Database,
     /// 预加载的 (path -> 缓存行)
     rows: HashMap<String, CacheRow>,
     /// 本次运行使用的评分配置指纹（参与缓存键）
@@ -53,8 +53,27 @@ impl CacheRow {
 impl ScoreCache {
     /// 打开（或创建）缓存库；`cfg_hash` 为本次运行的评分配置指纹
     pub fn open(path: &Path, cfg_hash: i64) -> Result<Self> {
-        let conn = rusqlite::Connection::open(path)
-            .with_context(|| format!("打开缓存库失败: {}", path.display()))?;
+        Self::open_at(path, crate::storage::FileRef::explicit(path, false)?, cfg_hash, true)?
+            .context("评分库不可用")
+    }
+
+    pub(crate) fn open_in(root: &Path, path: &Path, cfg_hash: i64, write: bool) -> Result<Option<Self>> {
+        let destination = match crate::storage::FileRef::at(root, path, write) {
+            Ok(file) => file,
+            Err(err) if !write && err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err.into()),
+        };
+        Self::open_at(path, destination, cfg_hash, write)
+    }
+
+    fn open_at(path: &Path, file: crate::storage::FileRef, cfg_hash: i64, write: bool) -> Result<Option<Self>> {
+        let Some(db) = crate::storage::Database::open(file, write)
+            .with_context(|| format!("打开缓存库失败: {}", path.display()))?
+        else {
+            return Ok(None);
+        };
+        let conn = &db.conn;
+        if write {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS photo_cache (
                 path TEXT PRIMARY KEY,
@@ -80,6 +99,7 @@ impl ScoreCache {
         );
         let _ = conn.execute("ALTER TABLE photo_cache ADD COLUMN pose_desc BLOB", []);
         let _ = conn.execute("ALTER TABLE photo_cache ADD COLUMN suggested_ev REAL", []);
+        }
 
         let rows = {
             let mut stmt = conn.prepare(
@@ -103,7 +123,8 @@ impl ScoreCache {
                                 aesthetic: r.get(8)?,
                             },
                             dhash: r.get::<_, i64>(10)? as u64,
-                            faces: r.get(11)?,
+                            faces: usize::try_from(r.get::<_, i64>(11)?).map_err(|err|
+                                rusqlite::Error::FromSqlConversionFailure(11, rusqlite::types::Type::Integer, Box::new(err)))?,
                             suggested_ev,
                             pose_desc: pose_desc.as_deref().and_then(blob_to_desc),
                         },
@@ -118,7 +139,7 @@ impl ScoreCache {
             }
             rows
         };
-        Ok(ScoreCache { conn, rows, cfg_hash, dirty: std::collections::HashSet::new() })
+        Ok(Some(ScoreCache { db, rows, cfg_hash, dirty: std::collections::HashSet::new() }))
     }
 
     /// 只读快照（供 rayon 并行段使用；Connection 非 Sync 不能跨线程）
@@ -150,7 +171,7 @@ impl ScoreCache {
         if self.dirty.is_empty() {
             return Ok(());
         }
-        let tx = self.conn.transaction()?;
+        let tx = self.db.conn.transaction()?;
         for path in &self.dirty {
             let Some(row) = self.rows.get(path) else { continue };
             let s = row.result.scores;
@@ -178,6 +199,7 @@ impl ScoreCache {
             )?;
         }
         tx.commit()?;
+        self.db.save()?;
         self.dirty.clear();
         Ok(())
     }
@@ -191,6 +213,10 @@ impl ScoreCache {
 /// 文件元数据：大小 + mtime（纳秒精度）
 pub fn file_fingerprint(path: &Path) -> Option<(u64, i64)> {
     let meta = std::fs::metadata(path).ok()?;
+    metadata_fingerprint(&meta)
+}
+
+pub fn metadata_fingerprint(meta: &std::fs::Metadata) -> Option<(u64, i64)> {
     let mtime = meta
         .modified()
         .ok()?

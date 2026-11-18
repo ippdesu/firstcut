@@ -16,7 +16,7 @@ updates:
           - patch
 
   - package-ecosystem: github-actions
-    directory: /.github/workflows
+    directory: /
     schedule:
       interval: weekly
       day: monday
@@ -29,3 +29,9 @@ updates:
         update-types:
           - minor
           - patch
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3

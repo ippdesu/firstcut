@@ -174,6 +174,7 @@ pub struct AnalysisOutcome {
 /// `on_progress(done, total)`：进度回调（每 25 张与最后一张各报一次）；
 /// `score` 子命令用它打 stderr，`review` 用它更新跑批进度。
 pub fn analyze_jpgs(
+    root: &Path,
     entries: &[PhotoEntry],
     ai: &AiEngine,
     cache_rows: Option<&std::collections::HashMap<String, crate::cache::CacheRow>>,
@@ -194,9 +195,12 @@ pub fn analyze_jpgs(
             if done % 25 == 0 || done == total {
                 on_progress(done, total);
             }
+            let file = crate::storage::FileRef::inside(root, Path::new(&e.path))
+                .ok()?.open_read().ok()??;
+            let fingerprint = file.metadata().ok().and_then(|meta| crate::cache::metadata_fingerprint(&meta));
             // 缓存命中则跳过分析（快照为纯数据，可跨线程共享）
             if let Some(rows) = cache_rows {
-                if let Some((size, mtime)) = crate::cache::file_fingerprint(Path::new(&e.path)) {
+                if let Some((size, mtime)) = fingerprint {
                     if let Some(row) = rows.get(&e.path) {
                         if row.matches(size, mtime, crate::cache::CACHE_VERSION, cfg_hash) {
                             hits.fetch_add(1, Ordering::Relaxed);
@@ -205,7 +209,7 @@ pub fn analyze_jpgs(
                     }
                 }
             }
-            let result = match analyze_one(e, &cfg.metric, ai) {
+            let result = match analyze_open_file(file, e, &cfg.metric, ai) {
                 Ok(Some(result)) => result,
                 Ok(None) => return None,
                 Err(err) => {
@@ -213,8 +217,7 @@ pub fn analyze_jpgs(
                     return None;
                 }
             };
-            let row = crate::cache::file_fingerprint(Path::new(&e.path))
-                .map(|(size, mtime)| (e.path.clone(), size, mtime, result));
+            let row = fingerprint.map(|(size, mtime)| (e.path.clone(), size, mtime, result));
             Some((e.pair_id().to_string(), result, row))
         })
         .fold(
@@ -248,11 +251,24 @@ pub fn analyze_jpgs(
 ///
 /// 返回 None 表示解码失败（跳过）；Err 表示 AI 推理失败（整批中断的候选，当前跳过）
 pub fn analyze_one(
+    root: &Path,
     e: &PhotoEntry,
     p: &MetricParams,
     ai: &AiEngine,
 ) -> anyhow::Result<Option<AnalysisResult>> {
-    let img = decode::load_analysis_image(Path::new(&e.path))?;
+    let Some(file) = crate::storage::FileRef::inside(root, Path::new(&e.path))?.open_read()? else {
+        return Ok(None);
+    };
+    analyze_open_file(file, e, p, ai)
+}
+
+fn analyze_open_file(
+    file: std::fs::File,
+    e: &PhotoEntry,
+    p: &MetricParams,
+    ai: &AiEngine,
+) -> anyhow::Result<Option<AnalysisResult>> {
+    let img = decode::load_analysis_file(file)?;
     let Some(img) = img else { return Ok(None) };
 
     // ---- 像素指标 ----
@@ -396,6 +412,7 @@ pub fn analyze_one(
 #[derive(Debug, Clone)]
 pub struct ScoreJobOptions {
     pub output_csv: PathBuf,
+    pub raw_csv: bool,
     pub cache_path: PathBuf,
     pub no_cache: bool,
     /// 跳过 AI 推理（纯像素快速预览）
@@ -474,9 +491,9 @@ pub fn run_score_job(
     let mut cache = if opts.no_cache {
         None
     } else {
-        match crate::cache::ScoreCache::open(&opts.cache_path, crate::config::analysis_fingerprint(cfg, engine.is_enabled()))
+        match crate::cache::ScoreCache::open_in(dir, &opts.cache_path, crate::config::analysis_fingerprint(cfg, engine.is_enabled()), true)
         {
-            Ok(c) => Some(c),
+            Ok(c) => c,
             Err(err) => {
                 on_event(ScoreEvent::Info(format!("缓存不可用（本次不使用）: {err:#}")));
                 None
@@ -487,7 +504,7 @@ pub fn run_score_job(
     // 分析（并行；进度经回调）
     let total_jpg = entries.iter().filter(|e| !e.is_raw).count();
     let cache_rows = cache.as_ref().map(|c| c.rows());
-    let outcome = analyze_jpgs(&entries, &engine, cache_rows, cfg, &|done, total| {
+    let outcome = analyze_jpgs(dir, &entries, &engine, cache_rows, cfg, &|done, total| {
         on_event(ScoreEvent::Progress { done, total });
     });
     on_event(ScoreEvent::Finished {
@@ -573,7 +590,7 @@ pub fn run_score_job(
             }
             let total = total_score(&r.scores, &cfg.weights);
             let rating = ratings.get(key).map(|r| r.stars).unwrap_or(3);
-            match crate::output::xmp::write_sidecar(e, &r.scores, total, rating, r.suggested_ev) {
+            match crate::output::xmp::write_sidecar(dir, e, &r.scores, total, rating, r.suggested_ev) {
                 Ok(true) => written += 1,
                 Ok(false) => skipped += 1,
                 Err(err) => on_event(ScoreEvent::Info(format!("XMP 写入失败 {}: {err:#}", e.path))),
@@ -582,7 +599,7 @@ pub fn run_score_job(
         on_event(ScoreEvent::Info(format!("XMP 侧车写入 {written} 个，跳过 {skipped} 个")));
     }
 
-    crate::output::csv::write_csv(&opts.output_csv, &entries)?;
+    crate::output::csv::write_csv_in(dir, &opts.output_csv, &entries, !opts.raw_csv)?;
     on_event(ScoreEvent::Info(format!("CSV 已写出: {}", opts.output_csv.display())));
 
     Ok(ScoreJobSummary {
