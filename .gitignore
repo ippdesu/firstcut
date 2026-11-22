@@ -23,11 +23,11 @@
 
 /lens_inventory.csv
 
-# Phase 2 µ÷ÑĞÖĞ¼ä²úÎï£¨×Ó´úÀí²ú³ö£¬½áÂÛÒÑ²¢Èë DESIGN.md£©
+# Phase 2 è°ƒç ”ä¸­é—´äº§ç‰©ï¼ˆå­ä»£ç†äº§å‡ºï¼Œç»“è®ºå·²å½’æ¡£è‡³ docs/history/DARKTABLE_PHASE2_RESEARCH.mdï¼‰
 /p2_notes/
 /p2_test/
 
-# ×Ó´úÀíµ÷ÑĞÓÃµÄ darktable Ô´Âë¸±±¾£¨70MB£¬²»Èë¿â£©
+# å­ä»£ç†è°ƒç ”ç”¨çš„ darktable æºç å‰¯æœ¬ï¼ˆ70MBï¼Œä¸å…¥åº“ï¼‰
 /dt_research/
 .env
 .env.*
