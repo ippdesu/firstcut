@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 pub const MODELS_DIR: &str = "models";
 
 // LFS SHA-256 values at the exact upstream revisions listed in README.
-const MODEL_FILES: [(&str, u64, &str); 4] = [
+pub(crate) const MODEL_FILES: [(&str, u64, &str); 4] = [
     ("clipiqa_model.onnx", 409_923, "4f959db3c321a652ef45915aeade0eb05284a8145cc933dd9feaae4e633cac37"),
     ("clipiqa_model.onnx.data", 152_764_416, "8c6b5a074405e85cda90155975588a3c4bc500d858ad994423380115610c19b6"),
     ("scrfd_10g_bnkps.onnx", 16_923_827, "5838f7fe053675b1c7a08b633df49e7af5495cee0493c7dcf6697200b85b5b91"),
@@ -82,7 +82,9 @@ fn verify_model_file(dir: &crate::storage::Folder, spec: (&str, u64, &str)) -> R
 fn load_verified_model(model_file: &str) -> Result<VerifiedModel> {
     let spec = MODEL_FILES.iter().copied().find(|spec| spec.0 == model_file)
         .with_context(|| format!("未知模型文件 {model_file}"))?;
-    let dir = crate::storage::Folder::open(&model_dir()).context("找不到已支持的模型目录")?;
+    let canonical_dir = crate::review::normal_photo_root(&model_dir())
+        .context("找不到已支持的模型目录")?;
+    let dir = crate::storage::Folder::open(&canonical_dir).context("找不到已支持的模型目录")?;
     let bytes = verify_model_file(&dir, spec)?;
     // The supported CLIPIQA graph and its data are verified separately. Feed
     // the verified bytes directly to ORT so it cannot reopen a changed path.

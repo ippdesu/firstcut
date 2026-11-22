@@ -88,7 +88,7 @@ pub struct AnalysisResult {
     /// （对位置/尺度不变），连拍组内聚类"不同姿势"用。None = 无主体级人脸。
     pub pose_desc: Option<[f32; 10]>,
     /// 建议曝光修正（EV，1/3 档；None = 曝光在容差带内、不给建议）。
-    /// 写进 XMP（`firstcut:suggestedEV` + `crs:Exposure2`）与 CSV，
+    /// 写进 XMP（`firstcut:suggestedEV` + `crs:Exposure2012`）与 CSV，
     /// 实际修正由用户在 Lightroom 里确认应用。
     pub suggested_ev: Option<f64>,
 }
@@ -186,6 +186,7 @@ pub fn analyze_jpgs(
     let total = entries.iter().filter(|e| !e.is_raw).count().max(1);
     // 配置指纹参与缓存键：改了 --config 必须重算，否则会静默返回旧分数
     let cfg_hash = crate::config::analysis_fingerprint(cfg, ai.is_enabled());
+    let legacy_ai_hash = ai.is_enabled().then(|| crate::config::legacy_ai_fingerprint(cfg));
 
     let (results, new_rows): (HashMap<String, AnalysisResult>, Vec<(String, u64, i64, AnalysisResult)>) = entries
         .par_iter()
@@ -198,13 +199,20 @@ pub fn analyze_jpgs(
             let file = crate::storage::FileRef::inside(root, Path::new(&e.path))
                 .ok()?.open_read().ok()??;
             let fingerprint = file.metadata().ok().and_then(|meta| crate::cache::metadata_fingerprint(&meta));
+            let cache_key = crate::cache::cache_key(root, Path::new(&e.path));
             // 缓存命中则跳过分析（快照为纯数据，可跨线程共享）
             if let Some(rows) = cache_rows {
                 if let Some((size, mtime)) = fingerprint {
-                    if let Some(row) = rows.get(&e.path) {
-                        if row.matches(size, mtime, crate::cache::CACHE_VERSION, cfg_hash) {
+                    if let Some((row, was_legacy_key)) = crate::cache::lookup(rows, root, &e.path) {
+                        let matched_current = row.matches(size, mtime, crate::cache::CACHE_VERSION, cfg_hash);
+                        let matched_legacy = legacy_ai_hash
+                            .is_some_and(|h| row.matches(size, mtime, crate::cache::CACHE_VERSION, h));
+                        if matched_current || matched_legacy {
                             hits.fetch_add(1, Ordering::Relaxed);
-                            return Some((e.pair_id().to_string(), row.result, None));
+                            // 命中旧版绝对路径键或旧版 mtime 模型指纹时，无痛补写一份可移植行。
+                            let migrated = (was_legacy_key || !matched_current)
+                                .then_some((cache_key, size, mtime, row.result));
+                            return Some((e.pair_id().to_string(), row.result, migrated));
                         }
                     }
                 }
@@ -217,7 +225,7 @@ pub fn analyze_jpgs(
                     return None;
                 }
             };
-            let row = fingerprint.map(|(size, mtime)| (e.path.clone(), size, mtime, result));
+            let row = fingerprint.map(|(size, mtime)| (cache_key, size, mtime, result));
             Some((e.pair_id().to_string(), result, row))
         })
         .fold(

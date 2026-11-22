@@ -39,7 +39,7 @@ pub struct PhotoEntry {
     pub aesthetic_score: String,
     pub total_score: String,
     /// 建议曝光修正（EV，带符号；空 = 曝光在容差带内不给建议）。
-    /// 同步写入 XMP（`firstcut:suggestedEV` + `crs:Exposure2`），供 Lightroom 确认应用
+    /// 同步写入 XMP（`firstcut:suggestedEV` + `crs:Exposure2012`），供 Lightroom / ACR 确认应用
     pub suggested_ev: String,
     /// 星级（1-5；relative 模式为批次内相对排名，absolute 模式为总分阈值）
     pub stars: String,
@@ -157,8 +157,22 @@ fn load_report_exif(root: &Path, report: &Path) -> Option<(std::time::SystemTime
     let report_time = meta.modified().ok()?;
     let mut reader = csv::Reader::from_reader(file.take(REPORT_LIMIT));
     let mut rows = HashMap::new();
+    let unescape = crate::output::csv::unescape_spreadsheet_text;
     for row in reader.deserialize::<PhotoEntry>() {
-        let row = row.ok()?;
+        let mut row = row.ok()?;
+        let raw_path = row.path.clone();
+        row.path = unescape(&row.path).to_string();
+        row.date_time_original = unescape(&row.date_time_original).to_string();
+        row.camera_make = unescape(&row.camera_make).to_string();
+        row.camera_model = unescape(&row.camera_model).to_string();
+        row.lens_model = unescape(&row.lens_model).to_string();
+        row.iso = unescape(&row.iso).to_string();
+        row.f_number = unescape(&row.f_number).to_string();
+        row.shutter_speed = unescape(&row.shutter_speed).to_string();
+        row.focal_length = unescape(&row.focal_length).to_string();
+        if raw_path != row.path {
+            rows.insert(raw_path, row.clone());
+        }
         rows.insert(row.path.clone(), row);
     }
     Some((report_time, rows))
@@ -449,17 +463,18 @@ mod tests {
         let jpg = dir.join("a.jpg");
         std::fs::write(&jpg, b"not a real jpeg").unwrap();
         let report = dir.join("report.csv");
-        let mut writer = csv::Writer::from_path(&report).unwrap();
-        writer.serialize(PhotoEntry {
+        let entry = PhotoEntry {
             path: jpg.display().to_string(), filename: "a.jpg".into(),
             extension: "jpg".into(), date_time_original: "2025:08:28 10:00:00".into(),
+            lens_model: "+FE 50mm".into(),
             ..Default::default()
-        }).unwrap();
-        writer.flush().unwrap();
+        };
+        crate::output::csv::write_csv_in(&dir, &report, &[entry], true).unwrap();
 
         let entries = scan_directory_with_exif_cache(&dir, &report).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].date_time_original, "2025:08:28 10:00:00");
+        assert_eq!(entries[0].lens_model, "+FE 50mm", "表格公式保护前缀应还原");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

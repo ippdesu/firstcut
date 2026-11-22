@@ -169,6 +169,8 @@ pub struct AppState {
     include_raw: bool,
     /// 全局单评分任务
     job: Arc<JobState>,
+    /// 串行化前端写操作（改星/连拍覆盖/场景反馈/配置保存），防止快速连点触发 SQLite 锁冲突或乱序写 XMP。
+    write_lock: Arc<tokio::sync::Mutex<()>>,
     control: Option<Arc<UiControl>>,
 }
 
@@ -222,6 +224,8 @@ pub fn serve_ui(root: &Path, pick_root: impl Fn() -> Option<PathBuf>) -> Result<
     let mut open_browser = true;
     let bind = IpAddr::V4(Ipv4Addr::LOCALHOST);
     let access = Arc::new(access::Access::new(bind, 8787, None, None)?);
+    #[cfg(windows)]
+    let _reopen_guard = UiReopenListener::start(access.url());
     loop {
         let paths = photo_root_paths(&root);
         Folder::open(&root)?.state(true)?;
@@ -309,6 +313,7 @@ fn serve_once(
         }),
         include_raw,
         job: Arc::new(JobState::with_log_file(root, root.join(".firstcut").join("review.log"))),
+        write_lock: Arc::new(tokio::sync::Mutex::new(())),
         control: control.clone(),
     });
     let load_state = Arc::clone(&state);
@@ -407,6 +412,86 @@ pub fn open_review_browser(url: &str) -> Result<()> {
         std::process::Command::new(program).arg(url).spawn()?;
     }
     Ok(())
+}
+
+/// Windows 单实例唤起信号：再次双击 `firstcut-ui.exe` 时通知已在运行的进程重新打开带
+/// `#access=` 的复核链接，避免在浏览器清缓存或更换默认浏览器后被锁在登录页，且不落盘凭据。
+#[cfg(windows)]
+const UI_REOPEN_EVENT: &str = "Local\\firstcut-ui-reopen-8787";
+
+#[cfg(windows)]
+#[link(name = "Kernel32")]
+extern "system" {
+    fn CreateEventW(
+        lp_event_attributes: *mut std::ffi::c_void,
+        b_manual_reset: i32,
+        b_initial_state: i32,
+        lp_name: *const u16,
+    ) -> isize;
+    fn OpenEventW(dw_desired_access: u32, b_inherit_handle: i32, lp_name: *const u16) -> isize;
+    fn SetEvent(h_event: isize) -> i32;
+    fn WaitForSingleObject(h_handle: isize, dw_milliseconds: u32) -> u32;
+    fn CloseHandle(h_object: isize) -> i32;
+}
+
+#[cfg(windows)]
+pub fn signal_ui_reopen() -> bool {
+    const EVENT_MODIFY_STATE: u32 = 0x0002;
+    let wide: Vec<u16> = UI_REOPEN_EVENT.encode_utf16().chain([0]).collect();
+    let handle = unsafe { OpenEventW(EVENT_MODIFY_STATE, 0, wide.as_ptr()) };
+    if handle == 0 {
+        return false;
+    }
+    let ok = unsafe { SetEvent(handle) } != 0;
+    unsafe { CloseHandle(handle) };
+    ok
+}
+
+#[cfg(windows)]
+struct UiReopenListener {
+    handle: isize,
+    stopped: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(windows)]
+impl UiReopenListener {
+    fn start(url: String) -> Option<Self> {
+        const INFINITE: u32 = 0xFFFF_FFFF;
+        const WAIT_OBJECT_0: u32 = 0;
+        let wide: Vec<u16> = UI_REOPEN_EVENT.encode_utf16().chain([0]).collect();
+        let handle = unsafe { CreateEventW(std::ptr::null_mut(), 0, 0, wide.as_ptr()) };
+        if handle == 0 {
+            return None;
+        }
+        let stopped = Arc::new(AtomicBool::new(false));
+        let thread_stopped = Arc::clone(&stopped);
+        let thread = std::thread::spawn(move || {
+            while unsafe { WaitForSingleObject(handle, INFINITE) } == WAIT_OBJECT_0 {
+                if thread_stopped.load(Ordering::Acquire) {
+                    break;
+                }
+                let _ = open_review_browser(&url);
+            }
+        });
+        Some(Self {
+            handle,
+            stopped,
+            thread: Some(thread),
+        })
+    }
+}
+
+#[cfg(windows)]
+impl Drop for UiReopenListener {
+    fn drop(&mut self) {
+        self.stopped.store(true, Ordering::Release);
+        unsafe { SetEvent(self.handle) };
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        unsafe { CloseHandle(self.handle) };
+    }
 }
 
 fn build_review_snapshot(
@@ -564,10 +649,13 @@ struct UiSettingsRequest {
 }
 
 async fn ui_settings_get(State(state): State<Arc<AppState>>) -> Response {
-    let preferences = load_ui_preferences(&state.root);
-    json_response(serde_json::json!({
-        "histogram_sample_percent": preferences.histogram_sample_percent,
-    }))
+    let root = state.root.clone();
+    match tokio::task::spawn_blocking(move || load_ui_preferences(&root)).await {
+        Ok(preferences) => json_response(serde_json::json!({
+            "histogram_sample_percent": preferences.histogram_sample_percent,
+        })),
+        Err(err) => internal_error(err.into()),
+    }
 }
 
 async fn ui_settings_save(
@@ -577,15 +665,25 @@ async fn ui_settings_save(
     if !(1..=25).contains(&request.histogram_sample_percent) {
         return (StatusCode::BAD_REQUEST, "直方图抽样比例必须在 1% 到 25% 之间").into_response();
     }
-    let mut preferences = load_ui_preferences(&state.root);
-    preferences.histogram_sample_percent = request.histogram_sample_percent;
-    if let Err(error) = save_ui_preferences(&state.root, &preferences) {
-        return internal_error(error.into());
+    let _write_guard = state.write_lock.lock().await;
+    let Some(_mutation) = state.job.begin_mutation() else {
+        return (StatusCode::CONFLICT, "评分任务进行中或服务正在关闭，暂不能保存设置").into_response();
+    };
+    let root = state.root.clone();
+    let sample_percent = request.histogram_sample_percent;
+    match tokio::task::spawn_blocking(move || -> Result<u8> {
+        let mut preferences = load_ui_preferences(&root);
+        preferences.histogram_sample_percent = sample_percent;
+        save_ui_preferences(&root, &preferences)?;
+        Ok(preferences.histogram_sample_percent)
+    }).await {
+        Ok(Ok(saved)) => json_response(serde_json::json!({
+            "ok": true,
+            "histogram_sample_percent": saved,
+        })),
+        Ok(Err(error)) => internal_error(error),
+        Err(err) => internal_error(err.into()),
     }
-    json_response(serde_json::json!({
-        "ok": true,
-        "histogram_sample_percent": preferences.histogram_sample_percent,
-    }))
 }
 
 #[derive(Deserialize)]
@@ -738,9 +836,10 @@ struct BurstKeepParams {
 /// POST /api/burst/keep：保存单张照片的手动连拍保留决定。
 async fn burst_keep(State(state): State<Arc<AppState>>,
     axum::Json(p): axum::Json<BurstKeepParams>) -> Response {
-    if state.job.is_running() {
-        return (StatusCode::CONFLICT, "评分任务进行中，暂不能修改连拍标记").into_response();
-    }
+    let _write_guard = state.write_lock.lock().await;
+    let Some(_mutation) = state.job.begin_mutation() else {
+        return (StatusCode::CONFLICT, "评分任务进行中或服务正在关闭，暂不能修改连拍标记").into_response();
+    };
     let pair_id = {
         let guard = state.snapshot.read().unwrap();
         let Some(photo) = guard.photos.iter().find(|x| x.path == p.p && !x.is_raw) else {
@@ -752,20 +851,23 @@ async fn burst_keep(State(state): State<Arc<AppState>>,
         photo.pair_id.clone()
     };
 
-    let mut overrides = state.burst_overrides.write().unwrap();
-    let previous = overrides.get(&p.p).copied();
-    if let Some(keep) = p.keep { overrides.insert(p.p.clone(), keep); }
-    else { overrides.remove(&p.p); }
-    let bytes = match serde_json::to_vec_pretty(&*overrides) {
+    let mut next_overrides = state.burst_overrides.read().unwrap().clone();
+    if let Some(keep) = p.keep { next_overrides.insert(p.p.clone(), keep); }
+    else { next_overrides.remove(&p.p); }
+    let bytes = match serde_json::to_vec_pretty(&next_overrides) {
         Ok(bytes) => bytes,
         Err(err) => return internal_error(err.into()),
     };
-    if let Err(err) = FileRef::at(&state.root, &state.burst_overrides_path, true)
-        .and_then(|file| file.write(&bytes)) {
-        restore_override(&mut overrides, &p.p, previous);
-        return internal_error(err.into());
+    let root = state.root.clone();
+    let path = state.burst_overrides_path.clone();
+    match tokio::task::spawn_blocking(move || {
+        FileRef::at(&root, &path, true).and_then(|file| file.write(&bytes))
+    }).await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => return internal_error(err.into()),
+        Err(err) => return internal_error(err.into()),
     }
-    drop(overrides);
+    *state.burst_overrides.write().unwrap() = next_overrides;
 
     let mut guard = state.snapshot.write().unwrap();
     for photo in guard.photos.iter_mut().filter(|x| x.pair_id == pair_id) {
@@ -775,11 +877,6 @@ async fn burst_keep(State(state): State<Arc<AppState>>,
         }
     }
     json_response(serde_json::json!({"ok": true, "keep": p.keep}))
-}
-
-fn restore_override(overrides: &mut HashMap<String, bool>, path: &str, previous: Option<bool>) {
-    if let Some(value) = previous { overrides.insert(path.to_string(), value); }
-    else { overrides.remove(path); }
 }
 
 fn load_burst_overrides(root: &Path, path: &Path) -> Result<HashMap<String, bool>> {
@@ -807,9 +904,10 @@ async fn scene_feedback_save(State(state): State<Arc<AppState>>,
     if p.note.chars().count() > 1000 {
         return (StatusCode::BAD_REQUEST, "备注不能超过 1000 字").into_response();
     }
-    if state.job.is_running() {
-        return (StatusCode::CONFLICT, "评分任务进行中，暂不能记录场景").into_response();
-    }
+    let _write_guard = state.write_lock.lock().await;
+    let Some(_mutation) = state.job.begin_mutation() else {
+        return (StatusCode::CONFLICT, "评分任务进行中或服务正在关闭，暂不能记录场景").into_response();
+    };
     let record = {
         let guard = state.snapshot.read().unwrap();
         let Some(photo) = guard.photos.iter().find(|x| x.path == p.p && !x.is_raw) else {
@@ -827,12 +925,17 @@ async fn scene_feedback_save(State(state): State<Arc<AppState>>,
             scores: photo.scores.clone(),
         }
     };
-    let mut feedback = state.scene_feedback.write().unwrap();
-    if let Err(err) = scene_feedback::append(&state.root, &state.scene_feedback_path, &record) {
-        return internal_error(err);
+    let root = state.root.clone();
+    let path = state.scene_feedback_path.clone();
+    let write_record = record.clone();
+    match tokio::task::spawn_blocking(move || {
+        scene_feedback::append(&root, &path, &write_record)
+    }).await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => return internal_error(err),
+        Err(err) => return internal_error(err.into()),
     }
-    feedback.insert(record.photo_path.clone(), record.clone());
-    drop(feedback);
+    state.scene_feedback.write().unwrap().insert(record.photo_path.clone(), record.clone());
     let mut guard = state.snapshot.write().unwrap();
     if let Some(photo) = guard.photos.iter_mut().find(|x| x.path == record.photo_path) {
         photo.scene_feedback = Some(record.clone());
@@ -847,9 +950,10 @@ async fn rate(State(state): State<Arc<AppState>>,
     if !(1..=5).contains(&p.stars) {
         return (StatusCode::BAD_REQUEST, "星级必须是 1~5").into_response();
     }
-    if state.job.is_running() {
-        return (StatusCode::CONFLICT, "评分任务进行中，暂不能改星").into_response();
-    }
+    let _write_guard = state.write_lock.lock().await;
+    let Some(_mutation) = state.job.begin_mutation() else {
+        return (StatusCode::CONFLICT, "评分任务进行中或服务正在关闭，暂不能改星").into_response();
+    };
     // 从当前快照取该照片的分数（未评分照片没有可写子分，拒绝）
     let (scores, total, suggested_ev, pair_id, jpg_path, sidecar_entries) = {
         let guard = state.snapshot.read().unwrap();
@@ -920,21 +1024,28 @@ async fn rate(State(state): State<Arc<AppState>>,
             }).collect::<Vec<_>>();
         (px, s.total, s.suggested_ev, photo.pair_id.clone(), jpg_path, sidecar_entries)
     };
-    if let Err(err) = crate::decision::set(&state.root, &jpg_path, p.stars) {
-        return internal_error(err);
-    }
-    let mut warnings = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    for entry in &sidecar_entries {
-        let sidecar = Path::new(&entry.path)
-            .with_file_name(format!("{}.xmp", crate::scan::stem_raw_of(&entry.filename)));
-        if !seen.insert(sidecar) { continue; }
-        match crate::output::xmp::write_sidecar(&state.root, entry, &scores, total, p.stars, suggested_ev) {
-            Ok(true) => {},
-            Ok(false) => warnings.push(format!("{} 已有其他软件的侧车，未覆盖", entry.path)),
-            Err(err) => warnings.push(format!("{} 侧车写入失败: {err:#}", entry.path)),
+    let root = state.root.clone();
+    let stars = p.stars;
+    let warnings = match tokio::task::spawn_blocking(move || -> Result<Vec<String>> {
+        crate::decision::set(&root, &jpg_path, stars)?;
+        let mut warnings = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for entry in &sidecar_entries {
+            let sidecar = Path::new(&entry.path)
+                .with_file_name(format!("{}.xmp", crate::scan::stem_raw_of(&entry.filename)));
+            if !seen.insert(sidecar) { continue; }
+            match crate::output::xmp::write_sidecar(&root, entry, &scores, total, stars, suggested_ev) {
+                Ok(true) => {},
+                Ok(false) => warnings.push(format!("{} 已有其他软件的侧车，未覆盖", entry.path)),
+                Err(err) => warnings.push(format!("{} 侧车写入失败: {err:#}", entry.path)),
+            }
         }
-    }
+        Ok(warnings)
+    }).await {
+        Ok(Ok(warnings)) => warnings,
+        Ok(Err(err)) => return internal_error(err),
+        Err(err) => return internal_error(err.into()),
+    };
     let mut guard = state.snapshot.write().unwrap();
     for photo in guard.photos.iter_mut().filter(|x| x.pair_id == pair_id) {
         photo.stars = Some(p.stars);
@@ -945,13 +1056,20 @@ async fn rate(State(state): State<Arc<AppState>>,
 
 /// GET /api/config：当前可编辑配置值（文件不存在时为内置默认）
 async fn config_get(State(state): State<Arc<AppState>>) -> Response {
-    match load_review_config(&state.root, state.config_explicit.then_some(state.config_path.as_path())) {
-        Ok((cfg, exists)) => json_response(serde_json::json!({
-            "path": state.config_path.display().to_string(),
+    let root = state.root.clone();
+    let config_path = state.config_path.clone();
+    let explicit = state.config_explicit;
+    match tokio::task::spawn_blocking(move || {
+        load_review_config(&root, explicit.then_some(config_path.as_path()))
+            .map(|(cfg, exists)| (config_path, cfg, exists))
+    }).await {
+        Ok(Ok((path, cfg, exists))) => json_response(serde_json::json!({
+            "path": path.display().to_string(),
             "exists": exists,
             "values": config_edit::ConfigValues::from_cfg(&cfg),
         })),
-        Err(err) => internal_error(err),
+        Ok(Err(err)) => internal_error(err),
+        Err(err) => internal_error(err.into()),
     }
 }
 
@@ -960,12 +1078,21 @@ async fn config_save(
     State(state): State<Arc<AppState>>,
     axum::Json(values): axum::Json<config_edit::ConfigValues>,
 ) -> Response {
-    match config_edit::save_in(&state.root, &state.config_path, &values) {
-        Ok(()) => {
+    let _write_guard = state.write_lock.lock().await;
+    let Some(_mutation) = state.job.begin_mutation() else {
+        return (StatusCode::CONFLICT, "评分任务进行中或服务正在关闭，暂不能保存配置").into_response();
+    };
+    let root = state.root.clone();
+    let config_path = state.config_path.clone();
+    match tokio::task::spawn_blocking(move || {
+        config_edit::save_in(&root, &config_path, &values)
+    }).await {
+        Ok(Ok(())) => {
             let note = "已保存；下一次 UI 跑批生效";
             json_response(serde_json::json!({ "ok": true, "note": note }))
         }
-        Err(err) => (StatusCode::BAD_REQUEST, format!("{err:#}")).into_response(),
+        Ok(Err(err)) => (StatusCode::BAD_REQUEST, format!("{err:#}")).into_response(),
+        Err(err) => internal_error(err.into()),
     }
 }
 
@@ -1085,7 +1212,9 @@ mod tests {
             loading: AtomicBool::new(false), load_error: Mutex::new(None),
             load_progress: Mutex::new(LoadProgress { phase: String::new(), done: 0, total: 0 }),
             include_raw: true,
-            job: Arc::new(JobState::new()), control: Some(Arc::clone(&control)),
+            job: Arc::new(JobState::new()),
+            write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            control: Some(Arc::clone(&control)),
         });
         let access = Arc::new(access::Access::new(Ipv4Addr::LOCALHOST.into(), 8787, None, None).unwrap());
         let url = access.url();
@@ -1162,6 +1291,7 @@ mod tests {
             loading: AtomicBool::new(false), load_error: Mutex::new(None),
             load_progress: Mutex::new(LoadProgress { phase: String::new(), done: 0, total: 0 }),
             include_raw: true,
+            write_lock: Arc::new(tokio::sync::Mutex::new(())),
             control: None,
         };
         let ok = resolve_jpeg(&state, "d/a.jpg");
@@ -1202,6 +1332,7 @@ mod tests {
             loading: AtomicBool::new(false), load_error: Mutex::new(None),
             load_progress: Mutex::new(LoadProgress { phase: String::new(), done: 0, total: 0 }),
             include_raw: true,
+            write_lock: Arc::new(tokio::sync::Mutex::new(())),
             control: None,
         });
         let response = burst_keep(State(Arc::clone(&state)), axum::Json(BurstKeepParams {
@@ -1259,6 +1390,7 @@ mod tests {
             loading: AtomicBool::new(false), load_error: Mutex::new(None),
             load_progress: Mutex::new(LoadProgress { phase: String::new(), done: 0, total: 0 }),
             include_raw: true,
+            write_lock: Arc::new(tokio::sync::Mutex::new(())),
             control: None,
         });
         let response = scene_feedback_save(State(Arc::clone(&state)),
@@ -1277,5 +1409,56 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_eq!(std::fs::read_to_string(&feedback_path).unwrap().lines().count(), 1);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn concurrent_rate_requests_serialize_without_lock_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_path_buf();
+        std::fs::write(dir.join("a.jpg"), b"jpg").unwrap();
+        let photo = snapshot::PhotoJson {
+            path: "a.jpg".into(), filename: "a.jpg".into(), ext: "jpg".into(),
+            is_raw: false, has_pair: false, pair_id: "a".into(), datetime: String::new(),
+            iso: String::new(), f_number: String::new(), shutter: String::new(), focal: String::new(),
+            scores: Some(snapshot::ScoresJson { sharpness: 70.0, exposure: 75.0, noise: 80.0,
+                composition: 60.0, aesthetic: 65.0, total: 70.5, suggested_ev: Some(0.33) }),
+            stars: Some(3), rating_source: Some("algorithm".into()),
+            analysis_mode: Some("pixel".into()), faces: 0, burst: None,
+            scene_hint: snapshot::SceneHintJson { id: "unknown", label: "未识别", reason: String::new() },
+            scene_feedback: None,
+        };
+        let state = Arc::new(AppState {
+            root: dir.clone(), cache_path: dir.join(".firstcut/cache.sqlite"),
+            config_path: dir.join(".firstcut/config.toml"),
+            config_explicit: false, burst_overrides: RwLock::new(HashMap::new()),
+            burst_overrides_path: dir.join(".firstcut/burst-overrides.json"),
+            scene_feedback: RwLock::new(HashMap::new()), scene_feedback_path: scene_feedback::store_path(&dir),
+            image_slots: Arc::new(Semaphore::new(2)), thumb_slots: Arc::new(Semaphore::new(1)),
+            snapshot: RwLock::new(Snapshot { root: dir.display().to_string(),
+                weights: snapshot::WeightsJson { sharpness: 0.3, exposure: 0.25, noise: 0.15,
+                    composition: 0.15, aesthetic: 0.15 }, photos: vec![photo] }),
+            job: Arc::new(JobState::new()),
+            write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            loading: AtomicBool::new(false), load_error: Mutex::new(None),
+            load_progress: Mutex::new(LoadProgress { phase: String::new(), done: 0, total: 0 }),
+            include_raw: true,
+            control: None,
+        });
+        let mut tasks = Vec::new();
+        for stars in 1u8..=5 {
+            let st = Arc::clone(&state);
+            tasks.push(tokio::spawn(async move {
+                rate(State(st), axum::Json(RateParams { p: "a.jpg".into(), stars })).await.status()
+            }));
+        }
+        for task in tasks {
+            assert_eq!(task.await.unwrap(), StatusCode::OK, "并发快速改星不应触发 SQLite 锁冲突 500");
+        }
+        let final_star = state.snapshot.read().unwrap().photos[0].stars.unwrap();
+        let saved = crate::decision::load(&dir).unwrap();
+        assert_eq!(saved.get("a.jpg").copied(), Some(final_star), "快照与决定库星级必须一致");
+        let sidecar = std::fs::read_to_string(dir.join("a.xmp")).unwrap();
+        assert!(sidecar.contains(&format!("<xmp:Rating>{final_star}</xmp:Rating>")), "XMP 与快照星级必须一致");
+        assert!(sidecar.contains("crs:Exposure2012=\"+0.33\""));
     }
 }

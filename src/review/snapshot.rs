@@ -128,7 +128,9 @@ pub fn build_snapshot_with_options(root: &Path, cfg: &ScoreConfig, cache_path: &
     progress("匹配评分缓存", 0, entries.len());
     let pixel_hash = crate::config::analysis_fingerprint(cfg, false);
     let ai_hash = crate::config::analysis_fingerprint(cfg, true);
-    let models_available = crate::ai::ensure_models().is_ok();
+    let legacy_ai_hash = crate::ai::ensure_models()
+        .ok()
+        .map(|_| crate::config::legacy_ai_fingerprint(cfg));
 
     // 打开缓存并按「size+mtime+version+cfg_hash」过滤出本次可用的分析结果
     let mut analyzed: HashMap<String, AnalysisResult> = HashMap::new();
@@ -150,12 +152,13 @@ pub fn build_snapshot_with_options(root: &Path, cfg: &ScoreConfig, cache_path: &
                 .and_then(|meta| cache::metadata_fingerprint(&meta)) else {
                 continue;
             };
-            let Some(row) = c.rows().get(&e.path) else { continue };
-            if row.matches(size, mtime, cache::CACHE_VERSION, pixel_hash)
-                || (models_available
-                    && row.matches(size, mtime, cache::CACHE_VERSION, ai_hash)) {
+            let Some((row, _)) = cache::lookup(c.rows(), root, &e.path) else { continue };
+            let is_ai = row.matches(size, mtime, cache::CACHE_VERSION, ai_hash)
+                || legacy_ai_hash
+                    .is_some_and(|h| row.matches(size, mtime, cache::CACHE_VERSION, h));
+            if is_ai || row.matches(size, mtime, cache::CACHE_VERSION, pixel_hash) {
                 analyzed.insert(e.pair_id().to_string(), row.result);
-                mode_by_pair.insert(e.pair_id().to_string(), row.cfg_hash == ai_hash);
+                mode_by_pair.insert(e.pair_id().to_string(), is_ai);
             }
         }
     }
@@ -163,12 +166,25 @@ pub fn build_snapshot_with_options(root: &Path, cfg: &ScoreConfig, cache_path: &
     progress("计算星级与连拍", 0, entries.len());
     let selection = crate::selection::build(root, &entries, &analyzed, cfg, None)?;
 
+    // 手动连拍保留覆盖以 JPG 相对路径持久化，通过 pair_id 同步到配对 RAW。
+    let mut manual_keep_by_pair: HashMap<&str, bool> = HashMap::new();
+    for e in entries.iter().filter(|e| !e.is_raw) {
+        let rel = rel_path(root, Path::new(&e.path));
+        if let Some(&keep) = manual_keep.get(&rel) {
+            manual_keep_by_pair.insert(e.pair_id(), keep);
+        }
+    }
+
     let mut photos: Vec<PhotoJson> = entries
         .iter()
         .map(|e| {
             let analyzed_result = analyzed.get(e.pair_id());
             let rel = rel_path(root, Path::new(&e.path));
             let ai_mode = mode_by_pair.get(e.pair_id()) == Some(&true);
+            let manual_burst_keep = manual_keep_by_pair
+                .get(e.pair_id())
+                .copied()
+                .or_else(|| manual_keep.get(&rel).copied());
             PhotoJson {
                 path: rel.clone(),
                 filename: e.filename.clone(),
@@ -202,9 +218,9 @@ pub fn build_snapshot_with_options(root: &Path, cfg: &ScoreConfig, cache_path: &
                     group: i.group,
                     size: i.size,
                     rank: i.rank,
-                    keep: manual_keep.get(&rel).copied().unwrap_or(i.keep),
+                    keep: manual_burst_keep.unwrap_or(i.keep),
                     suggested_keep: i.keep,
-                    manual_keep: manual_keep.get(&rel).copied(),
+                    manual_keep: manual_burst_keep,
                     pose_cluster: i.pose_cluster,
                 }),
             }
@@ -321,5 +337,77 @@ mod tests {
     fn unix_filename_is_not_reinterpreted_as_another_path() {
         let root = Path::new("/album");
         assert_eq!(rel_path(root, &root.join(r"camera\a.jpg")), r"camera\a.jpg");
+    }
+
+    #[test]
+    fn portable_ai_cache_and_manual_burst_override_propagate_to_paired_raw() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("album");
+        std::fs::create_dir_all(root.join("JPG")).unwrap();
+        std::fs::create_dir_all(root.join("RAW")).unwrap();
+        let jpg_a = root.join("JPG/a.jpg");
+        let jpg_b = root.join("JPG/b.jpg");
+        let raw_a = root.join("RAW/a.ARW");
+        let raw_b = root.join("RAW/b.ARW");
+        image::RgbImage::from_pixel(32, 32, image::Rgb([100, 120, 140])).save(&jpg_a).unwrap();
+        image::RgbImage::from_pixel(32, 32, image::Rgb([100, 120, 140])).save(&jpg_b).unwrap();
+        std::fs::write(&raw_a, b"raw").unwrap();
+        std::fs::write(&raw_b, b"raw").unwrap();
+        // 写入同一连拍时间的 EXIF 复用报告，让两张图归入同一连拍组
+        let report_entries = vec![
+            scan::PhotoEntry {
+                path: jpg_a.display().to_string(),
+                filename: "a.jpg".into(),
+                extension: "jpg".into(),
+                date_time_original: "2026:09:27 12:00:00".into(),
+                ..Default::default()
+            },
+            scan::PhotoEntry {
+                path: jpg_b.display().to_string(),
+                filename: "b.jpg".into(),
+                extension: "jpg".into(),
+                date_time_original: "2026:09:27 12:00:01".into(),
+                ..Default::default()
+            },
+        ];
+        crate::output::csv::write_csv_in(&root, &root.join(".firstcut/report.csv"), &report_entries, true).unwrap();
+
+        // 以相对路径键 + AI 可移植指纹写入缓存
+        let cfg = ScoreConfig::default();
+        let ai_hash = crate::config::analysis_fingerprint(&cfg, true);
+        let cache_path = root.join(".firstcut/cache.sqlite");
+        let mut cache = ScoreCache::open_in(&root, &cache_path, ai_hash, true).unwrap().unwrap();
+        for (p, total_s) in [(&jpg_a, 80.0), (&jpg_b, 70.0)] {
+            let (size, mtime) = cache::file_fingerprint(p).unwrap();
+            cache.put(
+                &cache::cache_key(&root, p),
+                size,
+                mtime,
+                &AnalysisResult {
+                    scores: score::PixelScores {
+                        sharpness: total_s,
+                        exposure: total_s,
+                        noise: total_s,
+                        composition: total_s,
+                        aesthetic: total_s,
+                    },
+                    dhash: 0,
+                    faces: 1,
+                    pose_desc: None,
+                    suggested_ev: None,
+                },
+            ).unwrap();
+        }
+        cache.flush().unwrap();
+
+        let overrides = HashMap::from([("JPG/a.jpg".to_string(), false)]);
+        let snap = build_snapshot(&root, &cfg, &cache_path, &overrides, &HashMap::new()).unwrap();
+        let photo_jpg = snap.photos.iter().find(|p| p.path == "JPG/a.jpg").unwrap();
+        let photo_raw = snap.photos.iter().find(|p| p.path == "RAW/a.ARW").unwrap();
+        assert_eq!(photo_jpg.analysis_mode.as_deref(), Some("ai"), "无本地模型目录也应可读已有可移植 AI 缓存");
+        assert_eq!(photo_jpg.burst.as_ref().unwrap().manual_keep, Some(false));
+        assert!(!photo_jpg.burst.as_ref().unwrap().keep);
+        assert_eq!(photo_raw.burst.as_ref().unwrap().manual_keep, Some(false), "配对 RAW 应同步手动连拍覆盖");
+        assert!(!photo_raw.burst.as_ref().unwrap().keep);
     }
 }

@@ -278,17 +278,41 @@ async function boot(){
   return true;
 }
 function loadData(){
-  apiFetch("/api/photos").then(r=>r.json()).then(j=>{
-    const currentPath = LB && LB.list[LB.idx].path;
+  apiFetch("/api/photos").then(r=>{
+    if(!r.ok) throw new Error(r.status);
+    return r.json();
+  }).then(j=>{
+    const currentPath = LB?.list?.[LB.idx]?.path;
     SNAPSHOT = j;
     ingest();
+    rebuildGroupOptions();
     if(currentPath){
       const list = visible();
       const idx = list.findIndex(p=>p.path===currentPath);
       if(idx < 0) closeLightbox();
       else { LB.list = list; LB.idx = idx; renderLB(); }
     }
-  });
+  }).catch(()=>{});
+}
+function rebuildGroupOptions(){
+  const groupCounts = new Map();
+  for(const p of jpgs){
+    const group = p.burst && p.burst.group;
+    if(group) groupCounts.set(group, (groupCounts.get(group) || 0) + 1);
+  }
+  const groupBox = document.getElementById("fGroup");
+  groupBox.querySelectorAll('option[value^="group:"]').forEach(opt => opt.remove());
+  for(const [group, count] of [...groupCounts].sort((a,b)=>a[0]-b[0])){
+    const option = document.createElement("option");
+    option.value = `group:${group}`;
+    option.textContent = `组 ${group}（${count} 张）`;
+    groupBox.appendChild(option);
+  }
+  groupBox.value = f.group;
+  if(!groupBox.value){
+    f.group = "all";
+    groupBox.value = "all";
+  }
 }
 function buildFilters(){
   const starBox = document.getElementById("fStars");
@@ -307,18 +331,7 @@ function buildFilters(){
     wrap.appendChild(r);
     dims.appendChild(wrap);
   }
-  const groupCounts = new Map();
-  for(const p of jpgs){
-    const group = p.burst && p.burst.group;
-    if(group) groupCounts.set(group, (groupCounts.get(group) || 0) + 1);
-  }
-  const groupBox = document.getElementById("fGroup");
-  for(const [group, count] of [...groupCounts].sort((a,b)=>a[0]-b[0])){
-    const option = document.createElement("option");
-    option.value = `group:${group}`;
-    option.textContent = `组 ${group}（${count} 张）`;
-    groupBox.appendChild(option);
-  }
+  rebuildGroupOptions();
 }
 function onFilter(){
   f.search = document.getElementById("fSearch").value.trim().toLowerCase();
@@ -504,6 +517,7 @@ async function setBurstKeep(photo, keep){
         item.burst.manual_keep = result.keep;
       }
     }
+    if(LB) renderLBActive();
     apply();
     toast(keep == null ? '已恢复自动保留建议' : (keep ? '已手动标记为保留' : '已手动标记为舍弃'));
   }catch(error){
@@ -544,7 +558,6 @@ async function loadHistogramSettings(){
     if(LB?.histogramOpen) renderLBHistogram();
   } catch (_) {}
 }
-loadHistogramSettings();
 
 function apertureLabel(value){
   const text = String(value || '').trim();
@@ -995,13 +1008,15 @@ function bindPane(pane){
     layoutPanes();
   }, {passive:false});
   let drag = null;
-  pane.addEventListener("mousedown", e=>{
+  pane.addEventListener("pointerdown", e=>{
+    if(e.button !== 0) return;
     selectPane(pane.dataset.path);
-    drag = {x:e.clientX, y:e.clientY, ax:LB.view.ax, ay:LB.view.ay};
+    drag = {id:e.pointerId, x:e.clientX, y:e.clientY, ax:LB.view.ax, ay:LB.view.ay};
+    pane.setPointerCapture(e.pointerId);
     pane.classList.add("dragging");
   });
-  window.addEventListener("mousemove", e=>{
-    if(!drag) return;
+  pane.addEventListener("pointermove", e=>{
+    if(!drag || e.pointerId !== drag.id) return;
     const img = pane.querySelector("img");
     if(!LB || !img.naturalWidth || !img.naturalHeight) return;
     const k = curK(pane);
@@ -1009,7 +1024,14 @@ function bindPane(pane){
     LB.view.ay = drag.ay - (e.clientY - drag.y) / (k * img.naturalHeight);
     layoutPanes();
   });
-  window.addEventListener("mouseup", ()=>{ drag = null; pane.classList.remove("dragging"); });
+  function endPaneDrag(e){
+    if(!drag || e.pointerId !== drag.id) return;
+    drag = null;
+    pane.classList.remove("dragging");
+  }
+  pane.addEventListener("pointerup", endPaneDrag);
+  pane.addEventListener("pointercancel", endPaneDrag);
+  pane.addEventListener("lostpointercapture", endPaneDrag);
   pane.addEventListener("dblclick", ()=>{
     LB.view = {s:1, ax:.5, ay:.5, fx:.5, fy:.5};
     layoutPanes();
@@ -1105,11 +1127,13 @@ document.getElementById('runBtn').addEventListener('click', ()=>{
   apiFetch('/api/score/run', {method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({xmp: document.getElementById('runXmp').checked, no_ai: document.getElementById('runNoAi').checked})
   }).then(async r=>{
-    if(r.status === 409){ toast(await r.text() || '当前无法开始评分'); }
+    if(!r.ok){
+      toast(await r.text() || `无法开始评分（${r.status}）`);
+      return;
+    }
     jobPolling = setTimeout(pollJob, 300);
-  });
+  }).catch(err=> toast('无法开始评分：' + err));
 });
-pollJob();
 
 // 星级：灯箱内按钮 + 快捷键
 function renderLbStars(){
@@ -1129,17 +1153,25 @@ function setStars(photo, n){
   apiFetch('/api/rate', {method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({p: photo.path, stars: n})
   }).then(async r=>{
-    const j = await r.json().catch(()=>({}));
+    const text = await r.text();
+    let j = {};
+    try { j = JSON.parse(text); } catch (_) {}
     if(r.ok && j.ok){
       toast(j.warnings?.length ? `已保存 ${n} 星；${j.warnings.length} 个侧车未同步` : `已保存 ${n} 星`);
-      // 本地数据同步（同 stem 共享星级）
+      // 本地数据同步（同 stem 共享星级）；不重建窗格 DOM，避免重拉原图与重算直方图
       const stem = photo.path.replace(/\.[^.]+$/,'').toLowerCase();
-      jpgs.forEach(p=>{ if(p.path.replace(/\.[^.]+$/,'').toLowerCase() === stem){ p.stars = n; p.rating_source = 'manual'; } });
-      renderLB(); apply();
+      for(const p of (SNAPSHOT?.photos || jpgs)){
+        if(p.path.replace(/\.[^.]+$/,'').toLowerCase() === stem){
+          p.stars = n;
+          p.rating_source = 'manual';
+        }
+      }
+      if(LB) renderLBActive();
+      apply();
     } else {
-      toast(j && typeof j === 'string' ? j : (j.error || r.statusText || '写入失败'));
+      toast(j.error || text || r.statusText || '写入失败');
     }
-  });
+  }).catch(err=> toast('写入失败：' + err));
 }
 // 快捷键 1~5（灯箱打开时）
 window.addEventListener('keydown', e=>{
@@ -1340,6 +1372,8 @@ async function startReview(){
 }
 startReview().then(ready=>{
   if(!ready) return;
+  loadHistogramSettings();
+  pollJob();
   document.getElementById("fSearch").value = f.search;
   document.getElementById("fKeep").value = f.keep;
   document.getElementById("fGroup").value = f.group;

@@ -6,7 +6,9 @@ use std::path::PathBuf;
 #[cfg(windows)]
 fn main() {
     if already_running() {
-        let _ = pic_process::review::open_review_browser("http://127.0.0.1:8787/");
+        if !pic_process::review::signal_ui_reopen() {
+            let _ = pic_process::review::open_review_browser("http://127.0.0.1:8787/");
+        }
         return;
     }
 

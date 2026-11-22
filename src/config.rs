@@ -53,7 +53,7 @@ pub struct MetricParams {
     /// 主体脸亮度在曝光判定中的权重（0 = 只看全图，1 = 只看主体脸）
     pub exposure_subject_blend: f64,
     /// 建议 EV 上限（档）：曝光落在满分容差带外的照片，XMP/CSV 里会写一条
-    /// 建议修正（`firstcut:suggestedEV` + `crs:Exposure2`，供 Lightroom 确认应用）；
+    /// 建议修正（`firstcut:suggestedEV` + `crs:Exposure2012`，供 Lightroom / ACR 确认应用）；
     /// 建议被钳在 ±此值内（默认 2.0；极欠/极曝的片应在筛选里淘汰，不给 +3 档鬼建议）。
     /// 0 = 关闭建议输出。
     pub exposure_suggest_cap: f64,
@@ -324,19 +324,33 @@ fn validate_config(cfg: &ScoreConfig, source: &str) -> Result<()> {
 }
 
 /// 缓存分析来源：像素预览与完整 AI 分析必须使用不同的键。
-/// 模型文件的大小及修改时间变化时，也必须重新推理。
+/// AI 指纹绑定到 README 固定版本的模型 SHA-256（推理前强制校验），
+/// 避免仅因模型文件拷贝/容器挂载导致 mtime 变化而使已有缓存全部失效。
 pub fn analysis_fingerprint(cfg: &ScoreConfig, with_ai: bool) -> i64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     config_fingerprint(cfg).hash(&mut h);
     with_ai.hash(&mut h);
     if with_ai {
-        for name in ["clipiqa_model.onnx", "clipiqa_model.onnx.data",
-            "scrfd_10g_bnkps.onnx", "yolov8n_pose.onnx"] {
+        for (name, size, sha256) in crate::ai::MODEL_FILES {
             name.hash(&mut h);
-            crate::cache::file_fingerprint(&crate::ai::model_path(name))
-                .hash(&mut h);
+            size.hash(&mut h);
+            sha256.hash(&mut h);
         }
+    }
+    h.finish() as i64
+}
+
+/// 兼容 v1.4.2 及更早缓存：旧版 AI 指纹使用模型文件的 (size, mtime)。
+/// 仅在已确认本机模型文件可用时作为只读兼容回退，写入一律使用新的可移植指纹。
+pub(crate) fn legacy_ai_fingerprint(cfg: &ScoreConfig) -> i64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    config_fingerprint(cfg).hash(&mut h);
+    true.hash(&mut h);
+    for (name, _, _) in crate::ai::MODEL_FILES {
+        name.hash(&mut h);
+        crate::cache::file_fingerprint(&crate::ai::model_path(name)).hash(&mut h);
     }
     h.finish() as i64
 }
@@ -396,7 +410,7 @@ pub fn config_template() -> String {
          #   不越过中灰），再按此权重混合。设为 0 则只看全图（适合无主体人脸的题材）。\n\
          exposure_subject_blend = {}\n\
          # 建议 EV 上限（档）：曝光落在满分容差带外的照片会写一条建议修正\n\
-         #   （firstcut:suggestedEV + crs:Exposure2，供 Lightroom 确认应用）。\n\
+         #   （firstcut:suggestedEV + crs:Exposure2012，供 Lightroom / ACR 确认应用）。\n\
          #   默认 2.0；极欠/极曝的片建议在筛选里淘汰而不是给 +3 档鬼建议；0 = 关闭。\n\
          exposure_suggest_cap = {}\n\
          # 星级分档：\n\

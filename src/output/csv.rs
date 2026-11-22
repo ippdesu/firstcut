@@ -55,6 +55,14 @@ pub fn spreadsheet_text(value: &str) -> Cow<'_, str> {
     }
 }
 
+/// Remove the leading spreadsheet text marker added by [`spreadsheet_text`].
+pub fn unescape_spreadsheet_text(value: &str) -> &str {
+    match value.strip_prefix('\'') {
+        Some(rest) if matches!(spreadsheet_text(rest), Cow::Owned(_)) => rest,
+        _ => value,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -73,7 +81,10 @@ mod tests {
         write_csv_in(album.path(), &path, std::slice::from_ref(&entry), true).unwrap();
         let row: PhotoEntry = csv::Reader::from_path(&path).unwrap().deserialize().next().unwrap().unwrap();
         assert_eq!(row.filename, "'-example.jpg");
+        assert_eq!(unescape_spreadsheet_text(&row.filename), "-example.jpg");
         assert_eq!(row.camera_model, "'  ＋ 示例相机");
+        assert_eq!(unescape_spreadsheet_text(&row.camera_model), "  ＋ 示例相机");
+        assert_eq!(unescape_spreadsheet_text("'normal"), "'normal");
         assert_eq!(row.lens_model, entry.lens_model);
         assert_eq!(row.suggested_ev, entry.suggested_ev);
 

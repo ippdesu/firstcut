@@ -126,7 +126,7 @@
   #lbDetails textarea{min-height:60px;resize:vertical}
   #lbDetails .detail-save{margin-top:8px;background:#2e6b30;border:0;border-radius:4px;color:#fff;padding:7px 12px;cursor:pointer}
   #panes{flex:1;display:flex;gap:2px;min-height:0}
-  .pane{flex:1;position:relative;overflow:hidden;background:#000;cursor:grab}
+  .pane{flex:1;position:relative;overflow:hidden;background:#000;cursor:grab;touch-action:none}
   .pane.dragging{cursor:grabbing}
   .pane.active::after{content:"";position:absolute;inset:0;border:2px solid var(--acc);pointer-events:none;z-index:2}
   .pane img{position:absolute;transform-origin:0 0;user-select:none;-webkit-user-drag:none;pointer-events:none}

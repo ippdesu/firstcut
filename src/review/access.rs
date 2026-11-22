@@ -2,8 +2,10 @@
 //! with an ordinary page request. The exchanged bearer token is stored by
 //! browser origin; unlike cookies this separates different localhost ports.
 
+use std::collections::VecDeque;
 use std::net::IpAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use axum::extract::{Request, State};
@@ -16,6 +18,8 @@ use serde::Deserialize;
 use subtle::ConstantTimeEq;
 
 pub(super) const HEALTH_MARKER: &str = "firstcut-review";
+const MAX_FAILED_SIGN_INS: usize = 5;
+const SIGN_IN_WINDOW: Duration = Duration::from_secs(60);
 
 pub(super) struct Access {
     authority: String,
@@ -25,6 +29,7 @@ pub(super) struct Access {
     managed: bool,
     alias_authority: Option<String>,
     alias_origin: Option<String>,
+    failed_sign_ins: Mutex<VecDeque<Instant>>,
 }
 
 impl Access {
@@ -107,6 +112,7 @@ impl Access {
             managed: configured_key.is_some(),
             alias_authority,
             alias_origin,
+            failed_sign_ins: Mutex::new(VecDeque::new()),
         })
     }
 
@@ -251,12 +257,39 @@ pub(super) async fn sign_in(
     State(access): State<Arc<Access>>,
     Json(login): Json<SignIn>,
 ) -> Response {
-    if !equal_secret(&login.key, &access.key) {
-        return (
-            StatusCode::UNAUTHORIZED,
-            "复核访问凭据无效，请使用当前服务的链接",
-        )
-            .into_response();
+    let now = Instant::now();
+    {
+        let mut failures = access
+            .failed_sign_ins
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        while failures
+            .front()
+            .is_some_and(|t| now.duration_since(*t) >= SIGN_IN_WINDOW)
+        {
+            failures.pop_front();
+        }
+        if failures.len() >= MAX_FAILED_SIGN_INS {
+            let retry_after = SIGN_IN_WINDOW
+                .saturating_sub(now.duration_since(failures[0]))
+                .as_secs()
+                .max(1);
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                [(header::RETRY_AFTER, retry_after.to_string())],
+                "登录失败次数过多，请稍后再试",
+            )
+                .into_response();
+        }
+        if !equal_secret(&login.key, &access.key) {
+            failures.push_back(now);
+            return (
+                StatusCode::UNAUTHORIZED,
+                "复核访问凭据无效，请使用当前服务的链接",
+            )
+                .into_response();
+        }
+        failures.clear();
     }
     Json(serde_json::json!({"session": &access.session})).into_response()
 }
@@ -272,5 +305,30 @@ mod tests {
         let key = random_key().unwrap();
         assert!(Access::new(any, 8787, Some("http://photos.example.test"), Some(&key)).is_err());
         assert!(Access::new(any, 8787, Some("https://photos.example.test"), Some(&key)).is_ok());
+    }
+
+    #[tokio::test]
+    async fn sign_in_throttles_repeated_failures() {
+        let key = random_key().unwrap();
+        let access = Arc::new(
+            Access::new("127.0.0.1".parse().unwrap(), 8787, None, Some(&key)).unwrap(),
+        );
+        for _ in 0..MAX_FAILED_SIGN_INS {
+            let resp = sign_in(
+                State(Arc::clone(&access)),
+                Json(SignIn {
+                    key: "wrong-key".into(),
+                }),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        }
+        let limited = sign_in(
+            State(Arc::clone(&access)),
+            Json(SignIn { key: key.clone() }),
+        )
+        .await;
+        assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(limited.headers().contains_key(header::RETRY_AFTER));
     }
 }
