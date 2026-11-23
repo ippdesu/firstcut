@@ -121,3 +121,8 @@ CodeQL 路径告警涉及复核界面选择的照片根目录传入人工评分�
 - `node --check src/review/assets/review.js`：退出码 0。
 - `python .github/scripts/check-review.py --binary target/debug/pic_process.exe`：退出码 0（认证复核、原图/缩略图、重评分、落盘全通过）。
 - 未覆盖范围：同 3.3（真实 Lightroom / ACR 导入验收、真实选片质量评估、Linux/ARM64 容器真机构建交由 PR CI 验证）。
+
+**二次复审补充收尾（2026-11-23，基于 `dae0a7d`）**：
+- `[P2]` 复核页缓存查找顺序改为**键优先**（[snapshot.rs](../../src/review/snapshot.rs)、[score.rs](../../src/score.rs)）：优先采用有效的相对路径键记录（无论 AI 或纯像素），仅在相对路径记录不存在或指纹失效时回退旧绝对路径键，避免旧库重跑 `--no-ai` 后复核页仍显示旧 AI 分数（新增 `valid_relative_pixel_row_takes_precedence_over_legacy_absolute_ai_row`）。
+- `[P2]` 显式 `ApplySuggestedExposure` 改为检查同一 `<rdf:RDF>` 下所有顶层 `<rdf:Description>` 节点中的 `crs:Exposure2012` / `crs:Exposure`（以及 `crs:HasSettings` / `crs:ProcessVersion`），避免多描述节点 XMP（Adobe XMP §7.4）重复写入第二个曝光值（新增 `split_rdf_descriptions_do_not_duplicate_crs_exposure`）。
+- 复测验证（Windows x64）：`cargo test --locked --all-targets` **88 项单元测试 + 8 项集成测试全通过**，4 个主二进制构建无警告，`check-review.py` 全通过。

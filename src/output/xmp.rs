@@ -356,17 +356,34 @@ fn merge_xmp(
             }
             // 仅在显式请求且侧车尚无已有 Adobe 曝光参数时写入 crs:Exposure2012；绝不覆盖人工曝光。
             if mode == XmpWriteMode::ApplySuggestedExposure {
-                let has_existing_crs_exposure = desc.attributes().any(|a| {
-                    a.namespace() == Some(NS_CRS) && matches!(a.name(), "Exposure2012" | "Exposure")
-                }) || desc.children().any(|n| {
-                    n.tag_name().namespace() == Some(NS_CRS)
-                        && matches!(n.tag_name().name(), "Exposure2012" | "Exposure")
+                // Adobe XMP 规范 §7.4 允许同一张照片的属性分布在 <rdf:RDF> 下的多个顶层
+                // <rdf:Description> 节点中；检查所有顶层描述节点，避免在已有曝光时重复写入，
+                // 同时不误判局部蒙版/预设等嵌套 <rdf:Description>。
+                let top_descriptions: Vec<Node<'_, '_>> = desc
+                    .parent()
+                    .filter(|p| p.has_tag_name((NS_RDF, "RDF")))
+                    .map(|rdf| {
+                        rdf.children()
+                            .filter(|n| n.has_tag_name((NS_RDF, "Description")))
+                            .collect()
+                    })
+                    .unwrap_or_else(|| vec![desc]);
+                let has_existing_crs_exposure = top_descriptions.iter().any(|d| {
+                    d.attributes().any(|a| {
+                        a.namespace() == Some(NS_CRS)
+                            && matches!(a.name(), "Exposure2012" | "Exposure")
+                    }) || d.children().any(|n| {
+                        n.tag_name().namespace() == Some(NS_CRS)
+                            && matches!(n.tag_name().name(), "Exposure2012" | "Exposure")
+                    })
                 });
-                if let Some(legacy_exp2) = desc
-                    .attributes()
-                    .find(|a| a.namespace() == Some(NS_CRS) && a.name() == "Exposure2")
-                {
-                    edits.push((legacy_exp2.range(), String::new()));
+                for d in &top_descriptions {
+                    if let Some(legacy_exp2) = d
+                        .attributes()
+                        .find(|a| a.namespace() == Some(NS_CRS) && a.name() == "Exposure2")
+                    {
+                        edits.push((legacy_exp2.range(), String::new()));
+                    }
                 }
                 if !has_existing_crs_exposure {
                     let crs_prefix = if let Some(prefix) = desc.lookup_prefix(NS_CRS) {
@@ -380,19 +397,29 @@ fn merge_xmp(
                         "crs".to_string()
                     };
                     extra_attrs.push_str(&format!(" {crs_prefix}:Exposure2012=\"{formatted_ev}\""));
-                    let crs_has_settings_attr = desc.attributes().find(|a| a.namespace() == Some(NS_CRS) && a.name() == "HasSettings");
-                    let crs_has_settings_child = desc.children().find(|n| n.has_tag_name((NS_CRS, "HasSettings")));
-                    if let Some(attr) = crs_has_settings_attr {
-                        edits.push((attr.range_value(), "True".into()));
+                    let mut updated_has_settings = false;
+                    for d in &top_descriptions {
+                        if let Some(attr) = d
+                            .attributes()
+                            .find(|a| a.namespace() == Some(NS_CRS) && a.name() == "HasSettings")
+                        {
+                            edits.push((attr.range_value(), "True".into()));
+                            updated_has_settings = true;
+                        }
+                        if let Some(child) =
+                            d.children().find(|n| n.has_tag_name((NS_CRS, "HasSettings")))
+                        {
+                            edit_child_text(child, "HasSettings", "True".into(), &mut edits)?;
+                            updated_has_settings = true;
+                        }
                     }
-                    if let Some(child) = crs_has_settings_child {
-                        edit_child_text(child, "HasSettings", "True".into(), &mut edits)?;
-                    }
-                    if crs_has_settings_attr.is_none() && crs_has_settings_child.is_none() {
+                    if !updated_has_settings {
                         extra_attrs.push_str(&format!(" {crs_prefix}:HasSettings=\"True\""));
                     }
-                    let has_pv = desc.attributes().any(|a| a.namespace() == Some(NS_CRS) && a.name() == "ProcessVersion")
-                        || desc.children().any(|n| n.has_tag_name((NS_CRS, "ProcessVersion")));
+                    let has_pv = top_descriptions.iter().any(|d| {
+                        d.attributes().any(|a| a.namespace() == Some(NS_CRS) && a.name() == "ProcessVersion")
+                            || d.children().any(|n| n.has_tag_name((NS_CRS, "ProcessVersion")))
+                    });
                     if !has_pv {
                         extra_attrs.push_str(&format!(" {crs_prefix}:ProcessVersion=\"11.0\""));
                     }
@@ -679,5 +706,78 @@ mod tests {
         assert!(applied.contains("crs:Exposure2012=\"+1.00\""));
         assert!(!applied.contains("crs:Exposure2=\""));
         assert!(applied.contains("crs:ProcessVersion=\"15.4\""), "不应降级 Lightroom 已有 ProcessVersion");
+    }
+
+    /// XMP §7.4 多顶层 rdf:Description 场景：已有曝光位于第二个描述节点时，
+    /// 显式 ApplySuggestedExposure 不得再往第一个节点重复写入 crs:Exposure2012。
+    #[test]
+    fn split_rdf_descriptions_do_not_duplicate_crs_exposure() {
+        let e = entry();
+        let s = PixelScores { sharpness: 78.0, exposure: 65.0, noise: 70.0,
+            composition: 62.0, aesthetic: 55.0 };
+        let split_with_exposure = concat!(
+            "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">",
+            "<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">",
+            "<rdf:Description rdf:about=\"\" ",
+            "xmlns:xmp=\"http://ns.adobe.com/xap/1.0/\" ",
+            "xmlns:firstcut=\"http://firstcut.local/ns/\">",
+            "<xmp:Rating>3</xmp:Rating>",
+            "<firstcut:sharpness>75.0</firstcut:sharpness>",
+            "<firstcut:exposure>80.0</firstcut:exposure>",
+            "<firstcut:noise>60.0</firstcut:noise>",
+            "<firstcut:composition>60.0</firstcut:composition>",
+            "<firstcut:aesthetic>45.0</firstcut:aesthetic>",
+            "<firstcut:faces>1</firstcut:faces>",
+            "<firstcut:total>66.0</firstcut:total>",
+            "<firstcut:burstGroup>3</firstcut:burstGroup>",
+            "<firstcut:burstRank>1</firstcut:burstRank>",
+            "<firstcut:burstKeep>true</firstcut:burstKeep>",
+            "</rdf:Description>",
+            "<rdf:Description rdf:about=\"\" ",
+            "xmlns:crs=\"http://ns.adobe.com/camera-raw-settings/1.0/\" ",
+            "crs:HasSettings=\"True\" crs:ProcessVersion=\"15.4\" ",
+            "crs:Exposure2012=\"+1.75\"/>",
+            "</rdf:RDF></x:xmpmeta>",
+        );
+
+        let merged = merge_xmp(
+            split_with_exposure,
+            &e,
+            &s,
+            68.5,
+            4,
+            Some(0.33),
+            XmpWriteMode::ApplySuggestedExposure,
+        )
+        .unwrap();
+        assert_eq!(
+            merged.matches("Exposure2012").count(),
+            1,
+            "已有顶层 Exposure2012 时绝不能生成第二个曝光值"
+        );
+        assert!(merged.contains("crs:Exposure2012=\"+1.75\""));
+        assert!(merged.contains("<firstcut:suggestedEV>+0.33</firstcut:suggestedEV>"));
+
+        // 第二个顶层节点有 ProcessVersion/HasSettings 但无曝光时，补写曝光也不应重复生成 ProcessVersion/HasSettings
+        let split_without_exposure = split_with_exposure.replace(
+            "crs:HasSettings=\"True\" crs:ProcessVersion=\"15.4\" crs:Exposure2012=\"+1.75\"",
+            "crs:HasSettings=\"False\" crs:ProcessVersion=\"15.4\" crs:Shadows2012=\"+20\"",
+        );
+        let merged_no_exp = merge_xmp(
+            &split_without_exposure,
+            &e,
+            &s,
+            68.5,
+            4,
+            Some(0.33),
+            XmpWriteMode::ApplySuggestedExposure,
+        )
+        .unwrap();
+        assert_eq!(merged_no_exp.matches("Exposure2012").count(), 1);
+        assert!(merged_no_exp.contains("crs:Exposure2012=\"+0.33\""));
+        assert_eq!(merged_no_exp.matches("HasSettings").count(), 1);
+        assert!(merged_no_exp.contains("crs:HasSettings=\"True\""));
+        assert_eq!(merged_no_exp.matches("ProcessVersion").count(), 1);
+        assert!(merged_no_exp.contains("crs:ProcessVersion=\"15.4\""));
     }
 }

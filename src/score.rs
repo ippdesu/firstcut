@@ -200,22 +200,20 @@ pub fn analyze_jpgs(
                 .ok()?.open_read().ok()??;
             let fingerprint = file.metadata().ok().and_then(|meta| crate::cache::metadata_fingerprint(&meta));
             let cache_key = crate::cache::cache_key(root, Path::new(&e.path));
-            // 缓存命中则跳过分析（快照为纯数据，可跨线程共享）
+            // 缓存命中则跳过分析（快照为纯数据，可跨线程共享）；
+            // 优先匹配新版相对路径键，仅在未命中或指纹不符时回退旧版绝对路径键。
             if let Some(rows) = cache_rows {
                 if let Some((size, mtime)) = fingerprint {
-                    let hit = crate::cache::find_matching(rows, root, &e.path, |row| {
-                        row.matches(size, mtime, crate::cache::CACHE_VERSION, cfg_hash)
-                    })
-                    .map(|(row, was_legacy_key)| (row, was_legacy_key, true))
-                    .or_else(|| {
-                        legacy_ai_hash.and_then(|h| {
-                            crate::cache::find_matching(rows, root, &e.path, |row| {
-                                row.matches(size, mtime, crate::cache::CACHE_VERSION, h)
-                            })
-                            .map(|(row, was_legacy_key)| (row, was_legacy_key, false))
+                    if let Some((row, was_legacy_key)) =
+                        crate::cache::find_matching(rows, root, &e.path, |row| {
+                            row.matches(size, mtime, crate::cache::CACHE_VERSION, cfg_hash)
+                                || legacy_ai_hash.is_some_and(|h| {
+                                    row.matches(size, mtime, crate::cache::CACHE_VERSION, h)
+                                })
                         })
-                    });
-                    if let Some((row, was_legacy_key, matched_current)) = hit {
+                    {
+                        let matched_current =
+                            row.matches(size, mtime, crate::cache::CACHE_VERSION, cfg_hash);
                         hits.fetch_add(1, Ordering::Relaxed);
                         // 命中旧版绝对路径键或旧版 mtime 模型指纹时，无痛补写一份可移植行。
                         let migrated = (was_legacy_key || !matched_current)
