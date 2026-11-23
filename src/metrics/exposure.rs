@@ -169,7 +169,7 @@ pub fn exposure_score(
 ///   （极欠/极曝的照片应该在筛选里被淘汰，而不是被建议 +3 档这种鬼数值）；
 /// - `suggest_cap = 0` → 一律不给建议。
 ///
-/// 建议值同时写进 XMP（`firstcut:suggestedEV` 信息字段 + `crs:Exposure2`
+/// 建议值同时写进 XMP（`firstcut:suggestedEV` 信息字段 + `crs:Exposure2012`
 /// Lightroom 开发字段），实际曝光修正由用户在 Lightroom 里确认/应用，
 /// 本程序不修改照片。
 pub fn suggested_ev(stats: &ExposureStats, subject_mean: Option<f64>, c: &ExposureCurve) -> Option<f64> {

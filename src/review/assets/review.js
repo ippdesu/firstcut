@@ -222,6 +222,8 @@ const f = {
 // ---------- 初始化 ----------
 function ingest(){
   jpgs = SNAPSHOT.photos.filter(p => !p.is_raw);
+  // 先刷新连拍组选项并校正失效的 f.group，再调用 apply() 渲染网格
+  rebuildGroupOptions();
   document.getElementById("info").textContent =
     `${SNAPSHOT.root} — ${jpgs.length} 张（已评分 ${jpgs.filter(p=>p.scores).length}）`;
   apply();
@@ -278,8 +280,11 @@ async function boot(){
   return true;
 }
 function loadData(){
-  apiFetch("/api/photos").then(r=>r.json()).then(j=>{
-    const currentPath = LB && LB.list[LB.idx].path;
+  apiFetch("/api/photos").then(r=>{
+    if(!r.ok) throw new Error(r.status);
+    return r.json();
+  }).then(j=>{
+    const currentPath = LB?.list?.[LB.idx]?.path;
     SNAPSHOT = j;
     ingest();
     if(currentPath){
@@ -288,7 +293,27 @@ function loadData(){
       if(idx < 0) closeLightbox();
       else { LB.list = list; LB.idx = idx; renderLB(); }
     }
-  });
+  }).catch(()=>{});
+}
+function rebuildGroupOptions(){
+  const groupCounts = new Map();
+  for(const p of jpgs){
+    const group = p.burst && p.burst.group;
+    if(group) groupCounts.set(group, (groupCounts.get(group) || 0) + 1);
+  }
+  const groupBox = document.getElementById("fGroup");
+  groupBox.querySelectorAll('option[value^="group:"]').forEach(opt => opt.remove());
+  for(const [group, count] of [...groupCounts].sort((a,b)=>a[0]-b[0])){
+    const option = document.createElement("option");
+    option.value = `group:${group}`;
+    option.textContent = `组 ${group}（${count} 张）`;
+    groupBox.appendChild(option);
+  }
+  if(![...groupBox.options].some(opt => opt.value === f.group)){
+    f.group = "all";
+    page = 0;
+  }
+  groupBox.value = f.group;
 }
 function buildFilters(){
   const starBox = document.getElementById("fStars");
@@ -306,18 +331,6 @@ function buildFilters(){
     r.type = "range"; r.min = 0; r.max = 100; r.value = 0; r.dataset.dim = k;
     wrap.appendChild(r);
     dims.appendChild(wrap);
-  }
-  const groupCounts = new Map();
-  for(const p of jpgs){
-    const group = p.burst && p.burst.group;
-    if(group) groupCounts.set(group, (groupCounts.get(group) || 0) + 1);
-  }
-  const groupBox = document.getElementById("fGroup");
-  for(const [group, count] of [...groupCounts].sort((a,b)=>a[0]-b[0])){
-    const option = document.createElement("option");
-    option.value = `group:${group}`;
-    option.textContent = `组 ${group}（${count} 张）`;
-    groupBox.appendChild(option);
   }
 }
 function onFilter(){
@@ -504,6 +517,7 @@ async function setBurstKeep(photo, keep){
         item.burst.manual_keep = result.keep;
       }
     }
+    if(LB) renderLBActive();
     apply();
     toast(keep == null ? '已恢复自动保留建议' : (keep ? '已手动标记为保留' : '已手动标记为舍弃'));
   }catch(error){
@@ -544,7 +558,6 @@ async function loadHistogramSettings(){
     if(LB?.histogramOpen) renderLBHistogram();
   } catch (_) {}
 }
-loadHistogramSettings();
 
 function apertureLabel(value){
   const text = String(value || '').trim();
@@ -995,13 +1008,15 @@ function bindPane(pane){
     layoutPanes();
   }, {passive:false});
   let drag = null;
-  pane.addEventListener("mousedown", e=>{
+  pane.addEventListener("pointerdown", e=>{
+    if(e.button !== 0) return;
     selectPane(pane.dataset.path);
-    drag = {x:e.clientX, y:e.clientY, ax:LB.view.ax, ay:LB.view.ay};
+    drag = {id:e.pointerId, x:e.clientX, y:e.clientY, ax:LB.view.ax, ay:LB.view.ay};
+    pane.setPointerCapture(e.pointerId);
     pane.classList.add("dragging");
   });
-  window.addEventListener("mousemove", e=>{
-    if(!drag) return;
+  pane.addEventListener("pointermove", e=>{
+    if(!drag || e.pointerId !== drag.id) return;
     const img = pane.querySelector("img");
     if(!LB || !img.naturalWidth || !img.naturalHeight) return;
     const k = curK(pane);
@@ -1009,7 +1024,14 @@ function bindPane(pane){
     LB.view.ay = drag.ay - (e.clientY - drag.y) / (k * img.naturalHeight);
     layoutPanes();
   });
-  window.addEventListener("mouseup", ()=>{ drag = null; pane.classList.remove("dragging"); });
+  function endPaneDrag(e){
+    if(!drag || e.pointerId !== drag.id) return;
+    drag = null;
+    pane.classList.remove("dragging");
+  }
+  pane.addEventListener("pointerup", endPaneDrag);
+  pane.addEventListener("pointercancel", endPaneDrag);
+  pane.addEventListener("lostpointercapture", endPaneDrag);
   pane.addEventListener("dblclick", ()=>{
     LB.view = {s:1, ax:.5, ay:.5, fx:.5, fy:.5};
     layoutPanes();
@@ -1101,15 +1123,28 @@ function pollJob(){
   }).catch(()=>{});
 }
 function schedulePoll(){ if(jobPolling) clearTimeout(jobPolling); jobPolling = setTimeout(pollJob, 600); }
+const runXmpEl = document.getElementById('runXmp');
+const runXmpExposureEl = document.getElementById('runXmpExposure');
+function syncRunXmpExposure(){
+  const enabled = runXmpEl.checked;
+  runXmpExposureEl.disabled = !enabled;
+  if(!enabled) runXmpExposureEl.checked = false;
+}
+runXmpEl.addEventListener('change', syncRunXmpExposure);
+syncRunXmpExposure();
 document.getElementById('runBtn').addEventListener('click', ()=>{
+  const xmp = runXmpEl.checked;
+  const xmpExposure = xmp && runXmpExposureEl.checked;
   apiFetch('/api/score/run', {method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({xmp: document.getElementById('runXmp').checked, no_ai: document.getElementById('runNoAi').checked})
+    body: JSON.stringify({xmp, xmp_exposure: xmpExposure, no_ai: document.getElementById('runNoAi').checked})
   }).then(async r=>{
-    if(r.status === 409){ toast(await r.text() || '当前无法开始评分'); }
+    if(!r.ok){
+      toast(await r.text() || `无法开始评分（${r.status}）`);
+      return;
+    }
     jobPolling = setTimeout(pollJob, 300);
-  });
+  }).catch(err=> toast('无法开始评分：' + err));
 });
-pollJob();
 
 // 星级：灯箱内按钮 + 快捷键
 function renderLbStars(){
@@ -1129,17 +1164,25 @@ function setStars(photo, n){
   apiFetch('/api/rate', {method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({p: photo.path, stars: n})
   }).then(async r=>{
-    const j = await r.json().catch(()=>({}));
+    const text = await r.text();
+    let j = {};
+    try { j = JSON.parse(text); } catch (_) {}
     if(r.ok && j.ok){
       toast(j.warnings?.length ? `已保存 ${n} 星；${j.warnings.length} 个侧车未同步` : `已保存 ${n} 星`);
-      // 本地数据同步（同 stem 共享星级）
+      // 本地数据同步（同 stem 共享星级）；不重建窗格 DOM，避免重拉原图与重算直方图
       const stem = photo.path.replace(/\.[^.]+$/,'').toLowerCase();
-      jpgs.forEach(p=>{ if(p.path.replace(/\.[^.]+$/,'').toLowerCase() === stem){ p.stars = n; p.rating_source = 'manual'; } });
-      renderLB(); apply();
+      for(const p of (SNAPSHOT?.photos || jpgs)){
+        if(p.path.replace(/\.[^.]+$/,'').toLowerCase() === stem){
+          p.stars = n;
+          p.rating_source = 'manual';
+        }
+      }
+      if(LB) renderLBActive();
+      apply();
     } else {
-      toast(j && typeof j === 'string' ? j : (j.error || r.statusText || '写入失败'));
+      toast(j.error || text || r.statusText || '写入失败');
     }
-  });
+  }).catch(err=> toast('写入失败：' + err));
 }
 // 快捷键 1~5（灯箱打开时）
 window.addEventListener('keydown', e=>{
@@ -1178,7 +1221,7 @@ const FIELD_GUIDE = {
   exposure_ev_lo:{help:'暗侧偏离达到该 EV 时曝光分降到 0；数值越大，对欠曝越宽容，必须大于暗侧满分容差。',min:1,max:8,step:.1,recommended:'常用 3–5 EV'},
   exposure_ev_hi:{help:'亮侧偏离达到该 EV 时曝光分降到 0；通常设得比暗侧更严格，必须大于亮侧满分容差。',min:1,max:6,step:.1,recommended:'常用 1.5–3 EV'},
   exposure_subject_blend:{help:'有主体脸时，主体亮度参与曝光判断的比例；0 只看全图，1 只看主体。',min:0,max:1,step:.05,recommended:'常用 0.3–0.7'},
-  exposure_suggest_cap:{help:'写入 XMP/CSV 的曝光修正建议最大绝对值（EV）；设为 0 可关闭建议。',min:0,max:4,step:.1,recommended:'常用 1–2 EV'},
+  exposure_suggest_cap:{help:'记录到 XMP（firstcut:suggestedEV）与 CSV 的曝光修正建议最大绝对值（EV）；设为 0 可关闭建议。',min:0,max:4,step:.1,recommended:'常用 1–2 EV'},
   dedup_adaptive_keep:{help:'按人脸姿态把连拍拆成多个瞬间分别保留；关闭后退回按画面相似度分簇。'},
   dedup_keep_k:{help:'每个姿势簇保留分数最高的前 K 张；调大可保留更多表情或动作备选。',min:1,max:10,step:1,recommended:'常用 2–5 张；必须至少 1 张'},
   dedup_pose_cluster_threshold:{help:'姿态描述子的聚类距离阈值；调低会拆出更多姿态组，调高会合并相近姿势。',min:.05,max:.6,step:.01,recommended:'常用 0.15–0.40；默认 0.25'},
@@ -1340,6 +1383,8 @@ async function startReview(){
 }
 startReview().then(ready=>{
   if(!ready) return;
+  loadHistogramSettings();
+  pollJob();
   document.getElementById("fSearch").value = f.search;
   document.getElementById("fKeep").value = f.keep;
   document.getElementById("fGroup").value = f.group;

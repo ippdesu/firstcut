@@ -42,9 +42,12 @@ enum Commands {
         /// 跳过 AI 推理（无模型时快速预览）
         #[arg(long)]
         no_ai: bool,
-        /// 写 XMP 星级侧车（xmp:Rating + firstcut 子分）
+        /// 写 XMP 星级侧车（xmp:Rating + firstcut 子分；默认不写 Adobe crs:* 开发字段）
         #[arg(long)]
         xmp: bool,
+        /// 显式将建议曝光写入 Adobe crs:Exposure2012 开发字段（需配合 --xmp，不覆盖已有人工曝光）
+        #[arg(long)]
+        xmp_exposure: bool,
         /// 增量缓存文件路径（默认 <照片目录>/.firstcut/cache.sqlite）
         #[arg(long)]
         cache: Option<PathBuf>,
@@ -126,7 +129,7 @@ fn main() -> Result<()> {
             pic_process::storage::FileRef::at(&current, &output, true)?.write(text.as_bytes())?;
             eprintln!("[config] 已写出: {}", output.display());
         }
-        Commands::Score { dir, output, raw_csv, keep, no_ai, xmp, cache, no_cache, config, gpu } => {
+        Commands::Score { dir, output, raw_csv, keep, no_ai, xmp, xmp_exposure, cache, no_cache, config, gpu } => {
             let dir = pic_process::review::normal_photo_root(&dir)?;
             let paths = pic_process::review::photo_root_paths(&dir);
             // 0) 评分配置（默认或文件）
@@ -151,6 +154,7 @@ fn main() -> Result<()> {
                 no_cache,
                 no_ai,
                 xmp,
+                xmp_exposure,
                 gpu,
                 keep_override: keep,
                 include_raw: preferences.include_raw,

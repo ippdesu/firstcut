@@ -145,10 +145,11 @@ fn main() -> Result<()> {
             scores.insert(d.to_string(), get(i).parse().unwrap_or(0.0));
         }
         let total: f64 = get(i_total).parse().unwrap_or(0.0);
+        let unescape = pic_process::output::csv::unescape_spreadsheet_text;
         rows.push(Row {
-            path: get(i_path),
-            filename: get(i_name),
-            iso: get(i_iso),
+            path: unescape(&get(i_path)).to_string(),
+            filename: unescape(&get(i_name)).to_string(),
+            iso: unescape(&get(i_iso)).to_string(),
             faces: get(i_faces),
             burst_size: get(i_size),
             burst_rank: get(i_rank),

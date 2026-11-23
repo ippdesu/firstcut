@@ -210,6 +210,43 @@ impl ScoreCache {
     }
 }
 
+/// 可移植缓存键：相对照片根目录的正斜杠路径（跨目录搬迁与 Windows/Docker 通用）。
+pub fn cache_key(root: &Path, path: &Path) -> String {
+    let rel = path.strip_prefix(root).unwrap_or(path).to_string_lossy();
+    #[cfg(windows)]
+    {
+        rel.replace('\\', "/")
+    }
+    #[cfg(not(windows))]
+    {
+        rel.into_owned()
+    }
+}
+
+/// 按条件查找缓存行：先校验可移植相对路径键，未命中或条件不满足时再回退校验旧版绝对路径键。
+/// 避免一条已失效的相对路径记录挡住仍有效的旧版绝对路径记录。
+/// 返回 `(行引用, 是否命中旧版绝对路径键)`。
+pub fn find_matching<'a, F>(
+    rows: &'a HashMap<String, CacheRow>,
+    root: &Path,
+    full_path: &str,
+    mut predicate: F,
+) -> Option<(&'a CacheRow, bool)>
+where
+    F: FnMut(&CacheRow) -> bool,
+{
+    let key = cache_key(root, Path::new(full_path));
+    if let Some(row) = rows.get(&key).filter(|row| predicate(row)) {
+        return Some((row, false));
+    }
+    if key != full_path {
+        if let Some(row) = rows.get(full_path).filter(|row| predicate(row)) {
+            return Some((row, true));
+        }
+    }
+    None
+}
+
 /// 文件元数据：大小 + mtime（纳秒精度）
 pub fn file_fingerprint(path: &Path) -> Option<(u64, i64)> {
     let meta = std::fs::metadata(path).ok()?;
@@ -245,4 +282,59 @@ fn blob_to_desc(bytes: &[u8]) -> Option<[f32; 10]> {
         *v = f32::from_le_bytes([bytes[i * 4], bytes[i * 4 + 1], bytes[i * 4 + 2], bytes[i * 4 + 3]]);
     }
     Some(d)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_key_is_relative_and_lookup_falls_back_to_legacy_absolute_path() {
+        let root = Path::new("/photos/event");
+        let full = "/photos/event/JPG/DSC00001.JPG";
+        assert_eq!(cache_key(root, Path::new(full)), "JPG/DSC00001.JPG");
+
+        let sample = CacheRow {
+            size: 100,
+            mtime: 200,
+            version: CACHE_VERSION,
+            cfg_hash: 42,
+            result: AnalysisResult {
+                scores: PixelScores::default(),
+                dhash: 1,
+                faces: 0,
+                pose_desc: None,
+                suggested_ev: None,
+            },
+        };
+        let mut legacy_rows = HashMap::new();
+        legacy_rows.insert(full.to_string(), sample);
+        let (found, was_legacy) = find_matching(&legacy_rows, root, full, |r| r.cfg_hash == 42).unwrap();
+        assert_eq!(found.cfg_hash, 42);
+        assert!(was_legacy);
+
+        let mut portable_rows = HashMap::new();
+        portable_rows.insert("JPG/DSC00001.JPG".to_string(), sample);
+        let (found, was_legacy) = find_matching(
+            &portable_rows,
+            Path::new("/moved/event"),
+            "/moved/event/JPG/DSC00001.JPG",
+            |r| r.cfg_hash == 42,
+        )
+        .unwrap();
+        assert_eq!(found.cfg_hash, 42);
+        assert!(!was_legacy);
+
+        // 相对路径行指纹不匹配时，不应挡住仍有效的旧版绝对路径行
+        let mut stale_relative = sample;
+        stale_relative.cfg_hash = 999;
+        let mut both_rows = HashMap::new();
+        both_rows.insert("JPG/DSC00001.JPG".to_string(), stale_relative);
+        both_rows.insert(full.to_string(), sample);
+        let (found, was_legacy) =
+            find_matching(&both_rows, root, full, |r| r.matches(100, 200, CACHE_VERSION, 42))
+                .unwrap();
+        assert_eq!(found.cfg_hash, 42);
+        assert!(was_legacy);
+    }
 }

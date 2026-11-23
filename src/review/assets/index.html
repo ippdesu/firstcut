@@ -126,7 +126,7 @@
   #lbDetails textarea{min-height:60px;resize:vertical}
   #lbDetails .detail-save{margin-top:8px;background:#2e6b30;border:0;border-radius:4px;color:#fff;padding:7px 12px;cursor:pointer}
   #panes{flex:1;display:flex;gap:2px;min-height:0}
-  .pane{flex:1;position:relative;overflow:hidden;background:#000;cursor:grab}
+  .pane{flex:1;position:relative;overflow:hidden;background:#000;cursor:grab;touch-action:none}
   .pane.dragging{cursor:grabbing}
   .pane.active::after{content:"";position:absolute;inset:0;border:2px solid var(--acc);pointer-events:none;z-index:2}
   .pane img{position:absolute;transform-origin:0 0;user-select:none;-webkit-user-drag:none;pointer-events:none}
@@ -229,6 +229,7 @@
     <h3>评分</h3>
     <div id="runBlock">
       <label><input type="checkbox" id="runXmp" checked> 跑批后写 XMP 侧车</label>
+      <label title="仅对尚无 Adobe 曝光参数的侧车写入建议 EV（crs:Exposure2012），绝不覆盖或删除已有的 Lightroom 人工曝光"><input type="checkbox" id="runXmpExposure"> 写入建议曝光到 Adobe 开发参数</label>
       <label><input type="checkbox" id="runNoAi"> 跳过 AI（纯像素快速）</label>
       <div style="display:flex;gap:6px;margin-top:6px">
         <button class="btn primary" id="runBtn" style="flex:1">▶ 重新评分</button>

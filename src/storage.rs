@@ -142,8 +142,8 @@ impl FileRef {
     /// the caller (e.g. --output or --cache). Within the album, every component
     /// below the selected root is opened without following links.
     pub fn at(root: &Path, path: &Path, create_parent: bool) -> io::Result<Self> {
-        if let Ok(rel) = path.strip_prefix(root) {
-            let (parent, name) = split(rel)?;
+        if let Some(rel) = strip_album_prefix(root, path) {
+            let (parent, name) = split(&rel)?;
             return Folder::open(root)?
                 .descend(parent, create_parent)?
                 .file(name);
@@ -153,10 +153,9 @@ impl FileRef {
 
     /// For data that must stay inside the selected root, such as images and XMP.
     pub fn inside(root: &Path, path: &Path) -> io::Result<Self> {
-        let rel = path
-            .strip_prefix(root)
-            .map_err(|_| denied("路径不在相册内"))?;
-        let (parent, name) = split(rel)?;
+        let rel = strip_album_prefix(root, path)
+            .ok_or_else(|| denied("路径不在相册内"))?;
+        let (parent, name) = split(&rel)?;
         Folder::open(root)?.descend(parent, false)?.file(name)
     }
 
@@ -269,6 +268,42 @@ impl FileRef {
             let _ = self.parent.unlink(&temp);
         }
         result
+    }
+}
+
+fn strip_album_prefix(root: &Path, path: &Path) -> Option<PathBuf> {
+    #[cfg(not(windows))]
+    {
+        path.strip_prefix(root).ok().map(Path::to_path_buf)
+    }
+    #[cfg(windows)]
+    {
+        let mut root_iter = root.components();
+        let mut path_iter = path.components();
+        loop {
+            match root_iter.next() {
+                None => return Some(path_iter.collect()),
+                Some(r) => {
+                    let p = path_iter.next()?;
+                    let same = match (r, p) {
+                        (Component::Prefix(a), Component::Prefix(b)) => a
+                            .as_os_str()
+                            .to_string_lossy()
+                            .eq_ignore_ascii_case(&b.as_os_str().to_string_lossy()),
+                        (Component::RootDir, Component::RootDir)
+                        | (Component::CurDir, Component::CurDir)
+                        | (Component::ParentDir, Component::ParentDir) => true,
+                        (Component::Normal(a), Component::Normal(b)) => a
+                            .to_string_lossy()
+                            .eq_ignore_ascii_case(&b.to_string_lossy()),
+                        _ => false,
+                    };
+                    if !same {
+                        return None;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -467,5 +502,15 @@ mod tests {
         assert!(Database::open(file, false).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), old);
         assert_eq!(std::fs::read(&wal).unwrap(), b"pending recovery");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_strip_album_prefix_is_case_insensitive() {
+        let root = Path::new(r"F:\Photos\Event");
+        let lower = Path::new(r"f:\photos\event\.firstcut\report.csv");
+        let rel = strip_album_prefix(root, lower).expect("应识别不同大小写的相册内路径");
+        assert_eq!(rel, Path::new(r".firstcut\report.csv"));
+        assert!(strip_album_prefix(root, Path::new(r"F:\Photos\EventOther\a.jpg")).is_none());
     }
 }

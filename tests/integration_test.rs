@@ -227,7 +227,7 @@ fn manual_rating_survives_rescore_and_export() {
     let cfg = ScoreConfig::default();
     let opts = score::ScoreJobOptions {
         output_csv: csv_path.clone(), raw_csv: false, cache_path: cache_path.clone(), no_cache: false,
-        no_ai: true, xmp: true, gpu: false, keep_override: None,
+        no_ai: true, xmp: true, xmp_exposure: false, gpu: false, keep_override: None,
         include_raw: true, skip_processed: false,
     };
     score::run_score_job(&root, &cfg, &opts, &|_| {}).unwrap();
@@ -247,5 +247,65 @@ fn manual_rating_survives_rescore_and_export() {
         &std::collections::HashMap::new()).unwrap();
     assert_eq!(snap.photos[0].stars, Some(1));
     assert_eq!(snap.photos[0].rating_source.as_deref(), Some("manual"));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// Option A 端到端验证：常规 `--xmp` 仅写 `firstcut:suggestedEV`；
+/// `--xmp-exposure` 须显式启用，且绝不覆盖已有 Lightroom `crs:Exposure2012`。
+#[test]
+fn xmp_exposure_opt_in_and_manual_exposure_protection() {
+    let root = std::env::temp_dir().join(format!(
+        "firstcut_xmp_optin_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    // 暗图（码值 30）：必然落在曝光容差带外并产生正向建议 EV
+    let dark_a = root.join("dark_a.jpg");
+    let dark_b = root.join("dark_b.jpg");
+    image::RgbImage::from_pixel(64, 64, image::Rgb([30, 30, 30])).save(&dark_a).unwrap();
+    image::RgbImage::from_pixel(64, 64, image::Rgb([30, 30, 30])).save(&dark_b).unwrap();
+
+    let csv_path = root.join("report.csv");
+    let cache_path = root.join("cache.sqlite");
+    let cfg = ScoreConfig::default();
+
+    // 1) 未开启 --xmp 时，--xmp-exposure 必须拒绝
+    let bad_opts = score::ScoreJobOptions {
+        output_csv: csv_path.clone(), raw_csv: false, cache_path: cache_path.clone(), no_cache: false,
+        no_ai: true, xmp: false, xmp_exposure: true, gpu: false, keep_override: None,
+        include_raw: false, skip_processed: false,
+    };
+    assert!(score::run_score_job(&root, &cfg, &bad_opts, &|_| {}).is_err());
+
+    // 2) 常规评分（--xmp，不带 --xmp-exposure）：仅写 firstcut:suggestedEV，不写 crs:Exposure2012
+    let default_opts = score::ScoreJobOptions {
+        xmp: true, xmp_exposure: false, ..bad_opts.clone()
+    };
+    score::run_score_job(&root, &cfg, &default_opts, &|_| {}).unwrap();
+    let xmp_a = std::fs::read_to_string(dark_a.with_extension("xmp")).unwrap();
+    assert!(xmp_a.contains("<firstcut:suggestedEV>+"), "常规评分应记录建议 EV 信息字段");
+    assert!(!xmp_a.contains("crs:Exposure2012"), "常规评分默认不得写入 Adobe crs:Exposure2012");
+
+    // 3) 模拟摄影师在 dark_b 的侧车里已手动调整了 Lightroom 曝光 +1.75 EV
+    let xmp_b = std::fs::read_to_string(dark_b.with_extension("xmp")).unwrap();
+    let xmp_b_manual = xmp_b.replace(
+        "xmlns:firstcut=\"http://firstcut.local/ns/\">",
+        "xmlns:firstcut=\"http://firstcut.local/ns/\"\n   xmlns:crs=\"http://ns.adobe.com/camera-raw-settings/1.0/\"\n   crs:HasSettings=\"True\" crs:ProcessVersion=\"11.0\" crs:Exposure2012=\"+1.75\">",
+    );
+    assert!(xmp_b_manual.contains("crs:Exposure2012=\"+1.75\""));
+    std::fs::write(dark_b.with_extension("xmp"), xmp_b_manual).unwrap();
+
+    // 4) 显式开启 --xmp-exposure：dark_a 补写 crs:Exposure2012，dark_b 保留人工 +1.75
+    let optin_opts = score::ScoreJobOptions {
+        xmp: true, xmp_exposure: true, ..bad_opts
+    };
+    score::run_score_job(&root, &cfg, &optin_opts, &|_| {}).unwrap();
+    let xmp_a2 = std::fs::read_to_string(dark_a.with_extension("xmp")).unwrap();
+    let xmp_b2 = std::fs::read_to_string(dark_b.with_extension("xmp")).unwrap();
+    assert!(xmp_a2.contains("crs:Exposure2012=\"+"), "显式开启应为无曝光参数的侧车写入建议 EV");
+    assert!(xmp_a2.contains("crs:HasSettings=\"True\""));
+    assert!(xmp_b2.contains("crs:Exposure2012=\"+1.75\""), "已有 Lightroom 人工曝光绝不得被覆盖");
+
     let _ = std::fs::remove_dir_all(root);
 }

@@ -4,7 +4,7 @@
 
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 #[cfg(not(windows))]
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -21,10 +21,25 @@ pub enum JobStatus {
 struct JobInner {
     status: JobStatus,
     stopping: bool,
+    /// 进行中的前端写请求数（改星/连拍覆盖/场景反馈/配置保存）；
+    /// 非零时禁止启动新跑批或关闭服务，消除 TOCTOU 竞态。
+    active_mutations: usize,
     /// 最近 200 行日志，供 UI 即时显示。
     log: Vec<String>,
     /// 磁盘写入连续失败后停止重试，避免刷屏和无意义磁盘访问。
     log_file_disabled: bool,
+}
+
+/// RAII 写操作守卫：持有期间阻塞跑批启动与服务关闭，离开作用域（含 panic）自动释放。
+pub struct MutationGuard {
+    job: Arc<JobState>,
+}
+
+impl Drop for MutationGuard {
+    fn drop(&mut self) {
+        let mut g = self.job.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.active_mutations = g.active_mutations.saturating_sub(1);
+    }
 }
 
 #[derive(Debug)]
@@ -53,6 +68,7 @@ impl JobState {
             inner: Mutex::new(JobInner {
                 status: JobStatus::Idle,
                 stopping: false,
+                active_mutations: 0,
                 log: Vec::new(),
                 log_file_disabled: false,
             }),
@@ -68,10 +84,22 @@ impl JobState {
         matches!(self.status(), JobStatus::Running { .. })
     }
 
-    /// 尝试占坑：Idle/Done/Failed 时进入 Running 并清空日志；已在跑则返回 false
-    pub fn begin(&self) -> bool {
+    /// 占用写操作槽位：仅在未跑批且未关闭时成功；防止与 `begin()` / `begin_shutdown()` 竞态。
+    pub fn begin_mutation(self: &Arc<Self>) -> Option<MutationGuard> {
         let mut g = self.inner.lock().unwrap();
         if g.stopping || matches!(g.status, JobStatus::Running { .. }) {
+            return None;
+        }
+        g.active_mutations += 1;
+        Some(MutationGuard {
+            job: Arc::clone(self),
+        })
+    }
+
+    /// 尝试占坑：Idle/Done/Failed 且无进行中写操作时进入 Running 并清空日志；否则返回 false
+    pub fn begin(&self) -> bool {
+        let mut g = self.inner.lock().unwrap();
+        if g.stopping || g.active_mutations > 0 || matches!(g.status, JobStatus::Running { .. }) {
             return false;
         }
         g.status = JobStatus::Running { done: 0, total: 0 };
@@ -80,10 +108,10 @@ impl JobState {
         true
     }
 
-    /// 只有评分空闲时才能关闭服务；与 begin 共用锁，避免关闭与新跑批竞态。
+    /// 只有评分空闲且无进行中写操作时才能关闭服务；与 begin 共用锁，避免关闭与写/跑批竞态。
     pub fn begin_shutdown(&self) -> bool {
         let mut g = self.inner.lock().unwrap();
-        if g.stopping || matches!(g.status, JobStatus::Running { .. }) {
+        if g.stopping || g.active_mutations > 0 || matches!(g.status, JobStatus::Running { .. }) {
             return false;
         }
         g.stopping = true;
@@ -293,5 +321,19 @@ mod tests {
         assert!(job.begin_shutdown());
         assert!(!job.begin());
         assert!(!job.begin_shutdown());
+    }
+
+    #[test]
+    fn mutation_guard_blocks_scoring_and_shutdown_until_dropped() {
+        let job = Arc::new(JobState::new());
+        let guard = job.begin_mutation().expect("空闲时可获取写守卫");
+        assert!(!job.begin(), "写操作期间不应启动跑批");
+        assert!(!job.begin_shutdown(), "写操作期间不应关闭服务");
+        drop(guard);
+        assert!(job.begin(), "写守卫释放后可启动跑批");
+        assert!(job.begin_mutation().is_none(), "跑批中不可获取写守卫");
+        job.finish("完成".into());
+        assert!(job.begin_shutdown());
+        assert!(job.begin_mutation().is_none(), "关闭中不可获取写守卫");
     }
 }

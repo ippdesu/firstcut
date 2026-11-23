@@ -1,69 +1,109 @@
-# firstcut — 照片初筛评分工具
+# firstcut — 索尼照片本地初筛与复核工具
 
-用 Rust 编写的本地照片初筛工具：扫描索尼相机 JPG+ARW 目录，对 JPG 做
-**五维评分**（清晰度 / 曝光 / 噪点 / 构图 / 美学），连拍去重排序，输出
-**CSV 报告**和 **XMP 星级侧车**。全程本地运行、照片不上传。
+用 Rust 编写的本地照片初筛评分与复核工具：扫描索尼相机 `JPG + ARW` 目录，对 JPG 做**五维评分**（清晰度 / 曝光 / 噪点 / 构图 / 美学）与**连拍姿态去重**，提供本地 Web 复核界面，并输出 **CSV 报告** 与 **Lightroom XMP 星级侧车**。全程本地运行，照片不上传、不删改原片。
 
-> 当前版本 **v1.4.2** 加固复核访问、评分存储与导出。继续提供 Windows 程序和 Linux AMD64、ARM64 容器。正常关闭的评分库、现有配置和 XMP 可继续使用。图像分析支持 SDR JPEG。
-> 当前方向：本地初筛、人工复核、Lightroom 元数据交接。darktable 批量 RAW 开发路线已停止；历史调研保存在 [项目历史档案](docs/HISTORY.md#5-已停止的-darktable-raw-开发研究原设计-9)。
->
-> 文档入口：[使用说明](#构建) · [当前设计](DESIGN.md) · [版本说明](release_notes.md) · [评审与历史决策](docs/HISTORY.md) · [安全政策](SECURITY.md)。
+> **当前版本**：`v1.4.2`（提供 Windows 可执行程序与 Linux `amd64` / `arm64` 容器镜像）
+> **当前边界**：聚焦本地初筛、人工复核与 Lightroom 元数据交接；图像分析支持 SDR JPEG；darktable 批量 RAW 开发路线已停止（见 [历史研究档案](docs/history/DARKTABLE_PHASE2_RESEARCH.md)）。
 
-## 构建
+## 文档导航
 
-```bash
-cargo build --release
-# 可选：实验性 DirectML GPU 推理（score --gpu；历史实测无显著收益，见设计文档）
-cargo build --release --features gpu
+| 文档 | 内容 |
+|---|---|
+| [设计文档](docs/DESIGN.md) | 现行架构、四层数据模型、评分/缓存/配置约定、安全边界与后续计划 |
+| [版本说明](docs/RELEASE_NOTES.md) | 面向用户的各版本变更记录 |
+| [安全政策](SECURITY.md) | 安全支持版本与私密漏洞报告渠道 |
+| [文档总索引](docs/README.md) | 现行文档与历史归档维护规范 |
+| [历史与过期评审归档](docs/history/README.md) | 历次代码评审、早期里程碑、历史决策与已停止的 darktable 研究 |
+
+---
+
+## 核心架构概览
+
+```text
+扫描 / EXIF / JPG+ARW 配对 (scan)
+        ↓  [cap-std 安全目录句柄边界: storage]
+增量分析缓存匹配 (cache.sqlite, CACHE_VERSION = 15)
+        ↓  未命中时
+JPEG 解码 + 像素指标 (decode / metrics) + ONNX AI 推理 (ai: SCRFD / YOLOv8-pose / CLIPIQA+)
+        ↓
+统一结果合成 (selection / dedup / decision: 当前权重、相对星级、连拍簇、人工决定覆盖)
+        ↓
+CSV 报告 / XMP 侧车 (output)  &  本地 Web 复核台 (review: axum + 内嵌前端)
 ```
 
-产物（`target/release/`，Windows 加 `.exe`）：
+- **四层数据分离**：原始照片（只读资产）→ 可重建分析缓存（`.firstcut/cache.sqlite`）→ 运行期算法建议（`selection` 共用逻辑）→ 持久化人工决定（`.firstcut/decisions.sqlite`，重评分不覆盖）。
+- **UI 与 CLI 统一**：同一照片根目录共用 `.firstcut/` 下的缓存、配置、报告与 RAW 关联偏好，避免切换入口导致数据不一致。
+- 详细架构约定、算法细节与安全设计见 [`docs/DESIGN.md`](docs/DESIGN.md)。
 
-| 二进制 | 用途 |
-|---|---|
-| `pic_process` | 主命令（`scan` / `score` / `config-template` / `review`） |
-| `firstcut-ui` | Windows 无控制台启动器：双击选目录，自动启动本地复核 UI；页面内可重启或退出服务 |
-| `pic_process-tune` | 调参工具：导出原始指标 CSV |
-| `pic_process-gallery` | HTML 联系表生成器（缩略图 + 分数） |
-| `pic_process-debug-pose` | 诊断工具：YOLOv8-pose 检测验证 |
-| `pic_process-debug-scrfd` | 诊断工具：SCRFD 检测验证（含 kps/姿态描述子） |
-| `pic_process-debug-exposure` | 诊断工具：全图亮度 vs 主体脸亮度 |
-| `pic_process-probe` | 诊断工具：打印 ONNX 输入输出元数据 |
+---
 
-> Windows 程序静态链接 ONNX Runtime，依赖 Windows DirectML 和 Visual C++ 运行时。
-> Release 提供 UI、CLI、gallery、tune 四个程序；诊断工具可从源码按需构建。
+## 快速开始
 
-### 双击启动复核 UI（Windows）
+### 方式一：Windows 双击启动复核 UI（推荐）
 
-运行发行包里的 `firstcut-ui.exe`，在目录窗口中选择照片根目录后会自动启动本地服务并打开浏览器。若 JPG 和 RAW 分放在 `JPG/`、`RAW/` 子目录，请选择同时包含这两个目录的活动根目录；只有 JPG 时可直接选择 JPG 目录。复核 UI 会递归扫描所选目录，但默认跳过其中名为 `Processed/` 的输出子目录；若要看成片，可直接选择 `Processed/` 本身。放在活动根目录顶层的 JPG 无法与原片自动区分，也会进入列表，建议把成片放进 `Processed/`。取消选目录会直接退出。侧栏的“选择照片目录…”可随时换目录；“关联同名 RAW 照片”开关可决定是否载入 RAW、把 JPG 分数映射到 RAW 并在评分或改星时写其 XMP 侧车。该开关保存在所选根目录的 `.firstcut/ui-preferences.json`，CLI 评分和 review 也读取相同偏好；UI 与 CLI 默认使用相同配置、缓存、扫描规则和照片根路径，不会因启动方式不同而换一套评分记录。
+从 [GitHub Releases](https://github.com/ippdesu/firstcut/releases) 下载发行包，双击 `firstcut-ui.exe`：
 
-浏览器会在启动后立即显示实际扫描阶段、已发现或已读取文件数，以及有总数时的进度条；完成后自动切换照片列表。UI 和 CLI 默认共用所选照片根目录 `.firstcut/cache.sqlite`、`.firstcut/report.csv` 与 `.firstcut/config.toml`；扫描报告为 `.firstcut/scan-report.csv`。缩略图、人工决定、界面偏好、场景反馈和有大小上限的任务日志也都放在 `.firstcut/`。Windows 启动器把系统返回的 `\\?\` 路径规范化为缓存中的普通绝对路径，以免同一目录被误判为不同目录。未找到可用评分时，页面会提示重新选择之前评分的照片目录，或继续按未评分照片浏览。启动器会从可执行文件所在目录及其上级目录寻找 `models/`，因此在项目内双击 `target/release/firstcut-ui.exe` 也能命中原有 AI 评分缓存。GitHub Release 不包含模型文件；独立使用发行包时，请把模型放在可执行文件同级的 `models/` 目录。
+1. **选择照片根目录**：
+   - 若 JPG 与 RAW 分放在 `JPG/`、`RAW/` 子目录，请选择同时包含两者的**活动根目录**；仅有 JPG 时可直接选 JPG 目录。
+   - 默认递归扫描所选目录，并跳过名为 `Processed/` 的输出子目录（要浏览成片可直接选择 `Processed/` 本身；建议不要把成片散放在活动根目录顶层）。
+2. **模型目录**：发行包不含 AI 模型（见下方[模型准备](#模型准备一次性)）。请将模型放到 `firstcut-ui.exe` 同级的 `models/` 目录（开发环境下启动器也会自动向上查找仓库根目录的 `models/`）。
+3. **浏览与操作**：
+   - 浏览器自动打开并登录，立即展示扫描阶段与进度；未找到已有评分时，可重选目录或先以未评分状态浏览，再通过侧栏**“重新评分”**触发跑批。
+   - 侧栏支持切换照片目录与**“关联同名 RAW 照片”**开关（偏好保存在 `.firstcut/ui-preferences.json`，UI 与 CLI 共用）。
+   - 页面右上角提供**“重启服务”**（重载配置与快照）和**“退出程序”**（释放 `8787` 端口）；评分运行中会拒绝这两项操作。仅关闭浏览器标签页不会退出服务，再次双击 `firstcut-ui.exe` 可重新打开运行中的页面。
 
-页面右上角的“重启服务”会重新读取配置与照片快照，“退出程序”会关闭本地服务并释放 8787 端口。评分运行时这两项操作会被拒绝，需等评分完成。仅关闭浏览器标签页不会停止服务；再次双击 `firstcut-ui.exe` 会重新打开仍在运行的页面。CLI 的 `review` 模式继续使用终端里的 Ctrl+C 退出。
+### 方式二：命令行（CLI）
 
-命令行用户继续运行 `pic_process review <照片目录>`。`scan`、`score` 和 `review` 默认都以照片目录作为状态归属位置，将缓存、报告和配置放到 `<照片目录>/.firstcut/`；显式传入 `--cache`、`--output` 或 `--config` 时以指定路径为准。`config-template` 没有照片目录参数，默认写入当前目录的 `.firstcut/firstcut-template.toml`；`tune` 默认写入照片目录 `.firstcut/metrics.csv`，`gallery` 默认把 HTML 联系表写在输入报告同目录。已有旧版工作目录缓存不会自动搬移；如需继续读取，CLI 可用 `--cache <旧缓存文件>` 显式指定，避免错误地把另一图库的缓存当成本目录数据。
+```bash
+# 1. 仅扫描建索引（EXIF + JPG/ARW 配对，不评分）
+pic_process scan <照片目录>                  # 默认写入 <照片目录>/.firstcut/scan-report.csv
 
-复核链接会自动登录。`--no-browser` 模式请复制终端给出的完整链接；链接里的访问凭据不要分享。直接打开不带凭据的地址时，需要已有会话或手动登录。正常关闭的旧版评分库与人工评分库无需迁移；如果程序提示有数据库旁路日志，请保留原库及日志，在可信位置恢复并正常关闭，再重新打开。程序会拒绝通过链接或 Windows 重解析点读取、写入相册状态。
+# 2. 五维评分 + 连拍去重（增量缓存，第二次运行几乎秒级）
+pic_process score <照片目录>                 # 默认写入 <照片目录>/.firstcut/report.csv 与 cache.sqlite
 
-`scan`、`score` 和 `tune` 默认将可能被电子表格解释为公式的文本单元格加上文本标记；供脚本读取的原始 CSV 可用 `--raw-csv`，不要直接用表格应用打开来源不可信的原始报告。联系表只读取照片根内的 JPG；报告在别处时用 `--photo-root <照片目录>` 明确指定。
+# 3. 评分并导出 Lightroom XMP 星级侧车
+pic_process score <照片目录> --xmp
 
-XMP 是唯一有意写在照片旁边的导出物：Lightroom 通过照片同目录的标准侧车文件识别星级和曝光建议。其他 firstcut 状态和报告不会散落在照片根目录。
+# 4. 启动本地 Web 复核界面（默认监听 http://127.0.0.1:8787，终端 Ctrl+C 退出）
+pic_process review <照片目录>
+pic_process review <照片目录> --port 9000 --config stage.toml
 
-## Linux 容器（Linux / macOS）
+# 5. 生成评分配置模板或场景预设（portrait / stage / highkey / sports / lowlight）
+pic_process config-template
+pic_process config-template --preset stage -o <照片目录>/.firstcut/config.toml
 
-Release 工作流在 Windows 测试通过后，会构建并发布 `linux/amd64` 与 `linux/arm64` 两种镜像到 GitHub Container Registry。Docker 会按主机架构自动选择镜像。Apple Silicon（M1/M2/M3/M4）用户可通过 Docker Desktop 运行 ARM64 Linux 镜像，不需要模拟 x86；这提供的是 Linux 容器环境，不是原生 macOS 应用。该方案适合浏览、复核和使用已有评分缓存。
+# 6. 辅助工具
+pic_process-gallery <照片目录>/.firstcut/report.csv   # 生成静态 HTML 联系表（默认输出到报告同目录）
+pic_process-tune <照片目录>                            # 导出原始指标（默认 <照片目录>/.firstcut/metrics.csv）
+```
 
-首次发布后，需要在 GitHub 仓库关联的 `firstcut` container package 设置中把可见性改成 Public，朋友才能匿名拉取镜像。GHCR 新建的 package 默认是 Private。
+常用 `score` 选项：
+- `--xmp`：写出 `<stem>.xmp` 侧车（默认仅写 `xmp:Rating`、`firstcut:*` 与信息字段 `firstcut:suggestedEV`，不触碰 Adobe `crs:*` 开发参数）
+- `--xmp-exposure`：配合 `--xmp` 显式将建议曝光写入 Adobe `crs:Exposure2012`（亦可在配置中设 `[metric] exposure_write_crs = true`）；绝不覆盖或删除侧车中已有的 Lightroom 人工曝光
+- `-k <N>`：每个连拍保留单元（姿态簇 / dHash 子簇）保留前 N 张（默认读取 `[dedup] keep_k = 3`）
+- `--config <file>`：指定评分配置 TOML（默认自动读取 `<照片目录>/.firstcut/config.toml`）
+- `--cache <file>` / `--no-cache`：指定旧版/自定义缓存路径，或禁用缓存
+- `--no-ai`：跳过 AI 推理，仅跑纯像素模式
+- `--raw-csv`：输出不做表格公式转义的原始 CSV（仅限脚本读取，勿直接用电子表格打开不可信来源）
+- `--gpu`：实验性 DirectML GPU 推理（需 `--features gpu` 构建；历史实测无显著加速）
 
-macOS 上先安装并启动 Docker Desktop，然后克隆仓库，把 `.env.example` 复制为 `.env` 并填写照片与模型目录。运行 `openssl rand -hex 32` 生成访问凭据，把输出写入 `FIRSTCUT_ACCESS_TOKEN`：
+> **访问凭据与链接**：复核链接自带自动登录凭据；使用 `--no-browser` 时请复制终端输出的完整链接（勿分享含凭据的链接）。直接访问不带凭据的地址需手动输入凭据或复用已有会话。
+
+### 方式三：Linux / macOS（Docker 容器）
+
+Release 工作流向 GHCR 发布 `linux/amd64` 与 `linux/arm64` 双架构镜像（Apple Silicon M1–M4 可通过 Docker Desktop 原生运行 ARM64 Linux 镜像；原生 macOS 二进制尚未列入发行承诺）。
+
+> 首次发布到新仓库时，需在 GitHub 仓库关联的 `firstcut` package 设置中将可见性改为 **Public**，他人才能匿名拉取。
+
+1. 复制 `.env.example` 为 `.env`，生成随机访问凭据（`openssl rand -hex 32`）并填写路径：
 
 ```dotenv
 PHOTO_DIR=/Users/你的用户名/Pictures/活动目录
 MODEL_DIR=/Users/你的用户名/firstcut-models
-FIRSTCUT_ACCESS_TOKEN=<上一步生成的随机凭据>
+FIRSTCUT_ACCESS_TOKEN=<随机生成的 32-128 位凭据>
 ```
 
-在终端启动时，把照片目录写权限映射给当前 macOS 用户，再启动容器：
+2. 映射当前用户权限并启动容器：
 
 ```bash
 export FIRSTCUT_UID="$(id -u)"
@@ -72,263 +112,192 @@ docker compose pull
 docker compose up -d
 ```
 
-访问 <http://127.0.0.1:8787>，在登录页输入刚配置的凭据；结束后运行 `docker compose down`。`PHOTO_DIR` 必须是活动照片根目录，容器会在其 `.firstcut/` 下读取和保存评分、配置、缓存、缩略图及日志，因此该目录以读写方式挂载。端口只发布到本机回环地址。模型目录挂载到容器的 `/app/models`；没有或未通过校验的模型会让重评分降级为纯像素模式。
+3. 打开 <http://127.0.0.1:8787> 输入 `FIRSTCUT_ACCESS_TOKEN` 登录；使用完毕后运行 `docker compose down`。
 
-Linux 主机也使用同一 Compose 配置。直接运行 CLI 时默认只监听本机。需要 `--bind 0.0.0.0` 时必须提供 `FIRSTCUT_ACCESS_TOKEN`。宿主端口映射有变化时，将 `FIRSTCUT_PUBLIC_URL` 设为浏览器实际打开的地址；使用反向代理时，需要保留外部 Host 和 Origin，非本机地址须用 HTTPS。
+- 容器默认只映射宿主机回环地址 `127.0.0.1:8787`，`PHOTO_DIR` 以读写方式挂载以保存 `.firstcut/` 状态与 XMP，`MODEL_DIR` 只读挂载到 `/app/models`。
+- 直接运行 CLI 并使用 `--bind 0.0.0.0` 时，必须提供 `FIRSTCUT_ACCESS_TOKEN`；若经端口映射或反向代理暴露，请配置 `FIRSTCUT_PUBLIC_URL`（非本机地址须使用 HTTPS，且代理需保留外部 `Host` 与 `Origin`）。
 
-当前锁定的 ONNX Runtime 版本提供 Linux x86_64 与 ARM64 CPU 运行库；CI 和镜像发布会分别在 x86_64、ARM64 原生 runner 上测试和构建。M 芯片用户通过 ARM64 容器可用 CPU 推理。原生 macOS Apple Silicon 也有继续支持的路径，但需要启用并实际验证 CoreML；当前先不把原生 macOS 程序列入发行承诺。该 ONNX Runtime 版本没有 Intel Mac 预编译目标。
-
-## 自动检查与发布
-
-GitHub Actions 的 [CI 工作流](.github/workflows/ci.yml) 在提交到 `main`、向 `main` 提交 PR 时运行 Windows、Linux x86_64 和 Linux ARM64 测试，并检查 RustSec 公告。Windows 构建后对四个 EXE 执行 `cargo audit bin`，主程序用合成照片检查登录、原图、缩略图和重新评分。AMD64 和 ARM64 容器以镜像归档为输入，由 Trivy 静态扫描系统包和嵌入程序的 Rust 依赖。[Release 工作流](.github/workflows/release.yml) 要求标签指向 `main` 上已通过 CI 与 CodeQL 的提交。发布时 Windows 验证和两架构镜像扫描通过后，才更新 GHCR 的版本标签和 `latest`，随后发布带 GitHub 构建证明的 Windows 产物。手动运行 Release 工作流只保留 14 天的 Windows 临时工件。
-
-发布新版本时，先将 `Cargo.toml` 中的版本号和 `Cargo.lock` 更新并合入 `main`，确认 CI 通过，然后推送对应标签。例如 `1.4.1` 使用 `v1.4.1`。发布任务会核对标签与版本号，GitHub 自动生成发行说明。`v1.2` 是此前手动发布的版本；后续版本使用自动发布流程。模型文件和本地照片不会进入发行包。
+---
 
 ## 模型准备（一次性）
 
-`score` 需要 `models/` 目录下三个模型（已 gitignore）：
+`score` 完整模式需要 `models/` 目录（或 `FIRSTCUT_MODEL_DIR` 指定目录）下的三个固定版本模型（已 gitignore，不随源码或 Release 分发）：
 
 | 文件 | 来源 | 大小 |
 |---|---|---|
-| `clipiqa_model.onnx` + `clipiqa_model.onnx.data` | [86Cao/IQA-ONNX-Models 固定版本](https://huggingface.co/86Cao/IQA-ONNX-Models/tree/2e32ab1ad40c592da9d199f4c7fb8a2383bbae94)（保留原文件名） | ~153MB |
-| `scrfd_10g_bnkps.onnx` | [RuteNL 的 10g_bnkps.onnx](https://huggingface.co/RuteNL/SCRFD-face-detection-ONNX/blob/3d9a1b3bc9f8a50635817929118fb9184f5bc30b/10g_bnkps.onnx)（下载后改成左侧文件名） | 16.9MB |
-| `yolov8n_pose.onnx` | [Xenova 的 onnx/model.onnx](https://huggingface.co/Xenova/yolov8n-pose/blob/da4224085e2f6ce4c9ff9b670e28765194619db2/onnx/model.onnx)（下载后改成左侧文件名） | 13.5MB |
+| `clipiqa_model.onnx` + `clipiqa_model.onnx.data` | [86Cao/IQA-ONNX-Models 固定版本](https://huggingface.co/86Cao/IQA-ONNX-Models/tree/2e32ab1ad40c592da9d199f4c7fb8a2383bbae94)（保留原文件名） | ~153 MB |
+| `scrfd_10g_bnkps.onnx` | [RuteNL 的 10g_bnkps.onnx](https://huggingface.co/RuteNL/SCRFD-face-detection-ONNX/blob/3d9a1b3bc9f8a50635817929118fb9184f5bc30b/10g_bnkps.onnx)（下载后改成左侧文件名） | 16.9 MB |
+| `yolov8n_pose.onnx` | [Xenova 的 onnx/model.onnx](https://huggingface.co/Xenova/yolov8n-pose/blob/da4224085e2f6ce4c9ff9b670e28765194619db2/onnx/model.onnx)（下载后改成左侧文件名） | 13.5 MB |
 
-推理前会核对这些固定版本的 SHA‑256。模型缺失或无法通过校验时，`score` 会提示并降级为纯像素评分；`--no-ai` 可显式跳过。CSV 的 `analysis_mode` 标明本次是 `ai` 还是 `pixel`；两种结果使用不同缓存指纹，模型文件变化也会使 AI 缓存失效。下载后放到 `models/`，或通过 `FIRSTCUT_MODEL_DIR` 显式指定模型目录。
+推理前会核对上述固定版本的 **SHA‑256**。模型缺失或校验失败时，`score` 会提示并降级为纯像素评分；CSV 的 `analysis_mode` 列会标明 `ai` 或 `pixel`，两者在缓存中严格隔离。
 
-## 用法
+---
 
-```bash
-# 只建索引（EXIF + 配对，不评分）
-pic_process scan <照片目录>  # 默认写入 <照片目录>/.firstcut/scan-report.csv
+## 评分、预设与连拍去重
 
-# 评分 + 连拍去重（推荐）
-pic_process score <照片目录>  # 默认写入 <照片目录>/.firstcut/report.csv 和 cache.sqlite
+### 五维评分（默认权重总和 1.0）
 
-# 评分 + 写 XMP 星级侧车（Lightroom 可读）
-pic_process score <照片目录> --xmp
-
-# 本地 Web 复核界面（缩略图墙 / 1:1 原图 / 连拍并排对比，浏览器打开）
-pic_process review <照片目录>
-
-# 增量重跑（SQLite 缓存，只处理新照片/变更照片）
-pic_process score <照片目录>            # 第二次几乎秒级
-
-# 其他选项
-pic_process score <目录> -k 2           # 每个保留单元保留 2 张
-pic_process score <目录> --no-ai        # 跳过 AI 推理
-pic_process score <目录> --no-cache     # 禁用缓存
-pic_process score <目录> --cache x.db   # 指定缓存文件
-pic_process score <目录> --config x.toml # 自定义评分配置（多场景可存多份）
-pic_process score <目录> --gpu          # 实验性 DirectML（需 --features gpu 构建）
-
-# 生成评分配置模板
-pic_process config-template                   # 默认写入当前目录/.firstcut/firstcut-template.toml
-
-# 生成内置场景预设（portrait / stage / highkey / sports / lowlight）
-pic_process config-template --preset stage -o .firstcut/config-stage.toml
-
-# 辅助工具
-pic_process-gallery <目录>/.firstcut/report.csv  # 默认写入报告同目录/gallery.html
-pic_process-tune <目录>                           # 默认写入 <目录>/.firstcut/metrics.csv
-```
-
-## 多场景配置
-
-不同拍摄场景用不同权重与曝光容差。内置 5 个场景预设，可直接生成后微调：
-
-```bash
-pic_process config-template --preset stage -o .firstcut/config-stage.toml
-pic_process score <目录> --config <目录>/.firstcut/config-stage.toml
-```
-
-| 预设 | 适用场景 | 主要差异 |
+| 维度 | 默认权重 | 核心方法 |
 |---|---|---|
-| `portrait` | 人像 / 漫展 / 棚拍 | 等同于内置默认值 |
-| `stage` | 舞台演出 / 暗厅 / live | 曝光权重 0.20、暗侧容差放宽到 -2 档、构图权重 0.20 |
-| `highkey` | 白背景 / 白裙 / 雪景 | 目标亮度 150、亮侧容差放宽到 +3 档 |
-| `sports` | 运动 / 打鸟 / 飞机 | 清晰度权重 0.45 且判定更严格、构图权重 0.05、关闭主体感知曝光 |
-| `lowlight` | 夜景 / 暗光室内 | 目标亮度 110、暗侧容差 -5 档、噪点更宽容、美学权重 0.20 |
+| 清晰度 | 0.30 | 主体感知三层链路：SCRFD 人脸区域 reblur P80 → 无主体脸时 YOLOv8-pose 头部区域 → 无主体则 50 中性下限；与全局 Tenengrad 取高者 |
+| 曝光 | 0.25 | 过曝/欠曝像素比例惩罚 + **EV 容差带**（默认 ±1 EV 满分，-4 / +2 EV 归零）；有主体脸时做向中灰方向单向修正 |
+| 噪点 | 0.15 | 暗部 8×8 块标准差 P15 + ISO 容忍度曲线 `k = 3.0·(1 + 0.3·log10(iso/100))` |
+| 构图 | 0.15 | SCRFD 主体脸（高度 ≥ 4%）三分法位置、占比（8%–30% 理想）与多人降权；无人脸给中性 60 |
+| 美学 | 0.15 | CLIPIQA+（224×224，sigmoid × 100） |
 
-`config-template`（不带 `--preset`）输出的是带完整中文注释的通用模板，
-只写想改的字段即可。**换了 `--config` 无需换缓存文件**：配置指纹已并入缓存键，
-配置变化会自动重算（见下）。
+### 内置场景预设
 
-> 配置是 **fail-fast** 的：`--config` 指向的文件不存在/解析失败会直接报错退出
-> （不再静默回退默认值），未知字段名也会被拒绝——防止手滑的字段名静默失效。
-> 但注意：改**权重**或**星级阈值**不会触发重新分析（它们不影响缓存里的五维子分），只会重新合成总分和星级；改曲线参数（`sharpness_k`/`noise_k0`/`exposure_*`）会重新分析。`NaN`、无穷值和越界参数会被拒绝。
+通过 `pic_process config-template --preset <名称>` 生成，或在复核界面直接编辑 `.firstcut/config.toml`：
 
-## 输出说明
+| 预设 | 适用场景 | 主要调整 |
+|---|---|---|
+| `portrait` | 人像 / 漫展 / 棚拍 | 等同内置默认值 |
+| `stage` | 舞台演出 / 暗厅 / live | 曝光权重 0.20、暗侧容差放宽至 -2 EV、构图权重 0.20 |
+| `highkey` | 白背景 / 白裙 / 雪景 | 目标亮度 150、亮侧容差放宽至 +3 EV |
+| `sports` | 运动 / 打鸟 / 飞机 | 清晰度权重 0.45 且更严格、构图权重 0.05、关闭主体感知曝光 |
+| `lowlight` | 夜景 / 暗光室内 | 目标亮度 110、暗侧容差 -5 EV、噪点更宽容、美学权重 0.20 |
 
-**CSV**（`report.csv`）每行一张照片（ARW 分数映射自同名 JPG）：
+> **配置校验与缓存规则**：配置采用 **fail-fast** 校验（文件缺失、未知字段、权重和偏离 `1.0 ± 0.05`、NaN/越界或容差带顺序错误均直接报错）。修改**权重/星级阈值/连拍参数**不会触发重解码和 AI 重算，仅重新合成总分与星级；修改**曲线参数**、分析模式或模型来源时自动失效并重算。
+
+### 星级分档与连拍去重
+
+- **相对星级（默认 `star_mode = "relative"`）**：按批次内排名给星——5★ 前 10%、4★ 10%–30%、3★ 30%–65%、2★ 65%–90%、1★ 后 10%（同分并列取平均位次；建议整场活动一次评分，跨批次比较请看 `total_score`）。可切 `star_mode = "absolute"`（默认阈值 75/60/45/30）。
+- **人工星级优先**：通过复核界面设置的星级持久化在 `.firstcut/decisions.sqlite`，重评分不会覆盖，并同步给配对的 JPG/ARW。
+- **自适应连拍去重**：按 EXIF 时间 ≤ 2s 分连拍组 → dHash 汉明距离 ≤ 10 分近似子簇 → SCRFD 五关键点 10 维姿态描述子聚类（阈值 0.25）→ 每姿势簇保留 top-3（单组上限 20）。可在 `[dedup]` 关闭 `adaptive_keep` 回退纯 dHash 模式。`burst_keep` 仅为建议标记，工具永不删除文件。
+
+---
+
+## 本地复核界面（`review`）
+
+- **缩略图墙与筛选侧栏**：分页懒加载、筛选排序自动记忆；默认按连拍组折叠显示代表帧，点击或右键可展开整组、手动覆盖保留/舍弃标记。侧栏筛选区可折叠并拖动调宽。
+- **1:1 原图灯箱与连拍并排对比**：按需流式直读原图，支持滚轮缩放、拖拽平移、双击复位、`←/→` 组内切换、缩放百分比与带单位 EXIF（`f/`、`s`、`mm`）；支持勾选同组 2–4 张**同步缩放平移**对比合焦。
+- **RGBW 直方图**：可拖动悬浮面板，支持 W/R/G/B 通道独立开关，基于解码后 SDR JPEG 做网格抽样（默认 10%，可在设置中调为 1%–25%，仅内存缓存）。
+- **评分解释与场景反馈**：展示活动照片的五维子分、实际权重与贡献；支持记录真实场景纠正与备注至 `.firstcut/scene-feedback.jsonl`。
+- **界面内改星、跑批与调参**：灯箱内 `1–5` 快捷改星并同步 XMP；侧栏一键重评分（实时进度与时间日志）；表单化编辑配置并用 `toml_edit` 保留注释。
+
+---
+
+## 输出与状态文件布局
+
+除照片旁的 `<stem>.xmp` 侧车（供 Lightroom / Camera Raw / darktable 读取）外，所有 firstcut 状态默认集中存放在 `<照片根目录>/.firstcut/`：
+
+| 路径 | 说明 |
+|---|---|
+| `.firstcut/cache.sqlite` | 可重建的分析缓存（删除后可重算） |
+| `.firstcut/decisions.sqlite` | 人工星级决定库（**备份照片时请保留**） |
+| `.firstcut/burst-overrides.json` | review 人工连拍保留/舍弃覆盖（**建议保留**） |
+| `.firstcut/scene-feedback.jsonl` | 场景标注与备注记录（上限 16 MiB） |
+| `.firstcut/config.toml` / `ui-preferences.json` | 照片根级评分配置与 UI 偏好 |
+| `.firstcut/report.csv` / `scan-report.csv` / `metrics.csv` | 评分、扫描与调参报告 |
+| `.firstcut/thumbs/v2/` | 有界缩略图缓存（8192 槽，每槽上限 64 KiB） |
+| `.firstcut/review.log` | 任务时间日志（严格限制单文件 256 KiB） |
+| `<照片目录>/<stem>.xmp` | 默认写 `xmp:Rating`、`firstcut:*` 子分/连拍与 `firstcut:suggestedEV`；仅显式开启 `--xmp-exposure` / `exposure_write_crs = true` 或 UI 对应选项时，才为尚无曝光参数的侧车附加 `crs:Exposure2012`（含 `crs:HasSettings`），改星仅同步 `xmp:Rating`；不覆盖他人侧车，绝不覆盖或删除已有 Adobe 人工曝光，并兼容属性规范化写法 |
+
+> **安全边界**：程序拒绝通过符号链接或 Windows 重解析点读写相册状态，并拒绝读取带未关闭旁路日志的异常 SQLite 数据库（保留原件不破坏）。正常关闭的旧版评分库和决定库可直接继续使用。
+
+<details>
+<summary>查看 CSV 报告完整列说明</summary>
 
 | 列 | 含义 |
 |---|---|
-| `path, filename, extension, is_raw, has_pair` | 文件标识与 JPG/ARW 配对状态（JPG 与 ARW 同目录配对；分放 `JPG/`+`RAW/` 时同名且无歧义也可配对） |
-| `date_time_original` | EXIF 拍摄时间（连拍聚类用） |
-| `camera_make, camera_model, lens_model` | 相机/镜头 |
+| `path, filename, extension, is_raw, has_pair` | 文件路径标识与 JPG/ARW 配对状态 |
+| `date_time_original` | EXIF 拍摄时间（连拍聚类依据） |
+| `camera_make, camera_model, lens_model` | 相机与镜头型号 |
 | `iso, f_number, shutter_speed, focal_length` | 曝光参数 |
-| `sharpness_score, exposure_score, noise_score, composition_score, aesthetic_score` | 五维子分（0-100） |
-| `total_score` | 加权总分（0-100，跨批次可比） |
-| `stars` | 星级 1-5（默认按**本批次相对排名**，见下） |
-| `rating_source` | `algorithm` 为算法建议；`manual` 为人工星级。人工决定优先，重跑不会覆盖 |
-| `analysis_mode` | `ai` 为完整模型分析；`pixel` 为纯像素分析或模型不可用时的降级结果 |
+| `sharpness_score, exposure_score, noise_score, composition_score, aesthetic_score` | 五维子分（0–100） |
+| `total_score` | 加权总分（0–100，同配置下跨批次可比） |
+| `stars` | 最终星级 1–5（人工决定优先） |
+| `rating_source` | `algorithm`（算法建议）或 `manual`（人工星级） |
+| `analysis_mode` | `ai`（完整模型）或 `pixel`（纯像素/降级） |
 | `faces` | SCRFD 检测到的人脸数 |
-| `analysis_ok` | 评分数据是否可用（解码失败/无配对 ARW 为 false，运行结束 stderr 也有失败清单） |
-| `burst_group, burst_size, burst_rank, burst_keep, burst_pose` | 连拍去重：组号、**保留单元内**张数、保留单元内排名、是否建议保留、姿态簇号（`burst_keep` 只是建议标记，**工具永不删除/移动文件**） |
+| `analysis_ok` | 分析数据是否可用（解码失败或无配对 ARW 为 `false`） |
+| `burst_group, burst_size, burst_rank, burst_keep, burst_pose` | 连拍组号、保留单元张数、单元内排名、建议保留标记、姿态簇号 |
 
-**XMP 侧车**（`--xmp`）：写 `<stem>.xmp`（如 `DSC00001.xmp`），含
-`xmp:Rating`（1-5 星）+ `firstcut:` 命名空间（五维子分/人脸/连拍信息）。
-同目录的 JPG/ARW 共用一个侧车；分放不同目录时各写一份同名侧车，使用相同的最终星级。
-**已有其他软件写的侧车不会被覆盖**（只提示跳过）。firstcut 创建的侧车若后来加入其他字段，重跑仅合并 firstcut 管理的分数、星级和曝光建议字段，保留其余 XML 内容；文件无法解析时保留原文件并报告写入失败。
+</details>
 
-> 命名兼容性：`<stem>.xmp` 是 **Lightroom / Camera Raw** 的约定，**darktable 也读**
-> 这种格式（它自己的 `<stem>.<扩展名>.xmp` 也认）。所以一份侧车两边都能用。
+---
 
-## 评分维度（默认权重，总和 1.0）
+## 源码构建、目录结构与测试
 
-| 维度 | 权重 | 方法 |
+### 从源码构建
+
+```bash
+cargo build --release
+# 可选：实验性 DirectML GPU 推理（score --gpu）
+cargo build --release --features gpu
+```
+
+产物位于 `target/release/`（Windows 加 `.exe`；ONNX Runtime 静态链接，Windows 依赖系统 DirectML 与 Visual C++ 运行时）：
+
+| 二进制 | 用途 | 是否进入 Release |
 |---|---|---|
-| 清晰度 | 0.30 | 主体感知三层链路：SCRFD 人脸区域 reblur P80（半宽/半高 = 脸框尺寸 ×1.5，即约 3× 脸框）→ 无主体级人脸时 YOLOv8-pose 头部关键点区域 reblur P80 → 都无则 50 分中性下限（大光圈浅景深照片不会被误判）；区域分与全局分**取高者** |
-| 曝光 | 0.25 | 过曝/欠曝像素比例（4× 惩罚）+ 判定亮度偏离理想值的 **EV 容差带**（默认 ±1 档内满分，-4 档 / +2 档降为 0）；判定亮度在有主体级人脸时用主体脸亮度做单向修正 |
-| 噪点 | 0.15 | 暗部 8×8 块标准差 P15（最平滑暗块）+ ISO 容忍度曲线 `k = 3.0·(1+0.3·log10(iso/100))` |
-| 构图 | 0.15 | SCRFD 主体级人脸（高度 ≥ 4%）：三分法位置 + 主体大小（8%~30% 理想）+ 多人降权；无主体脸时中性 60（不惩罚风景/静物） |
-| 美学 | 0.15 | CLIPIQA+（CLIP 底座，sigmoid 输出 ×100 → 0-100 分） |
+| `pic_process` | 主命令行工具（`scan` / `score` / `config-template` / `review`） | 是 |
+| `firstcut-ui` | Windows 无控制台双击启动器 | 是 |
+| `pic_process-gallery` | 静态 HTML 联系表生成器 | 是 |
+| `pic_process-tune` | 原始指标 CSV 导出（调参用） | 是 |
+| `pic_process-debug-pose` / `-scrfd` / `-exposure` / `-probe` | 模型与像素指标诊断工具 | 按需源码构建 |
 
-> 加载 `--config` 时，权重和需在 1.0±0.05 范围内；曝光容差带必须严格嵌套
-> （`exposure_ev_lo > exposure_ev_full_lo`），否则拒绝加载。
+### 源码目录结构
 
-### 曝光为什么用 EV 容差带
-
-用"平均亮度偏离中灰多少"打分，会把两类**合法**场景误判成曝光失误：
-舞台黑幕布（全图均值被拉低）、白裙白背景（全图均值被拉高）。所以：
-
-1. **容差带按曝光档位（EV）定义**，而不是按码值。±1 EV 对应码值 92~176，
-   是 AE 的正常波动范围；超出后线性衰减，暗侧到 -4 EV、亮侧到 +2 EV 降为 0
-   （亮侧更陡：高光溢出在 JPG 里不可恢复，暗部在 RAW 里通常还能救）。
-2. **两侧容差独立**：舞台要放宽暗侧但不能放宽亮侧，雪景反之。
-3. **主体感知做单向修正**：有主体级人脸（高度 ≥ 4%）时，取最亮的一张主体脸
-   亮度，把判定值往中灰方向拉（最多拉到中灰，不会越过）。所以暗色/亮色误检框
-   不会把正常照片打下去，同时暗背景/亮背景场景能被救回。
-
-**星级分档**：默认 `star_mode = "relative"`，按**本次批次内的相对排名**给星：
-
-| 星级 | 批次内百分位（0 = 最好） |
-|---|---|
-| 5★ | 前 10% |
-| 4★ | 10%~30% |
-| 3★ | 30%~65% |
-| 2★ | 65%~90% |
-| 1★ | 后 10% |
-
-为什么不用绝对阈值：各维度为了防止误杀都带中性地板（清晰度 50 保底、构图无主体
-60、曝光容差带），实测一批 119 张按绝对阈值全部落在 4~5 星，星级就失去了筛选作用。
-**总分仍原样写进 CSV/XMP**，跨批次比较看分数而不是星级。
-同分并列取平均位次，不会被拆成不同星级。
-想要绝对阈值就设 `star_mode = "absolute"`（阈值 `rating_5..2`，默认 75/60/45/30）。
-
-> 注意：星级依赖"批次"——建议**整场照片一次跑完**。分批跑不同子目录会各自归一化，
-> 星级之间不可比。
-> 人工改星保存在照片根目录的 `.firstcut/decisions.sqlite`，优先于算法星级，并同步给配对的 JPG/ARW。此文件是用户决定，**备份照片目录时请保留**；评分缓存 `.firstcut/cache.sqlite` 可删除后重建。旧版仅写入 XMP 的人工星级不会自动导入决定库，需要在复核界面重新确认。
-
-**连拍去重（默认按姿势分组保留）**：先按 EXIF 拍摄时间排序，再以间隔 ≤2s 成组 → 组内按 dHash
-汉明距离 ≤10 分**子簇**（近乎同一张）→ 子簇内再按 **SCRFD 关键点姿态描述子**
-聚类（距离 > 0.25 = 不同姿势）→ **每个姿势簇各自保留 top-3**（`-k` 可调），
-单组保留总量受上限 20 约束（超出按总分截断）。
-解决"30fps 连拍不同姿势被 dHash 判为近似重复只留 2 张"的问题；
-无人脸的帧退化为 dHash 行为；`burst_keep=true|false` 只是建议保留标记。
-阈值/开关/上限都在 `[dedup]` 配置段（`adaptive_keep = false` 回退旧行为）。
-
-## 本地复核与操作台（review）
-
-```bash
-pic_process review <照片目录>            # 浏览器自动打开 http://127.0.0.1:8787
-pic_process review <目录> --port 9000 --config stage.toml
-```
-
-- **缩略图墙**：分页 + 懒加载，卡片显示星级/总分/连拍保留标记；筛选（星级、
-  保留/未保留、五维分数下限、有人脸、文件名搜索）与排序，条件自动记忆。默认按连拍组聚合，首页每组只显示当前排序最靠前的一张；点击后仍可查看整组，选定具体组时显示全部成员。开关可随时关闭。
-- **筛选侧栏**：星级和分数下限可折叠，收起后仍显示已启用条件的数量；目录与操作说明也可按需展开。桌面端拖动侧栏右侧边界可调整宽度，双击边界恢复默认宽度；窄屏使用“筛选”按钮打开侧栏。展开状态和侧栏宽度保存在浏览器中。
-- **1:1 原图灯箱**：点击卡片打开原图（按需直读原文件，不预生成），
-  滚轮缩放、拖拽平移、双击复位，`←/→` 在同一连拍组内切换——缩略图看不清
-  是否合焦时随时放大到 100%。顶部显示带单位的 ISO、光圈、快门和焦距信息。
-- **直方图**：灯箱顶部可显示或隐藏亮度与 RGB 直方图，面板可拖动；并排对比时跟随当前选中的照片。W（亮度）、R、G、B 通道可分别开关。横轴为 JPEG 解码后的 8-bit 色阶（0–255），纵轴为相对像素频数。抽样比例默认 10%，可在“程序配置 → 界面设置”中调整为 1–25%；比例越高，耗时和临时内存越大。固定网格抽样的暗部、亮部百分比是估计值，不能用于精确判断少量像素的过曝或欠曝；不生成磁盘缓存。灯箱同时显示缩放百分比；照片信息中的快门、焦距带有 `s`、`mm` 单位。
-- **连拍组并排对比**：灯箱内勾选同组 2~4 张，并排窗格**同步缩放平移**
-  （滚轮/拖拽作用于所有窗格），逐帧对比合焦位置。
-- **评分说明与场景标注**：打开照片后，悬浮面板列出五项子分、实际权重和各自贡献。并排对比时可点击窗格或在面板中选择照片；面板标题可拖动，右下角可调整大小。场景初判目前仅依据人脸检测给出“人像候选”，其余显示“未识别”；这不是通用场景分类器，也不会自动切换评分配置。可选择实际场景并写备注，记录追加到 `.firstcut/scene-feedback.jsonl`，供后续识别与评分校准。
-- **手动调整连拍保留标记**：照片右键可设为保留/舍弃，也可恢复自动建议；标记保存在照片根目录的 `.firstcut/burst-overrides.json`，复核界面重启后仍有效。
-- **UI 内跑批**：侧栏"重新评分"触发完整评分流水线（与 `score` 子命令
-  同一实现），进度条 + 带本地时间的日志实时可见，完成后快照自动刷新，无需重启服务。完整任务记录追加到照片目录的 `.firstcut/review.log`；单文件严格限制为 256 KiB，达到上限后压缩为最近约 128 KiB 再继续写入，超长单行也会截断。
-- **UI 内改星**：灯箱内点星级或按 `1~5` 快捷键 → 保存人工决定并同步 XMP。
-  重启复核界面、重新评分或导出后仍使用人工星级；他人侧车不覆盖。侧车同步失败时，界面会提示，人工决定仍然保存。
-- **配置编辑**：权重/星级阈值/EV 容差/[dedup] 表单化编辑，
-  保存保留 TOML 注释，非法值（权重和越界等）拒绝写盘。
-- 默认配置位于照片根目录的 `.firstcut/config.toml`，UI、CLI `score` 和 `review` 均自动加载；不存在时使用内置默认值。UI 跑批报告位于 `.firstcut/report.csv`；CLI 可用 `--config` 显式选择其他配置。
-- **图像兼容范围**：目前直方图与分析基于解码后的 SDR JPEG 像素；HDR 增益图、PQ/HLG 等 HDR 内容尚未识别或保留 HDR 亮度信息。HDR 照片暂按 SDR JPEG 兼容范围处理。
-- 数据来源：扫描目录 + SQLite 分析缓存 + 独立的人工决定库（星级/连拍与 `score` 同一逻辑在线计算）。
-  未跑过评分的照片显示为未评分。
-
-## 性能（16 核机器实测）
-
-- 119 张 33MP 冷缓存（含 AI）：约 **146ms/张**（CLIPIQA + SCRFD + 姿态）
-- **1447 张真实图库冷跑 2m55s（~121ms/张，88% 连拍）**；增量重跑 1447 张全命中 2.06s
-- 实验性 `--gpu`（DirectML）：119 张 16.7s vs CPU 17.4s——无显著收益，保持实验性
-- 纯像素冷缓存：约 **90ms/张**（`--no-ai`）
-- 增量重跑：秒级（SQLite 缓存，键 = `path` + `size` + `mtime` + `CACHE_VERSION` + 配置/分析模式/模型文件指纹）
-- 曲线参数、分析模式或模型文件来源变更时自动重新分析，无需手动换缓存；仅改权重/星级阈值会复用子分并重新合成结果
-
-这些是历史样本和硬件上的测量，不是本次文档整理重新跑出的性能保证。直方图抽样的工作量与内存估算见[设计文档](DESIGN.md#71-直方图与性能边界)。
-
-## 目录结构
-
-```
+```text
 src/
-├── main.rs        # CLI（scan / score / config-template / review）
-├── lib.rs         # 库入口（pub mod 各模块）
-├── scan.rs        # 目录扫描 + EXIF + JPG/ARW 配对
-├── decode.rs      # JPEG 解码（box 降采样）+ EXIF 方向 + 灰度/直方图
-├── metrics/       # sharpness / exposure / noise / composition
-├── ai/            # CLIPIQA + SCRFD（含 kps）+ YOLOv8-pose（ort 推理）
-├── dedup.rs       # 连拍分组 + dHash 与姿态聚类 + 排序
-├── cache.rs       # SQLite 增量缓存（键含配置指纹，含姿态描述子）
-├── decision.rs    # 独立的人工星级决定与最终星级合成
-├── selection.rs   # CLI/review 共用的星级与连拍结果合成
-├── review/        # 本地 Web 复核服务（axum + 内嵌前端）
-├── output/        # csv / xmp 侧车
-├── config.rs      # 权重与曲线参数 + [dedup] + 场景预设（TOML 可配）
-└── bin/
-    ├── tune.rs             # 原始指标导出（调参用）
-    ├── gallery.rs          # HTML 联系表生成器
-    ├── debug_pose.rs       # 诊断：YOLOv8-pose 检测
-    ├── debug_scrfd.rs      # 诊断：SCRFD 检测 + kps 自检 + 姿态描述子
-    ├── debug_exposure.rs   # 诊断：全图亮度 vs 主体脸亮度
-    └── probe.rs            # 诊断：ONNX 模型元数据
+├── main.rs            # CLI 入口（scan / score / config-template / review）
+├── lib.rs             # 库模块导出
+├── storage.rs         # 基于 cap-std 的安全目录/文件访问与防链接逃逸边界
+├── scan.rs            # 目录扫描、EXIF 解析与 JPG/ARW 配对
+├── decode.rs          # JPEG 快速解码（box 降采样）、EXIF 方向与灰度安全路径
+├── score.rs           # 并行评分管线与 CLI/UI 共用跑批入口
+├── config.rs          # 配置加载、严格校验、指纹计算与内置场景预设
+├── cache.rs           # SQLite 增量分析缓存（CACHE_VERSION = 15）
+├── dedup.rs           # 连拍时间分组、dHash 子簇与 SCRFD 姿态聚类
+├── decision.rs        # 独立人工星级存储与最终星级合并
+├── selection.rs       # CLI / review 共用的总分、星级与连拍结果合成
+├── metrics/           # sharpness / exposure / noise / composition
+├── ai/                # CLIPIQA+ / SCRFD / YOLOv8-pose 推理与 SHA-256 校验
+├── output/            # CSV（公式防护）与 XMP 侧车读写合并
+├── review/            # 本地 Web 复核服务（axum）
+│   ├── mod.rs         # HTTP 路由与服务生命周期
+│   ├── access.rs      # 访问凭据兑换、会话与 Host/Origin 校验中间件
+│   ├── snapshot.rs    # 快照构建与加载状态
+│   ├── job.rs         # 后台跑批任务与 256 KiB 有界日志
+│   ├── config_edit.rs # 保留注释的 TOML 配置编辑
+│   ├── scene_feedback.rs # 场景反馈追加与大小上限保护
+│   ├── thumb.rs       # 固定槽位缩略图缓存
+│   └── assets/        # 内嵌前端（index.html + review.js）
+└── bin/               # firstcut_ui / gallery / tune / debug_* / probe
 
-presets/                  # 场景预设（编译进二进制，config-template --preset 输出）
-├── portrait.toml  stage.toml  highkey.toml  sports.toml  lowlight.toml
+presets/               # 5 份内置场景预设 TOML（编译进二进制）
+docs/                  # 现行设计、版本说明与 history/ 历史归档
 ```
 
-## 测试
+### 测试与 CI/Release 验证
 
 ```bash
-cargo test --locked
+cargo test --locked --all-targets
 node --check src/review/assets/review.js
 
-# 已构建 Windows 发行程序时，验证登录、取图、重新评分和落盘
+# 验证已构建的 Windows 发行程序（登录、原图、缩略图、重评分与落盘）
 python .github/scripts/check-review.py --binary target/release/pic_process.exe
 ```
 
-测试覆盖扫描和配对、分数与连拍、配置边界、灰度 JPEG、XMP 字段保留，以及“评分 → 人工改星 → 重跑 → CSV/XMP/快照”流程。少数旧集成测试依赖 gitignore 中的私人 `testpic/`；该目录不存在时会跳过这些用例。
+- **CI（[`.github/workflows/ci.yml`](.github/workflows/ci.yml)）**：在 Windows、Linux x86_64 与 ARM64 上运行测试、RustSec 依赖审计（`cargo audit`）、合成照片复核冒烟测试与双架构容器 Trivy 静态扫描；并禁止私人照片与本地状态进入 Git。
+- **Release（[`.github/workflows/release.yml`](.github/workflows/release.yml)）**：要求版本标签指向 `main` 上已通过 CI 与 CodeQL 的提交，核对 `Cargo.toml` 版本，发布带 GitHub 构建证明的 Windows 产物与双架构 GHCR 镜像。
 
-## 相关文档
+### 历史性能参考（16 核机器实测）
 
-- [`DESIGN.md`](DESIGN.md) — 当前有效的产品边界、数据模型、评分/缓存/UI 约定与后续工作
-- [`docs/HISTORY.md`](docs/HISTORY.md) — 合并的历次评审、实施证据、旧里程碑与停止路线研究；取代独立的 REVIEW / ASTRA_REVIEW 文档
-- [`release_notes.md`](release_notes.md) — 用户可见的版本变化
-- [`SECURITY.md`](SECURITY.md) — 安全支持范围与私密漏洞报告方式
+- 119 张 33MP 冷缓存（含 AI）：约 **146 ms/张**；纯像素（`--no-ai`）约 **90 ms/张**。
+- 1,447 张真实图库（88% 连拍）：冷跑 **2m55s**（~121 ms/张），增量全命中 **2.06s**。
+- 实验性 `--gpu`（DirectML）：119 张 16.7s vs CPU 17.4s，无显著收益。
 
-原始工单和被合并文档的全文仍可从 Git 历史找回，方法见历史档案。后续设计改动维护 `DESIGN.md`，评审过程统一追加到 `docs/HISTORY.md`，不再按模型或里程碑新建重复文件。本地沟通记忆不属于公开项目文档，已通过 Git 忽略规则排除。
+> 上述数据为历史样本与硬件实测参考，非跨设备保证；直方图抽样开销估算见 [`docs/DESIGN.md`](docs/DESIGN.md#71-直方图与性能边界)。
 
-## 方向与后续工作
+---
 
-当前产品聚焦选片与复核；曝光补偿只作为 Lightroom 侧车建议输出。优先统一人工连拍保留覆盖与 CLI/CSV 导出：当前人工星级已统一，连拍覆盖仍只作用于 review。真实选片质量校准和 Lightroom 实际导入仍未验收；需要用用户标注检查好片被排除率与连拍最佳帧覆盖率。完整边界和优先顺序见[后续工作](DESIGN.md#9-后续工作与未验收项)。
+## 后续方向
+
+当前优先推进：
+1. 将人工连拍保留覆盖纳入统一决定模型与 `selection` 导出（消除 review 与 CLI/CSV 之间的一致性缺口）。
+2. 建立真实选片标注集，评估好片排除率与连拍最佳帧覆盖率。
+3. 完成 Lightroom / Camera Raw 实际导入验证（星级、JPG/ARW 配对与 `crs:Exposure2012` 效果）。
+
+完整路线与未验收项见 [`docs/DESIGN.md`](docs/DESIGN.md#9-后续工作与未验收项)。
