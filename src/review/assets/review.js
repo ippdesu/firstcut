@@ -222,6 +222,8 @@ const f = {
 // ---------- 初始化 ----------
 function ingest(){
   jpgs = SNAPSHOT.photos.filter(p => !p.is_raw);
+  // 先刷新连拍组选项并校正失效的 f.group，再调用 apply() 渲染网格
+  rebuildGroupOptions();
   document.getElementById("info").textContent =
     `${SNAPSHOT.root} — ${jpgs.length} 张（已评分 ${jpgs.filter(p=>p.scores).length}）`;
   apply();
@@ -285,7 +287,6 @@ function loadData(){
     const currentPath = LB?.list?.[LB.idx]?.path;
     SNAPSHOT = j;
     ingest();
-    rebuildGroupOptions();
     if(currentPath){
       const list = visible();
       const idx = list.findIndex(p=>p.path===currentPath);
@@ -308,11 +309,11 @@ function rebuildGroupOptions(){
     option.textContent = `组 ${group}（${count} 张）`;
     groupBox.appendChild(option);
   }
-  groupBox.value = f.group;
-  if(!groupBox.value){
+  if(![...groupBox.options].some(opt => opt.value === f.group)){
     f.group = "all";
-    groupBox.value = "all";
+    page = 0;
   }
+  groupBox.value = f.group;
 }
 function buildFilters(){
   const starBox = document.getElementById("fStars");
@@ -331,7 +332,6 @@ function buildFilters(){
     wrap.appendChild(r);
     dims.appendChild(wrap);
   }
-  rebuildGroupOptions();
 }
 function onFilter(){
   f.search = document.getElementById("fSearch").value.trim().toLowerCase();
@@ -1123,9 +1123,20 @@ function pollJob(){
   }).catch(()=>{});
 }
 function schedulePoll(){ if(jobPolling) clearTimeout(jobPolling); jobPolling = setTimeout(pollJob, 600); }
+const runXmpEl = document.getElementById('runXmp');
+const runXmpExposureEl = document.getElementById('runXmpExposure');
+function syncRunXmpExposure(){
+  const enabled = runXmpEl.checked;
+  runXmpExposureEl.disabled = !enabled;
+  if(!enabled) runXmpExposureEl.checked = false;
+}
+runXmpEl.addEventListener('change', syncRunXmpExposure);
+syncRunXmpExposure();
 document.getElementById('runBtn').addEventListener('click', ()=>{
+  const xmp = runXmpEl.checked;
+  const xmpExposure = xmp && runXmpExposureEl.checked;
   apiFetch('/api/score/run', {method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({xmp: document.getElementById('runXmp').checked, no_ai: document.getElementById('runNoAi').checked})
+    body: JSON.stringify({xmp, xmp_exposure: xmpExposure, no_ai: document.getElementById('runNoAi').checked})
   }).then(async r=>{
     if(!r.ok){
       toast(await r.text() || `无法开始评分（${r.status}）`);
@@ -1210,7 +1221,7 @@ const FIELD_GUIDE = {
   exposure_ev_lo:{help:'暗侧偏离达到该 EV 时曝光分降到 0；数值越大，对欠曝越宽容，必须大于暗侧满分容差。',min:1,max:8,step:.1,recommended:'常用 3–5 EV'},
   exposure_ev_hi:{help:'亮侧偏离达到该 EV 时曝光分降到 0；通常设得比暗侧更严格，必须大于亮侧满分容差。',min:1,max:6,step:.1,recommended:'常用 1.5–3 EV'},
   exposure_subject_blend:{help:'有主体脸时，主体亮度参与曝光判断的比例；0 只看全图，1 只看主体。',min:0,max:1,step:.05,recommended:'常用 0.3–0.7'},
-  exposure_suggest_cap:{help:'写入 XMP/CSV 的曝光修正建议最大绝对值（EV）；设为 0 可关闭建议。',min:0,max:4,step:.1,recommended:'常用 1–2 EV'},
+  exposure_suggest_cap:{help:'记录到 XMP（firstcut:suggestedEV）与 CSV 的曝光修正建议最大绝对值（EV）；设为 0 可关闭建议。',min:0,max:4,step:.1,recommended:'常用 1–2 EV'},
   dedup_adaptive_keep:{help:'按人脸姿态把连拍拆成多个瞬间分别保留；关闭后退回按画面相似度分簇。'},
   dedup_keep_k:{help:'每个姿势簇保留分数最高的前 K 张；调大可保留更多表情或动作备选。',min:1,max:10,step:1,recommended:'常用 2–5 张；必须至少 1 张'},
   dedup_pose_cluster_threshold:{help:'姿态描述子的聚类距离阈值；调低会拆出更多姿态组，调高会合并相近姿势。',min:.05,max:.6,step:.01,recommended:'常用 0.15–0.40；默认 0.25'},

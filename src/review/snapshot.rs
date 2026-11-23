@@ -152,11 +152,25 @@ pub fn build_snapshot_with_options(root: &Path, cfg: &ScoreConfig, cache_path: &
                 .and_then(|meta| cache::metadata_fingerprint(&meta)) else {
                 continue;
             };
-            let Some((row, _)) = cache::lookup(c.rows(), root, &e.path) else { continue };
-            let is_ai = row.matches(size, mtime, cache::CACHE_VERSION, ai_hash)
-                || legacy_ai_hash
-                    .is_some_and(|h| row.matches(size, mtime, cache::CACHE_VERSION, h));
-            if is_ai || row.matches(size, mtime, cache::CACHE_VERSION, pixel_hash) {
+            let matched = cache::find_matching(c.rows(), root, &e.path, |row| {
+                row.matches(size, mtime, cache::CACHE_VERSION, ai_hash)
+            })
+            .map(|(row, _)| (row, true))
+            .or_else(|| {
+                legacy_ai_hash.and_then(|h| {
+                    cache::find_matching(c.rows(), root, &e.path, |row| {
+                        row.matches(size, mtime, cache::CACHE_VERSION, h)
+                    })
+                    .map(|(row, _)| (row, true))
+                })
+            })
+            .or_else(|| {
+                cache::find_matching(c.rows(), root, &e.path, |row| {
+                    row.matches(size, mtime, cache::CACHE_VERSION, pixel_hash)
+                })
+                .map(|(row, _)| (row, false))
+            });
+            if let Some((row, is_ai)) = matched {
                 analyzed.insert(e.pair_id().to_string(), row.result);
                 mode_by_pair.insert(e.pair_id().to_string(), is_ai);
             }
@@ -409,5 +423,90 @@ mod tests {
         assert!(!photo_jpg.burst.as_ref().unwrap().keep);
         assert_eq!(photo_raw.burst.as_ref().unwrap().manual_keep, Some(false), "配对 RAW 应同步手动连拍覆盖");
         assert!(!photo_raw.burst.as_ref().unwrap().keep);
+    }
+
+    #[test]
+    fn stale_relative_cache_row_does_not_shadow_valid_legacy_absolute_row() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("album");
+        std::fs::create_dir_all(root.join("JPG")).unwrap();
+        let jpg = root.join("JPG").join("a.jpg");
+        image::RgbImage::from_pixel(32, 32, image::Rgb([100, 120, 140])).save(&jpg).unwrap();
+        let (size, mtime) = cache::file_fingerprint(&jpg).unwrap();
+
+        let cfg = ScoreConfig::default();
+        let pixel_hash = crate::config::analysis_fingerprint(&cfg, false);
+        let stale_hash = pixel_hash.wrapping_add(12345);
+        let cache_path = root.join(".firstcut/cache.sqlite");
+
+        // 先写入一条“旧版绝对路径键 + 匹配当前配置指纹”的有效记录
+        let mut legacy_cache = ScoreCache::open_in(&root, &cache_path, pixel_hash, true).unwrap().unwrap();
+        legacy_cache.put(
+            &jpg.display().to_string(),
+            size,
+            mtime,
+            &AnalysisResult {
+                scores: score::PixelScores {
+                    sharpness: 82.0,
+                    exposure: 84.0,
+                    noise: 86.0,
+                    composition: 88.0,
+                    aesthetic: 80.0,
+                },
+                dhash: 7,
+                faces: 0,
+                pose_desc: None,
+                suggested_ev: None,
+            },
+        ).unwrap();
+        legacy_cache.flush().unwrap();
+        drop(legacy_cache);
+
+        // 再写入一条“新版相对路径键 + 另一配置指纹”的不匹配记录
+        let mut stale_cache = ScoreCache::open_in(&root, &cache_path, stale_hash, true).unwrap().unwrap();
+        stale_cache.put(
+            &cache::cache_key(&root, &jpg),
+            size,
+            mtime,
+            &AnalysisResult {
+                scores: score::PixelScores {
+                    sharpness: 11.0,
+                    exposure: 11.0,
+                    noise: 11.0,
+                    composition: 11.0,
+                    aesthetic: 11.0,
+                },
+                dhash: 9,
+                faces: 0,
+                pose_desc: None,
+                suggested_ev: None,
+            },
+        ).unwrap();
+        stale_cache.flush().unwrap();
+        drop(stale_cache);
+
+        // 1) review 快照应跳过不匹配的相对路径记录，命中仍有效的旧版绝对路径记录
+        let snap = build_snapshot(&root, &cfg, &cache_path, &HashMap::new(), &HashMap::new()).unwrap();
+        let photo = snap.photos.iter().find(|p| p.path == "JPG/a.jpg").unwrap();
+        let scores = photo.scores.as_ref().expect("不应被不匹配的相对路径记录挡成未评分");
+        assert_eq!(scores.sharpness, 82.0);
+        assert_eq!(photo.analysis_mode.as_deref(), Some("pixel"));
+
+        // 2) score::analyze_jpgs 也应命中旧版绝对路径记录而非重算，并生成迁移行覆盖失效的相对路径行
+        let entries = scan::scan_directory_with_options(&root, false, false).unwrap();
+        let read_cache = ScoreCache::open_in(&root, &cache_path, pixel_hash, false).unwrap().unwrap();
+        let outcome = score::analyze_jpgs(
+            &root,
+            &entries,
+            &score::AiEngine::none(),
+            Some(read_cache.rows()),
+            &cfg,
+            &|_, _| {},
+        );
+        assert_eq!(outcome.hits, 1, "应命中有效的旧版绝对路径缓存");
+        assert_eq!(outcome.misses, 0, "不应触发重算");
+        assert_eq!(outcome.new_rows.len(), 1, "应产出相对路径迁移行");
+        assert_eq!(outcome.new_rows[0].0, "JPG/a.jpg");
+        assert_eq!(outcome.new_rows[0].3.scores.sharpness, 82.0);
     }
 }

@@ -78,6 +78,8 @@ pic_process-tune <照片目录>                            # 导出原始指标�
 ```
 
 常用 `score` 选项：
+- `--xmp`：写出 `<stem>.xmp` 侧车（默认仅写 `xmp:Rating`、`firstcut:*` 与信息字段 `firstcut:suggestedEV`，不触碰 Adobe `crs:*` 开发参数）
+- `--xmp-exposure`：配合 `--xmp` 显式将建议曝光写入 Adobe `crs:Exposure2012`（亦可在配置中设 `[metric] exposure_write_crs = true`）；绝不覆盖或删除侧车中已有的 Lightroom 人工曝光
 - `-k <N>`：每个连拍保留单元（姿态簇 / dHash 子簇）保留前 N 张（默认读取 `[dedup] keep_k = 3`）
 - `--config <file>`：指定评分配置 TOML（默认自动读取 `<照片目录>/.firstcut/config.toml`）
 - `--cache <file>` / `--no-cache`：指定旧版/自定义缓存路径，或禁用缓存
@@ -189,7 +191,7 @@ docker compose up -d
 | `.firstcut/report.csv` / `scan-report.csv` / `metrics.csv` | 评分、扫描与调参报告 |
 | `.firstcut/thumbs/v2/` | 有界缩略图缓存（8192 槽，每槽上限 64 KiB） |
 | `.firstcut/review.log` | 任务时间日志（严格限制单文件 256 KiB） |
-| `<照片目录>/<stem>.xmp` | 含 `xmp:Rating`、`firstcut:*` 子分/连拍、`firstcut:suggestedEV` 与 `crs:Exposure2012`（含 `crs:HasSettings`）；不覆盖他人侧车，合并更新时保留外部 XML 字段并兼容 Adobe 属性规范化写法 |
+| `<照片目录>/<stem>.xmp` | 默认写 `xmp:Rating`、`firstcut:*` 子分/连拍与 `firstcut:suggestedEV`；仅显式开启 `--xmp-exposure` / `exposure_write_crs = true` 或 UI 对应选项时，才为尚无曝光参数的侧车附加 `crs:Exposure2012`（含 `crs:HasSettings`），改星仅同步 `xmp:Rating`；不覆盖他人侧车，绝不覆盖或删除已有 Adobe 人工曝光，并兼容属性规范化写法 |
 
 > **安全边界**：程序拒绝通过符号链接或 Windows 重解析点读写相册状态，并拒绝读取带未关闭旁路日志的异常 SQLite 数据库（保留原件不破坏）。正常关闭的旧版评分库和决定库可直接继续使用。
 

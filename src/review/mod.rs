@@ -658,6 +658,35 @@ async fn ui_settings_get(State(state): State<Arc<AppState>>) -> Response {
     }
 }
 
+/// 串行化且对请求取消安全的写操作执行器：
+/// 先获取全局写锁与任务守卫，再将二者与 `AppState` 一并移入 `spawn_blocking`；
+/// 即使 HTTP 连接在等待落盘期间断开导致外层 handler future 被 drop，
+/// 后台阻塞任务仍会持锁并持有守卫直到落盘、内存状态与快照全部更新完毕。
+async fn run_serialized_mutation<F>(
+    state: Arc<AppState>,
+    busy_msg: &'static str,
+    work: F,
+) -> Response
+where
+    F: FnOnce(&AppState) -> Response + Send + 'static,
+{
+    let write_guard = Arc::clone(&state.write_lock).lock_owned().await;
+    let Some(mutation) = state.job.begin_mutation() else {
+        return (StatusCode::CONFLICT, busy_msg).into_response();
+    };
+    let state_for_task = Arc::clone(&state);
+    match tokio::task::spawn_blocking(move || {
+        let _write_guard = write_guard;
+        let _mutation = mutation;
+        work(&state_for_task)
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(err) => internal_error(err.into()),
+    }
+}
+
 async fn ui_settings_save(
     State(state): State<Arc<AppState>>,
     axum::Json(request): axum::Json<UiSettingsRequest>,
@@ -665,25 +694,23 @@ async fn ui_settings_save(
     if !(1..=25).contains(&request.histogram_sample_percent) {
         return (StatusCode::BAD_REQUEST, "直方图抽样比例必须在 1% 到 25% 之间").into_response();
     }
-    let _write_guard = state.write_lock.lock().await;
-    let Some(_mutation) = state.job.begin_mutation() else {
-        return (StatusCode::CONFLICT, "评分任务进行中或服务正在关闭，暂不能保存设置").into_response();
-    };
-    let root = state.root.clone();
     let sample_percent = request.histogram_sample_percent;
-    match tokio::task::spawn_blocking(move || -> Result<u8> {
-        let mut preferences = load_ui_preferences(&root);
-        preferences.histogram_sample_percent = sample_percent;
-        save_ui_preferences(&root, &preferences)?;
-        Ok(preferences.histogram_sample_percent)
-    }).await {
-        Ok(Ok(saved)) => json_response(serde_json::json!({
-            "ok": true,
-            "histogram_sample_percent": saved,
-        })),
-        Ok(Err(error)) => internal_error(error),
-        Err(err) => internal_error(err.into()),
-    }
+    run_serialized_mutation(
+        state,
+        "评分任务进行中或服务正在关闭，暂不能保存设置",
+        move |state| {
+            let mut preferences = load_ui_preferences(&state.root);
+            preferences.histogram_sample_percent = sample_percent;
+            match save_ui_preferences(&state.root, &preferences) {
+                Ok(()) => json_response(serde_json::json!({
+                    "ok": true,
+                    "histogram_sample_percent": preferences.histogram_sample_percent,
+                })),
+                Err(error) => internal_error(error),
+            }
+        },
+    )
+    .await
 }
 
 #[derive(Deserialize)]
@@ -711,6 +738,9 @@ struct ScoreRunParams {
     /// 跑批后写 XMP 星级侧车
     #[serde(default)]
     xmp: bool,
+    /// 显式将建议曝光写入 Adobe `crs:Exposure2012`（需同时开启 `xmp`；不覆盖已有曝光）
+    #[serde(default)]
+    xmp_exposure: bool,
     /// 跳过 AI 推理（纯像素快速预览）
     #[serde(default)]
     no_ai: bool,
@@ -719,6 +749,9 @@ struct ScoreRunParams {
 /// POST /api/score/run：触发一次完整评分（单任务互斥；完成后热替换快照）
 async fn score_run(State(state): State<Arc<AppState>>,
     axum::Json(params): axum::Json<ScoreRunParams>) -> Response {
+    if params.xmp_exposure && !params.xmp {
+        return (StatusCode::BAD_REQUEST, "写入 Adobe 建议曝光需要同时开启 XMP 侧车").into_response();
+    }
     if state.loading.load(Ordering::Acquire) {
         return (StatusCode::CONFLICT, "照片仍在加载，请稍后再评分").into_response();
     }
@@ -736,6 +769,7 @@ async fn score_run(State(state): State<Arc<AppState>>,
     let cache_path = state.cache_path.clone();
     let config_path = state.config_path.clone();
     let xmp = params.xmp;
+    let xmp_exposure = params.xmp_exposure;
     let no_ai = params.no_ai;
     std::thread::spawn(move || {
         let started = std::time::Instant::now();
@@ -766,6 +800,7 @@ async fn score_run(State(state): State<Arc<AppState>>,
             no_cache: false,
             no_ai,
             xmp,
+            xmp_exposure,
             gpu: false,
             keep_override: None,
             include_raw: st.include_raw,
@@ -836,47 +871,46 @@ struct BurstKeepParams {
 /// POST /api/burst/keep：保存单张照片的手动连拍保留决定。
 async fn burst_keep(State(state): State<Arc<AppState>>,
     axum::Json(p): axum::Json<BurstKeepParams>) -> Response {
-    let _write_guard = state.write_lock.lock().await;
-    let Some(_mutation) = state.job.begin_mutation() else {
-        return (StatusCode::CONFLICT, "评分任务进行中或服务正在关闭，暂不能修改连拍标记").into_response();
-    };
-    let pair_id = {
-        let guard = state.snapshot.read().unwrap();
-        let Some(photo) = guard.photos.iter().find(|x| x.path == p.p && !x.is_raw) else {
-            return (StatusCode::NOT_FOUND, "照片不在快照中").into_response();
-        };
-        if !photo.burst.as_ref().is_some_and(|b| b.group > 0) {
-            return (StatusCode::BAD_REQUEST, "只有连拍组照片可以手动标记").into_response();
-        }
-        photo.pair_id.clone()
-    };
+    run_serialized_mutation(
+        state,
+        "评分任务进行中或服务正在关闭，暂不能修改连拍标记",
+        move |state| {
+            let pair_id = {
+                let guard = state.snapshot.read().unwrap();
+                let Some(photo) = guard.photos.iter().find(|x| x.path == p.p && !x.is_raw) else {
+                    return (StatusCode::NOT_FOUND, "照片不在快照中").into_response();
+                };
+                if !photo.burst.as_ref().is_some_and(|b| b.group > 0) {
+                    return (StatusCode::BAD_REQUEST, "只有连拍组照片可以手动标记").into_response();
+                }
+                photo.pair_id.clone()
+            };
 
-    let mut next_overrides = state.burst_overrides.read().unwrap().clone();
-    if let Some(keep) = p.keep { next_overrides.insert(p.p.clone(), keep); }
-    else { next_overrides.remove(&p.p); }
-    let bytes = match serde_json::to_vec_pretty(&next_overrides) {
-        Ok(bytes) => bytes,
-        Err(err) => return internal_error(err.into()),
-    };
-    let root = state.root.clone();
-    let path = state.burst_overrides_path.clone();
-    match tokio::task::spawn_blocking(move || {
-        FileRef::at(&root, &path, true).and_then(|file| file.write(&bytes))
-    }).await {
-        Ok(Ok(())) => {}
-        Ok(Err(err)) => return internal_error(err.into()),
-        Err(err) => return internal_error(err.into()),
-    }
-    *state.burst_overrides.write().unwrap() = next_overrides;
+            let mut next_overrides = state.burst_overrides.read().unwrap().clone();
+            if let Some(keep) = p.keep { next_overrides.insert(p.p.clone(), keep); }
+            else { next_overrides.remove(&p.p); }
+            let bytes = match serde_json::to_vec_pretty(&next_overrides) {
+                Ok(bytes) => bytes,
+                Err(err) => return internal_error(err.into()),
+            };
+            if let Err(err) = FileRef::at(&state.root, &state.burst_overrides_path, true)
+                .and_then(|file| file.write(&bytes))
+            {
+                return internal_error(err.into());
+            }
+            *state.burst_overrides.write().unwrap() = next_overrides;
 
-    let mut guard = state.snapshot.write().unwrap();
-    for photo in guard.photos.iter_mut().filter(|x| x.pair_id == pair_id) {
-        if let Some(burst) = &mut photo.burst {
-            burst.keep = p.keep.unwrap_or(burst.suggested_keep);
-            burst.manual_keep = p.keep;
-        }
-    }
-    json_response(serde_json::json!({"ok": true, "keep": p.keep}))
+            let mut guard = state.snapshot.write().unwrap();
+            for photo in guard.photos.iter_mut().filter(|x| x.pair_id == pair_id) {
+                if let Some(burst) = &mut photo.burst {
+                    burst.keep = p.keep.unwrap_or(burst.suggested_keep);
+                    burst.manual_keep = p.keep;
+                }
+            }
+            json_response(serde_json::json!({"ok": true, "keep": p.keep}))
+        },
+    )
+    .await
 }
 
 fn load_burst_overrides(root: &Path, path: &Path) -> Result<HashMap<String, bool>> {
@@ -904,154 +938,154 @@ async fn scene_feedback_save(State(state): State<Arc<AppState>>,
     if p.note.chars().count() > 1000 {
         return (StatusCode::BAD_REQUEST, "备注不能超过 1000 字").into_response();
     }
-    let _write_guard = state.write_lock.lock().await;
-    let Some(_mutation) = state.job.begin_mutation() else {
-        return (StatusCode::CONFLICT, "评分任务进行中或服务正在关闭，暂不能记录场景").into_response();
-    };
-    let record = {
-        let guard = state.snapshot.read().unwrap();
-        let Some(photo) = guard.photos.iter().find(|x| x.path == p.p && !x.is_raw) else {
-            return (StatusCode::NOT_FOUND, "照片不在快照中").into_response();
-        };
-        SceneFeedbackRecord {
-            photo_path: photo.path.clone(),
-            predicted_scene: photo.scene_hint.id.to_string(),
-            predicted_reason: photo.scene_hint.reason.clone(),
-            selected_scene: p.selected_scene,
-            note: p.note.trim().to_string(),
-            recorded_at_unix_ms: scene_feedback::now_unix_ms(),
-            faces: photo.faces,
-            analysis_mode: photo.analysis_mode.clone(),
-            scores: photo.scores.clone(),
-        }
-    };
-    let root = state.root.clone();
-    let path = state.scene_feedback_path.clone();
-    let write_record = record.clone();
-    match tokio::task::spawn_blocking(move || {
-        scene_feedback::append(&root, &path, &write_record)
-    }).await {
-        Ok(Ok(())) => {}
-        Ok(Err(err)) => return internal_error(err),
-        Err(err) => return internal_error(err.into()),
-    }
-    state.scene_feedback.write().unwrap().insert(record.photo_path.clone(), record.clone());
-    let mut guard = state.snapshot.write().unwrap();
-    if let Some(photo) = guard.photos.iter_mut().find(|x| x.path == record.photo_path) {
-        photo.scene_feedback = Some(record.clone());
-    }
-    json_response(serde_json::json!({"ok": true, "record": record}))
+    run_serialized_mutation(
+        state,
+        "评分任务进行中或服务正在关闭，暂不能记录场景",
+        move |state| {
+            let record = {
+                let guard = state.snapshot.read().unwrap();
+                let Some(photo) = guard.photos.iter().find(|x| x.path == p.p && !x.is_raw) else {
+                    return (StatusCode::NOT_FOUND, "照片不在快照中").into_response();
+                };
+                SceneFeedbackRecord {
+                    photo_path: photo.path.clone(),
+                    predicted_scene: photo.scene_hint.id.to_string(),
+                    predicted_reason: photo.scene_hint.reason.clone(),
+                    selected_scene: p.selected_scene,
+                    note: p.note.trim().to_string(),
+                    recorded_at_unix_ms: scene_feedback::now_unix_ms(),
+                    faces: photo.faces,
+                    analysis_mode: photo.analysis_mode.clone(),
+                    scores: photo.scores.clone(),
+                }
+            };
+            if let Err(err) = scene_feedback::append(&state.root, &state.scene_feedback_path, &record) {
+                return internal_error(err);
+            }
+            state.scene_feedback.write().unwrap().insert(record.photo_path.clone(), record.clone());
+            let mut guard = state.snapshot.write().unwrap();
+            if let Some(photo) = guard.photos.iter_mut().find(|x| x.path == record.photo_path) {
+                photo.scene_feedback = Some(record.clone());
+            }
+            json_response(serde_json::json!({"ok": true, "record": record}))
+        },
+    )
+    .await
 }
 
-/// POST /api/rate：UI 内改星——只改 `xmp:Rating`，firstcut 子分字段保留；
-/// 他人侧车（无 firstcut 命名空间）不覆盖（沿用 write_sidecar 保护）
+/// POST /api/rate：UI 内改星——已有 firstcut 侧车时只更新 `xmp:Rating`，不触碰
+/// `firstcut:suggestedEV` 或 Adobe `crs:*` 人工曝光；他人侧车（无 firstcut 命名空间）不覆盖。
 async fn rate(State(state): State<Arc<AppState>>,
     axum::Json(p): axum::Json<RateParams>) -> Response {
     if !(1..=5).contains(&p.stars) {
         return (StatusCode::BAD_REQUEST, "星级必须是 1~5").into_response();
     }
-    let _write_guard = state.write_lock.lock().await;
-    let Some(_mutation) = state.job.begin_mutation() else {
-        return (StatusCode::CONFLICT, "评分任务进行中或服务正在关闭，暂不能改星").into_response();
-    };
-    // 从当前快照取该照片的分数（未评分照片没有可写子分，拒绝）
-    let (scores, total, suggested_ev, pair_id, jpg_path, sidecar_entries) = {
-        let guard = state.snapshot.read().unwrap();
-        let Some(photo) = guard.photos.iter().find(|x| x.path == p.p && !x.is_raw) else {
-            return (StatusCode::NOT_FOUND, "照片不在快照中").into_response();
-        };
-        let Some(s) = &photo.scores else {
-            return (StatusCode::BAD_REQUEST, "该照片未评分，先跑一次评分再改星").into_response();
-        };
-        let px = crate::score::PixelScores {
-            sharpness: s.sharpness,
-            exposure: s.exposure,
-            noise: s.noise,
-            composition: s.composition,
-            aesthetic: s.aesthetic,
-        };
-        // render_xmp 需要完整 PhotoEntry 字段；从快照视图重建
-        let entry = crate::scan::PhotoEntry {
-            path: state.root.join(&photo.path).display().to_string(),
-            filename: photo.filename.clone(),
-            extension: photo.ext.clone(),
-            is_raw: false,
-            has_pair: photo.has_pair,
-            pair_id: photo.pair_id.clone(),
-            date_time_original: photo.datetime.clone(),
-            camera_make: String::new(),
-            camera_model: String::new(),
-            lens_model: String::new(),
-            iso: photo.iso.clone(),
-            f_number: photo.f_number.clone(),
-            shutter_speed: photo.shutter.clone(),
-            focal_length: photo.focal.clone(),
-            sharpness_score: format!("{:.1}", s.sharpness),
-            exposure_score: format!("{:.1}", s.exposure),
-            noise_score: format!("{:.1}", s.noise),
-            composition_score: format!("{:.1}", s.composition),
-            aesthetic_score: format!("{:.1}", s.aesthetic),
-            total_score: format!("{:.1}", s.total),
-            suggested_ev: String::new(),
-            stars: String::new(),
-            rating_source: "manual".into(),
-            faces: photo.faces.to_string(),
-            analysis_ok: "true".into(),
-            analysis_mode: photo.analysis_mode.clone().unwrap_or_default(),
-            burst_group: photo.burst.as_ref().map(|b| b.group.to_string()).unwrap_or_default(),
-            burst_size: photo.burst.as_ref().map(|b| b.size.to_string()).unwrap_or_default(),
-            burst_rank: photo.burst.as_ref().map(|b| b.rank.to_string()).unwrap_or_default(),
-            burst_keep: photo
-                .burst
-                .as_ref()
-                .map(|b| b.keep.to_string())
-                .unwrap_or_default(),
-            burst_pose: photo
-                .burst
-                .as_ref()
-                .map(|b| b.pose_cluster.to_string())
-                .unwrap_or_default(),
-        };
-        let jpg_path = match guard.photos.iter().find(|x| x.pair_id == photo.pair_id && !x.is_raw) {
-            Some(jpg) => state.root.join(&jpg.path),
-            None => return (StatusCode::BAD_REQUEST, "该照片没有可评分 JPG").into_response(),
-        };
-        let sidecar_entries = guard.photos.iter().filter(|x| x.pair_id == photo.pair_id)
-            .map(|x| crate::scan::PhotoEntry {
-                path: state.root.join(&x.path).display().to_string(),
-                filename: x.filename.clone(),
-                ..entry.clone()
-            }).collect::<Vec<_>>();
-        (px, s.total, s.suggested_ev, photo.pair_id.clone(), jpg_path, sidecar_entries)
-    };
-    let root = state.root.clone();
-    let stars = p.stars;
-    let warnings = match tokio::task::spawn_blocking(move || -> Result<Vec<String>> {
-        crate::decision::set(&root, &jpg_path, stars)?;
-        let mut warnings = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        for entry in &sidecar_entries {
-            let sidecar = Path::new(&entry.path)
-                .with_file_name(format!("{}.xmp", crate::scan::stem_raw_of(&entry.filename)));
-            if !seen.insert(sidecar) { continue; }
-            match crate::output::xmp::write_sidecar(&root, entry, &scores, total, stars, suggested_ev) {
-                Ok(true) => {},
-                Ok(false) => warnings.push(format!("{} 已有其他软件的侧车，未覆盖", entry.path)),
-                Err(err) => warnings.push(format!("{} 侧车写入失败: {err:#}", entry.path)),
+    run_serialized_mutation(
+        state,
+        "评分任务进行中或服务正在关闭，暂不能改星",
+        move |state| {
+            // 从当前快照取该照片的分数（未评分照片没有可写子分，拒绝）
+            let (scores, total, suggested_ev, pair_id, jpg_path, sidecar_entries) = {
+                let guard = state.snapshot.read().unwrap();
+                let Some(photo) = guard.photos.iter().find(|x| x.path == p.p && !x.is_raw) else {
+                    return (StatusCode::NOT_FOUND, "照片不在快照中").into_response();
+                };
+                let Some(s) = &photo.scores else {
+                    return (StatusCode::BAD_REQUEST, "该照片未评分，先跑一次评分再改星").into_response();
+                };
+                let px = crate::score::PixelScores {
+                    sharpness: s.sharpness,
+                    exposure: s.exposure,
+                    noise: s.noise,
+                    composition: s.composition,
+                    aesthetic: s.aesthetic,
+                };
+                // 新建侧车时需要完整 PhotoEntry 字段；从快照视图重建
+                let entry = crate::scan::PhotoEntry {
+                    path: state.root.join(&photo.path).display().to_string(),
+                    filename: photo.filename.clone(),
+                    extension: photo.ext.clone(),
+                    is_raw: false,
+                    has_pair: photo.has_pair,
+                    pair_id: photo.pair_id.clone(),
+                    date_time_original: photo.datetime.clone(),
+                    camera_make: String::new(),
+                    camera_model: String::new(),
+                    lens_model: String::new(),
+                    iso: photo.iso.clone(),
+                    f_number: photo.f_number.clone(),
+                    shutter_speed: photo.shutter.clone(),
+                    focal_length: photo.focal.clone(),
+                    sharpness_score: format!("{:.1}", s.sharpness),
+                    exposure_score: format!("{:.1}", s.exposure),
+                    noise_score: format!("{:.1}", s.noise),
+                    composition_score: format!("{:.1}", s.composition),
+                    aesthetic_score: format!("{:.1}", s.aesthetic),
+                    total_score: format!("{:.1}", s.total),
+                    suggested_ev: String::new(),
+                    stars: String::new(),
+                    rating_source: "manual".into(),
+                    faces: photo.faces.to_string(),
+                    analysis_ok: "true".into(),
+                    analysis_mode: photo.analysis_mode.clone().unwrap_or_default(),
+                    burst_group: photo.burst.as_ref().map(|b| b.group.to_string()).unwrap_or_default(),
+                    burst_size: photo.burst.as_ref().map(|b| b.size.to_string()).unwrap_or_default(),
+                    burst_rank: photo.burst.as_ref().map(|b| b.rank.to_string()).unwrap_or_default(),
+                    burst_keep: photo
+                        .burst
+                        .as_ref()
+                        .map(|b| b.keep.to_string())
+                        .unwrap_or_default(),
+                    burst_pose: photo
+                        .burst
+                        .as_ref()
+                        .map(|b| b.pose_cluster.to_string())
+                        .unwrap_or_default(),
+                };
+                let jpg_path = match guard.photos.iter().find(|x| x.pair_id == photo.pair_id && !x.is_raw) {
+                    Some(jpg) => state.root.join(&jpg.path),
+                    None => return (StatusCode::BAD_REQUEST, "该照片没有可评分 JPG").into_response(),
+                };
+                let sidecar_entries = guard.photos.iter().filter(|x| x.pair_id == photo.pair_id)
+                    .map(|x| crate::scan::PhotoEntry {
+                        path: state.root.join(&x.path).display().to_string(),
+                        filename: x.filename.clone(),
+                        ..entry.clone()
+                    }).collect::<Vec<_>>();
+                (px, s.total, s.suggested_ev, photo.pair_id.clone(), jpg_path, sidecar_entries)
+            };
+            if let Err(err) = crate::decision::set(&state.root, &jpg_path, p.stars) {
+                return internal_error(err);
             }
-        }
-        Ok(warnings)
-    }).await {
-        Ok(Ok(warnings)) => warnings,
-        Ok(Err(err)) => return internal_error(err),
-        Err(err) => return internal_error(err.into()),
-    };
-    let mut guard = state.snapshot.write().unwrap();
-    for photo in guard.photos.iter_mut().filter(|x| x.pair_id == pair_id) {
-        photo.stars = Some(p.stars);
-        photo.rating_source = Some("manual".into());
-    }
-    json_response(serde_json::json!({ "ok": true, "stars": p.stars, "warnings": warnings }))
+            let mut warnings = Vec::new();
+            let mut seen = std::collections::HashSet::new();
+            for entry in &sidecar_entries {
+                let sidecar = Path::new(&entry.path)
+                    .with_file_name(format!("{}.xmp", crate::scan::stem_raw_of(&entry.filename)));
+                if !seen.insert(sidecar) { continue; }
+                match crate::output::xmp::write_sidecar_with_mode(
+                    &state.root,
+                    entry,
+                    &scores,
+                    total,
+                    p.stars,
+                    suggested_ev,
+                    crate::output::xmp::XmpWriteMode::RatingOnly,
+                ) {
+                    Ok(true) => {},
+                    Ok(false) => warnings.push(format!("{} 已有其他软件的侧车，未覆盖", entry.path)),
+                    Err(err) => warnings.push(format!("{} 侧车写入失败: {err:#}", entry.path)),
+                }
+            }
+            let mut guard = state.snapshot.write().unwrap();
+            for photo in guard.photos.iter_mut().filter(|x| x.pair_id == pair_id) {
+                photo.stars = Some(p.stars);
+                photo.rating_source = Some("manual".into());
+            }
+            json_response(serde_json::json!({ "ok": true, "stars": p.stars, "warnings": warnings }))
+        },
+    )
+    .await
 }
 
 /// GET /api/config：当前可编辑配置值（文件不存在时为内置默认）
@@ -1078,22 +1112,18 @@ async fn config_save(
     State(state): State<Arc<AppState>>,
     axum::Json(values): axum::Json<config_edit::ConfigValues>,
 ) -> Response {
-    let _write_guard = state.write_lock.lock().await;
-    let Some(_mutation) = state.job.begin_mutation() else {
-        return (StatusCode::CONFLICT, "评分任务进行中或服务正在关闭，暂不能保存配置").into_response();
-    };
-    let root = state.root.clone();
-    let config_path = state.config_path.clone();
-    match tokio::task::spawn_blocking(move || {
-        config_edit::save_in(&root, &config_path, &values)
-    }).await {
-        Ok(Ok(())) => {
-            let note = "已保存；下一次 UI 跑批生效";
-            json_response(serde_json::json!({ "ok": true, "note": note }))
-        }
-        Ok(Err(err)) => (StatusCode::BAD_REQUEST, format!("{err:#}")).into_response(),
-        Err(err) => internal_error(err.into()),
-    }
+    run_serialized_mutation(
+        state,
+        "评分任务进行中或服务正在关闭，暂不能保存配置",
+        move |state| match config_edit::save_in(&state.root, &state.config_path, &values) {
+            Ok(()) => {
+                let note = "已保存；下一次 UI 跑批生效";
+                json_response(serde_json::json!({ "ok": true, "note": note }))
+            }
+            Err(err) => (StatusCode::BAD_REQUEST, format!("{err:#}")).into_response(),
+        },
+    )
+    .await
 }
 
 fn json_response(v: serde_json::Value) -> Response {
@@ -1459,6 +1489,187 @@ mod tests {
         assert_eq!(saved.get("a.jpg").copied(), Some(final_star), "快照与决定库星级必须一致");
         let sidecar = std::fs::read_to_string(dir.join("a.xmp")).unwrap();
         assert!(sidecar.contains(&format!("<xmp:Rating>{final_star}</xmp:Rating>")), "XMP 与快照星级必须一致");
-        assert!(sidecar.contains("crs:Exposure2012=\"+0.33\""));
+        assert!(sidecar.contains("<firstcut:suggestedEV>+0.33</firstcut:suggestedEV>"));
+        assert!(!sidecar.contains("crs:Exposure2012"), "改星新建侧车默认不应写入 Adobe crs:Exposure2012");
+    }
+
+    #[tokio::test]
+    async fn rate_preserves_existing_lightroom_exposure_on_disk() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_path_buf();
+        std::fs::write(dir.join("a.jpg"), b"jpg").unwrap();
+        std::fs::write(
+            dir.join("a.xmp"),
+            "<?xpacket begin=\"\u{feff}\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\n\
+             <x:xmpmeta xmlns:x=\"adobe:ns:meta/\">\n\
+              <rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n\
+               <rdf:Description rdf:about=\"\"\n\
+                 xmlns:xmp=\"http://ns.adobe.com/xap/1.0/\"\n\
+                 xmlns:firstcut=\"http://firstcut.local/ns/\"\n\
+                 xmlns:crs=\"http://ns.adobe.com/camera-raw-settings/1.0/\"\n\
+                 crs:HasSettings=\"True\" crs:ProcessVersion=\"11.0\" crs:Exposure2012=\"+1.75\" crs:Shadows2012=\"+35\">\n\
+                 <xmp:Rating>3</xmp:Rating>\n\
+                 <firstcut:sharpness>70.0</firstcut:sharpness>\n\
+                 <firstcut:exposure>75.0</firstcut:exposure>\n\
+                 <firstcut:noise>80.0</firstcut:noise>\n\
+                 <firstcut:composition>60.0</firstcut:composition>\n\
+                 <firstcut:aesthetic>65.0</firstcut:aesthetic>\n\
+                 <firstcut:faces>0</firstcut:faces>\n\
+                 <firstcut:total>70.5</firstcut:total>\n\
+                 <firstcut:burstGroup>0</firstcut:burstGroup>\n\
+                 <firstcut:burstRank></firstcut:burstRank>\n\
+                 <firstcut:burstKeep></firstcut:burstKeep>\n\
+               </rdf:Description>\n\
+              </rdf:RDF>\n\
+             </x:xmpmeta>\n\
+             <?xpacket end=\"w\"?>",
+        )
+        .unwrap();
+        let photo = snapshot::PhotoJson {
+            path: "a.jpg".into(), filename: "a.jpg".into(), ext: "jpg".into(),
+            is_raw: false, has_pair: false, pair_id: "a".into(), datetime: String::new(),
+            iso: String::new(), f_number: String::new(), shutter: String::new(), focal: String::new(),
+            scores: Some(snapshot::ScoresJson { sharpness: 70.0, exposure: 75.0, noise: 80.0,
+                composition: 60.0, aesthetic: 65.0, total: 70.5, suggested_ev: Some(0.33) }),
+            stars: Some(3), rating_source: Some("algorithm".into()),
+            analysis_mode: Some("pixel".into()), faces: 0, burst: None,
+            scene_hint: snapshot::SceneHintJson { id: "unknown", label: "未识别", reason: String::new() },
+            scene_feedback: None,
+        };
+        let state = Arc::new(AppState {
+            root: dir.clone(), cache_path: dir.join(".firstcut/cache.sqlite"),
+            config_path: dir.join(".firstcut/config.toml"),
+            config_explicit: false, burst_overrides: RwLock::new(HashMap::new()),
+            burst_overrides_path: dir.join(".firstcut/burst-overrides.json"),
+            scene_feedback: RwLock::new(HashMap::new()), scene_feedback_path: scene_feedback::store_path(&dir),
+            image_slots: Arc::new(Semaphore::new(2)), thumb_slots: Arc::new(Semaphore::new(1)),
+            snapshot: RwLock::new(Snapshot { root: dir.display().to_string(),
+                weights: snapshot::WeightsJson { sharpness: 0.3, exposure: 0.25, noise: 0.15,
+                    composition: 0.15, aesthetic: 0.15 }, photos: vec![photo] }),
+            job: Arc::new(JobState::new()),
+            write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            loading: AtomicBool::new(false), load_error: Mutex::new(None),
+            load_progress: Mutex::new(LoadProgress { phase: String::new(), done: 0, total: 0 }),
+            include_raw: true,
+            control: None,
+        });
+
+        let response = rate(State(Arc::clone(&state)), axum::Json(RateParams {
+            p: "a.jpg".into(), stars: 5,
+        })).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let sidecar = std::fs::read_to_string(dir.join("a.xmp")).unwrap();
+        assert!(sidecar.contains("<xmp:Rating>5</xmp:Rating>"));
+        assert!(sidecar.contains("crs:Exposure2012=\"+1.75\""), "改星不得覆盖已有 Lightroom 人工曝光");
+        assert!(sidecar.contains("crs:Shadows2012=\"+35\""));
+        assert!(!sidecar.contains("+0.33"), "改星不应把建议 EV 写入已有侧车");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_mutation_keeps_locks_and_updates_snapshot_before_next_write_or_job() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_path_buf();
+        let override_path = dir.join(".firstcut").join("burst-overrides.json");
+        let make_photo = |name: &str, pair: &str| snapshot::PhotoJson {
+            path: format!("scene/{name}"), filename: name.into(), ext: "jpg".into(),
+            is_raw: false, has_pair: false, pair_id: pair.into(), datetime: String::new(),
+            iso: String::new(), f_number: String::new(), shutter: String::new(), focal: String::new(),
+            scores: None, stars: None, rating_source: None, analysis_mode: None, faces: 0,
+            scene_hint: snapshot::SceneHintJson { id: "unknown", label: "未识别", reason: String::new() },
+            scene_feedback: None,
+            burst: Some(snapshot::BurstJson { group: 1, size: 2, rank: 1, keep: true,
+                suggested_keep: true, manual_keep: None, pose_cluster: 1 }),
+        };
+        let state = Arc::new(AppState {
+            root: dir.clone(), cache_path: dir.join(".firstcut/cache.sqlite"),
+            config_path: dir.join(".firstcut/config.toml"),
+            config_explicit: false, burst_overrides: RwLock::new(HashMap::new()),
+            burst_overrides_path: override_path.clone(),
+            scene_feedback: RwLock::new(HashMap::new()), scene_feedback_path: scene_feedback::store_path(&dir),
+            image_slots: Arc::new(Semaphore::new(2)), thumb_slots: Arc::new(Semaphore::new(1)),
+            snapshot: RwLock::new(Snapshot {
+                root: dir.display().to_string(),
+                weights: snapshot::WeightsJson { sharpness: 0.3, exposure: 0.25, noise: 0.15,
+                    composition: 0.15, aesthetic: 0.15 },
+                photos: vec![make_photo("a.jpg", "a"), make_photo("b.jpg", "b")],
+            }),
+            job: Arc::new(JobState::new()),
+            write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            loading: AtomicBool::new(false), load_error: Mutex::new(None),
+            load_progress: Mutex::new(LoadProgress { phase: String::new(), done: 0, total: 0 }),
+            include_raw: true,
+            control: None,
+        });
+
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let entered_task = Arc::clone(&entered);
+        let release_task = Arc::clone(&release);
+        let st1 = Arc::clone(&state);
+
+        // 模拟客户端在写操作落盘期间取消 HTTP 请求
+        let cancelled_req = tokio::spawn(async move {
+            run_serialized_mutation(st1, "busy", move |state| {
+                entered_task.wait();
+                release_task.wait();
+                let mut next = state.burst_overrides.read().unwrap().clone();
+                next.insert("scene/a.jpg".into(), false);
+                let bytes = serde_json::to_vec_pretty(&next).unwrap();
+                FileRef::at(&state.root, &state.burst_overrides_path, true)
+                    .and_then(|file| file.write(&bytes))
+                    .unwrap();
+                *state.burst_overrides.write().unwrap() = next;
+                let mut guard = state.snapshot.write().unwrap();
+                for photo in guard.photos.iter_mut().filter(|x| x.pair_id == "a") {
+                    if let Some(burst) = &mut photo.burst {
+                        burst.keep = false;
+                        burst.manual_keep = Some(false);
+                    }
+                }
+                json_response(serde_json::json!({ "ok": true }))
+            })
+            .await
+        });
+
+        // 等阻塞写入真正开始，再取消外层请求 future
+        tokio::task::spawn_blocking(move || entered.wait()).await.unwrap();
+        cancelled_req.abort();
+        let err = cancelled_req.await.unwrap_err();
+        assert!(err.is_cancelled(), "外层请求应已被取消");
+
+        // 外层请求取消后，写锁与任务守卫必须仍然生效：跑批/关闭都不得提前启动
+        assert!(!state.job.begin(), "后台写入未完成时不得启动评分任务");
+        assert!(!state.job.begin_shutdown(), "后台写入未完成时不得进入关闭状态");
+        assert!(state.write_lock.try_lock().is_err(), "后台写入未完成时写锁必须仍被持有");
+
+        // 紧接着发起第二次真实 burst_keep 请求：它必须等第一次写完并更新内存/快照后再执行
+        let second_req = tokio::spawn(burst_keep(
+            State(Arc::clone(&state)),
+            axum::Json(BurstKeepParams { p: "scene/b.jpg".into(), keep: Some(false) }),
+        ));
+        tokio::task::yield_now().await;
+        assert!(!second_req.is_finished(), "后续写入必须等待已取消请求的落盘与快照更新完成");
+
+        // 放行第一次写入，等待后续写入结束
+        tokio::task::spawn_blocking(move || release.wait()).await.unwrap();
+        let resp2 = second_req.await.unwrap();
+        assert_eq!(resp2.status(), StatusCode::OK);
+
+        // 两次决定必须都在磁盘、内存覆盖表与快照中完整保留（不能被旧内存覆盖）
+        let saved: HashMap<String, bool> =
+            serde_json::from_slice(&std::fs::read(&override_path).unwrap()).unwrap();
+        assert_eq!(saved.get("scene/a.jpg"), Some(&false));
+        assert_eq!(saved.get("scene/b.jpg"), Some(&false));
+        let overrides = state.burst_overrides.read().unwrap();
+        assert_eq!(overrides.get("scene/a.jpg"), Some(&false));
+        assert_eq!(overrides.get("scene/b.jpg"), Some(&false));
+        drop(overrides);
+        let snap = state.snapshot.read().unwrap();
+        assert_eq!(snap.photos[0].burst.as_ref().unwrap().manual_keep, Some(false));
+        assert_eq!(snap.photos[1].burst.as_ref().unwrap().manual_keep, Some(false));
+        drop(snap);
+
+        // 写入全部完成后，评分任务可以正常启动
+        assert!(state.job.begin(), "写入结束后应释放 MutationGuard");
     }
 }

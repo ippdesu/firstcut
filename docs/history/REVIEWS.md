@@ -103,3 +103,21 @@ CodeQL 路径告警涉及复核界面选择的照片根目录传入人工评分�
 - `node --check src/review/assets/review.js`：退出码 0。
 - `python .github/scripts/check-review.py --binary target/debug/pic_process.exe`：退出码 0（认证复核、原图/缩略图、重评分、落盘全通过）。
 - 未覆盖范围：仍未执行 Lightroom / Adobe Camera Raw 真机导入验收、真实照片选片质量标注评估，以及 Linux/macOS 容器真机构建（交由 PR CI 验证）；`storage.rs` 仍严格保持拒绝硬链接（`nlink == 1`）与 Windows 重解析点（含 OneDrive 云占位目录）策略。
+
+### 3.4 PR #14 复审意见修复（2026-11-23，基于 `caf16c8`）
+
+针对 PR #14 外部复审指出的 2 项 P1 与 2 项 P2 问题完成修复（按用户确认的方案 A 保护 Lightroom 人工曝光，`Cargo.toml`/`Cargo.lock` 与 `CACHE_VERSION = 15` 保持不变）：
+
+| 级别 | 问题 | 修复与回归覆盖 |
+|---|---|---|
+| P1 | 仅改星或常规重评分会覆盖已有 Lightroom `crs:Exposure2012`，建议曝光为空时甚至删除原曝光字段 | 引入 `XmpWriteMode`（`MetadataOnly` / `ApplySuggestedExposure` / `RatingOnly`）：`POST /api/rate` 对已有 firstcut 侧车仅更新 `xmp:Rating`；常规 `score --xmp` 与 UI 默认跑批仅写信息字段 `firstcut:suggestedEV`；写入 `crs:Exposure2012` 改为显式开启（`--xmp-exposure`、`[metric] exposure_write_crs = true` 或 UI 复选框 `#runXmpExposure`，默认关闭），且**绝不覆盖或删除已有的 `crs:Exposure2012` / `crs:Exposure`**（新增 `existing_lightroom_exposure_is_never_overwritten_or_deleted`、`rate_preserves_existing_lightroom_exposure_on_disk`、`xmp_exposure_opt_in_and_manual_exposure_protection`） |
+| P1 | HTTP 请求在等待 `spawn_blocking` 落盘期间被取消时，挂在 handler 栈上的 `write_lock` 与 `MutationGuard` 提前释放，后台写入继续而内存/快照更新被跳过 | 新增取消安全的 `run_serialized_mutation`，将 `Arc::clone(&state.write_lock).lock_owned().await`、`MutationGuard` 与 `AppState` 一并移入 `spawn_blocking`，所有写接口（改星、连拍保留、场景反馈、配置保存、界面设置）统一在阻塞任务内完成落盘、内存状态与快照更新后才释放双守卫（新增 `cancelled_mutation_keeps_locks_and_updates_snapshot_before_next_write_or_job`） |
+| P2 | 同一照片同时存在相对路径记录与旧版绝对路径记录时，失效的相对路径记录会挡住仍有效的旧记录，导致重算或显示未评分 | 用 `cache::find_matching` 替代 `cache::lookup`，对相对路径键与旧版绝对路径键分别按指纹条件校验；同步在 `docs/DESIGN.md` 补充“旧库需先在原路径跑批迁移”及“搬迁照片须保留 `mtime`”说明（新增 `stale_relative_cache_row_does_not_shadow_valid_legacy_absolute_row`） |
+| P2 | UI 重评分后原先选中的连拍组消失时，`loadData()` 先 `apply()` 后 `rebuildGroupOptions()` 留下空白网格 | 将 `rebuildGroupOptions()` 提前至 `ingest()` 中 `apply()` 之前，并在当前选中组失效时重置 `f.group = "all"` 与 `page = 0` 再渲染 |
+
+**验证记录（Windows x64）**：
+- `cargo test --locked --all-targets`：退出码 0，**86 项单元测试 + 8 项集成测试全通过**（无编译警告）。
+- `cargo build --locked --bin pic_process --bin firstcut-ui --bin pic_process-gallery --bin pic_process-tune`：退出码 0，无编译警告。
+- `node --check src/review/assets/review.js`：退出码 0。
+- `python .github/scripts/check-review.py --binary target/debug/pic_process.exe`：退出码 0（认证复核、原图/缩略图、重评分、落盘全通过）。
+- 未覆盖范围：同 3.3（真实 Lightroom / ACR 导入验收、真实选片质量评估、Linux/ARM64 容器真机构建交由 PR CI 验证）。

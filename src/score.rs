@@ -88,8 +88,8 @@ pub struct AnalysisResult {
     /// （对位置/尺度不变），连拍组内聚类"不同姿势"用。None = 无主体级人脸。
     pub pose_desc: Option<[f32; 10]>,
     /// 建议曝光修正（EV，1/3 档；None = 曝光在容差带内、不给建议）。
-    /// 写进 XMP（`firstcut:suggestedEV` + `crs:Exposure2012`）与 CSV，
-    /// 实际修正由用户在 Lightroom 里确认应用。
+    /// 常规评分写进 XMP 的 `firstcut:suggestedEV` 与 CSV；仅用户显式启用时
+    /// 才写入 Adobe `crs:Exposure2012`（且绝不覆盖已有人工曝光）。
     pub suggested_ev: Option<f64>,
 }
 
@@ -203,17 +203,24 @@ pub fn analyze_jpgs(
             // 缓存命中则跳过分析（快照为纯数据，可跨线程共享）
             if let Some(rows) = cache_rows {
                 if let Some((size, mtime)) = fingerprint {
-                    if let Some((row, was_legacy_key)) = crate::cache::lookup(rows, root, &e.path) {
-                        let matched_current = row.matches(size, mtime, crate::cache::CACHE_VERSION, cfg_hash);
-                        let matched_legacy = legacy_ai_hash
-                            .is_some_and(|h| row.matches(size, mtime, crate::cache::CACHE_VERSION, h));
-                        if matched_current || matched_legacy {
-                            hits.fetch_add(1, Ordering::Relaxed);
-                            // 命中旧版绝对路径键或旧版 mtime 模型指纹时，无痛补写一份可移植行。
-                            let migrated = (was_legacy_key || !matched_current)
-                                .then_some((cache_key, size, mtime, row.result));
-                            return Some((e.pair_id().to_string(), row.result, migrated));
-                        }
+                    let hit = crate::cache::find_matching(rows, root, &e.path, |row| {
+                        row.matches(size, mtime, crate::cache::CACHE_VERSION, cfg_hash)
+                    })
+                    .map(|(row, was_legacy_key)| (row, was_legacy_key, true))
+                    .or_else(|| {
+                        legacy_ai_hash.and_then(|h| {
+                            crate::cache::find_matching(rows, root, &e.path, |row| {
+                                row.matches(size, mtime, crate::cache::CACHE_VERSION, h)
+                            })
+                            .map(|(row, was_legacy_key)| (row, was_legacy_key, false))
+                        })
+                    });
+                    if let Some((row, was_legacy_key, matched_current)) = hit {
+                        hits.fetch_add(1, Ordering::Relaxed);
+                        // 命中旧版绝对路径键或旧版 mtime 模型指纹时，无痛补写一份可移植行。
+                        let migrated = (was_legacy_key || !matched_current)
+                            .then_some((cache_key, size, mtime, row.result));
+                        return Some((e.pair_id().to_string(), row.result, migrated));
                     }
                 }
             }
@@ -426,6 +433,8 @@ pub struct ScoreJobOptions {
     /// 跳过 AI 推理（纯像素快速预览）
     pub no_ai: bool,
     pub xmp: bool,
+    /// 显式将建议曝光写入 Adobe `crs:Exposure2012`（需同时开启 `xmp`；不覆盖已有曝光）
+    pub xmp_exposure: bool,
     /// 实验性 DirectML（仅 `--features gpu` 构建生效）
     pub gpu: bool,
     /// CLI `-k` 显式覆盖（None = 用 `[dedup] keep_k` 配置）
@@ -470,6 +479,9 @@ pub fn run_score_job(
     }
     if opts.keep_override == Some(0) {
         anyhow::bail!("连拍保留数 -k 必须至少为 1");
+    }
+    if opts.xmp_exposure && !opts.xmp {
+        anyhow::bail!("--xmp-exposure 需要同时开启 --xmp");
     }
 
     on_event(ScoreEvent::Info(format!(
@@ -582,6 +594,11 @@ pub fn run_score_job(
 
     // XMP 侧车（按侧车最终路径去重；跨目录配对两端各一份）
     if opts.xmp {
+        let xmp_mode = if opts.xmp_exposure || cfg.metric.exposure_write_crs {
+            crate::output::xmp::XmpWriteMode::ApplySuggestedExposure
+        } else {
+            crate::output::xmp::XmpWriteMode::MetadataOnly
+        };
         let mut written = 0usize;
         let mut skipped = 0usize;
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -598,7 +615,9 @@ pub fn run_score_job(
             }
             let total = total_score(&r.scores, &cfg.weights);
             let rating = ratings.get(key).map(|r| r.stars).unwrap_or(3);
-            match crate::output::xmp::write_sidecar(dir, e, &r.scores, total, rating, r.suggested_ev) {
+            match crate::output::xmp::write_sidecar_with_mode(
+                dir, e, &r.scores, total, rating, r.suggested_ev, xmp_mode,
+            ) {
                 Ok(true) => written += 1,
                 Ok(false) => skipped += 1,
                 Err(err) => on_event(ScoreEvent::Info(format!("XMP 写入失败 {}: {err:#}", e.path))),

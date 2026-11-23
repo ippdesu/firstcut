@@ -223,18 +223,28 @@ pub fn cache_key(root: &Path, path: &Path) -> String {
     }
 }
 
-/// 查找缓存行：优先匹配可移植相对路径键，找不到再兼容旧版绝对路径键。
+/// 按条件查找缓存行：先校验可移植相对路径键，未命中或条件不满足时再回退校验旧版绝对路径键。
+/// 避免一条已失效的相对路径记录挡住仍有效的旧版绝对路径记录。
 /// 返回 `(行引用, 是否命中旧版绝对路径键)`。
-pub fn lookup<'a>(
+pub fn find_matching<'a, F>(
     rows: &'a HashMap<String, CacheRow>,
     root: &Path,
     full_path: &str,
-) -> Option<(&'a CacheRow, bool)> {
+    mut predicate: F,
+) -> Option<(&'a CacheRow, bool)>
+where
+    F: FnMut(&CacheRow) -> bool,
+{
     let key = cache_key(root, Path::new(full_path));
-    if let Some(row) = rows.get(&key) {
+    if let Some(row) = rows.get(&key).filter(|row| predicate(row)) {
         return Some((row, false));
     }
-    rows.get(full_path).map(|row| (row, key != full_path))
+    if key != full_path {
+        if let Some(row) = rows.get(full_path).filter(|row| predicate(row)) {
+            return Some((row, true));
+        }
+    }
+    None
 }
 
 /// 文件元数据：大小 + mtime（纳秒精度）
@@ -299,14 +309,32 @@ mod tests {
         };
         let mut legacy_rows = HashMap::new();
         legacy_rows.insert(full.to_string(), sample);
-        let (found, was_legacy) = lookup(&legacy_rows, root, full).unwrap();
+        let (found, was_legacy) = find_matching(&legacy_rows, root, full, |r| r.cfg_hash == 42).unwrap();
         assert_eq!(found.cfg_hash, 42);
         assert!(was_legacy);
 
         let mut portable_rows = HashMap::new();
         portable_rows.insert("JPG/DSC00001.JPG".to_string(), sample);
-        let (found, was_legacy) = lookup(&portable_rows, Path::new("/moved/event"), "/moved/event/JPG/DSC00001.JPG").unwrap();
+        let (found, was_legacy) = find_matching(
+            &portable_rows,
+            Path::new("/moved/event"),
+            "/moved/event/JPG/DSC00001.JPG",
+            |r| r.cfg_hash == 42,
+        )
+        .unwrap();
         assert_eq!(found.cfg_hash, 42);
         assert!(!was_legacy);
+
+        // 相对路径行指纹不匹配时，不应挡住仍有效的旧版绝对路径行
+        let mut stale_relative = sample;
+        stale_relative.cfg_hash = 999;
+        let mut both_rows = HashMap::new();
+        both_rows.insert("JPG/DSC00001.JPG".to_string(), stale_relative);
+        both_rows.insert(full.to_string(), sample);
+        let (found, was_legacy) =
+            find_matching(&both_rows, root, full, |r| r.matches(100, 200, CACHE_VERSION, 42))
+                .unwrap();
+        assert_eq!(found.cfg_hash, 42);
+        assert!(was_legacy);
     }
 }

@@ -52,11 +52,12 @@ pub struct MetricParams {
     pub exposure_ev_hi: f64,
     /// 主体脸亮度在曝光判定中的权重（0 = 只看全图，1 = 只看主体脸）
     pub exposure_subject_blend: f64,
-    /// 建议 EV 上限（档）：曝光落在满分容差带外的照片，XMP/CSV 里会写一条
-    /// 建议修正（`firstcut:suggestedEV` + `crs:Exposure2012`，供 Lightroom / ACR 确认应用）；
-    /// 建议被钳在 ±此值内（默认 2.0；极欠/极曝的片应在筛选里淘汰，不给 +3 档鬼建议）。
-    /// 0 = 关闭建议输出。
+    /// 建议 EV 上限（档）：曝光落在满分容差带外的照片，CSV 与 XMP 会记录信息字段
+    /// `firstcut:suggestedEV`；钳位在 ±此值内（默认 2.0，0 = 关闭建议）。
     pub exposure_suggest_cap: f64,
+    /// 是否将建议 EV 写入 Adobe 开发字段 `crs:Exposure2012`（默认 false，仅写 `firstcut:suggestedEV`；
+    /// 开启后仅对尚无已有人工曝光的侧车写入，绝不覆盖或删除已有的 `crs:Exposure2012`）。
+    pub exposure_write_crs: bool,
     /// 星级分档模式："relative"（批次内相对排名，默认）或 "absolute"（总分阈值）
     pub star_mode: String,
     /// relative 模式：5 星分界（批次内百分位，0 = 最好）
@@ -92,10 +93,9 @@ impl Default for MetricParams {
             exposure_ev_lo: 4.0,
             exposure_ev_hi: 2.0,
             exposure_subject_blend: 0.5,
-            // 建议 EV（写入 XMP 供 Lightroom 用）：±2.0 档上限——
-            // 超出容差带才给建议，极欠/极曝的片宁可让用户在筛选里淘汰，
-            // 也不建议 +3 档这种需要重新拍的数值
+            // 建议 EV（默认仅写信息字段 firstcut:suggestedEV；Adobe 开发字段需显式启用）
             exposure_suggest_cap: 2.0,
+            exposure_write_crs: false,
             // M7 决策：星级默认按批次内相对排名（分数绝对值仍写进 CSV/XMP，
             // 但星级保证每批都有区分度——实测绝对阈值下 119 张全落在 4~5 星）
             star_mode: "relative".to_string(),
@@ -409,10 +409,12 @@ pub fn config_template() -> String {
          #   主体脸区域均值，把判定亮度往中灰方向拉（夹在「全图 ~ 中灰」之间，\n\
          #   不越过中灰），再按此权重混合。设为 0 则只看全图（适合无主体人脸的题材）。\n\
          exposure_subject_blend = {}\n\
-         # 建议 EV 上限（档）：曝光落在满分容差带外的照片会写一条建议修正\n\
-         #   （firstcut:suggestedEV + crs:Exposure2012，供 Lightroom / ACR 确认应用）。\n\
-         #   默认 2.0；极欠/极曝的片建议在筛选里淘汰而不是给 +3 档鬼建议；0 = 关闭。\n\
+         # 建议 EV 上限（档）：曝光落在满分容差带外的照片会记录信息字段 firstcut:suggestedEV。\n\
+         #   默认 2.0；极欠/极曝的片建议在筛选里淘汰；0 = 关闭。\n\
          exposure_suggest_cap = {}\n\
+         # 是否将建议 EV 一并写入 Adobe 开发字段 crs:Exposure2012（默认 false，需显式开启；\n\
+         #   开启后也不会覆盖或删除侧车里已有的 Lightroom/ACR 人工曝光）。\n\
+         exposure_write_crs = {}\n\
          # 星级分档：\n\
          #   mode = 「relative」（默认）按**本次批次的相对排名**给星，保证每批都有区分度；\n\
          #   mode = 「absolute」用下面的总分阈值（跨批次可比，但实测一批照片容易全落在 4~5 星）。\n\
@@ -458,6 +460,7 @@ pub fn config_template() -> String {
         c.metric.exposure_ev_hi,
         c.metric.exposure_subject_blend,
         c.metric.exposure_suggest_cap,
+        c.metric.exposure_write_crs,
         c.metric.star_mode,
         c.metric.star_five_pct,
         c.metric.star_four_pct,
