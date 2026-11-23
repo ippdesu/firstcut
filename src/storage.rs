@@ -62,6 +62,46 @@ impl Folder {
         Ok(Self(dir))
     }
 
+    /// 打开或安全创建显式目标目录（用于导出到相册外的已授权目录）：
+    /// 从已存在的最近祖先起逐级无链接创建并校验每一层不是符号链接或重解析点。
+    pub fn open_or_create_explicit(path: &Path, create: bool) -> io::Result<Self> {
+        let absolute = std::path::absolute(path)?;
+        if !create {
+            return Self::open_explicit(&absolute);
+        }
+        // 找到已存在的最近祖先目录，避免 create_dir_all 盲目穿越符号链接
+        let mut existing = absolute.as_path();
+        let mut missing: Vec<OsString> = Vec::new();
+        while !existing.exists() {
+            let name = existing
+                .file_name()
+                .ok_or_else(|| denied("目标路径缺少有效祖先目录"))?;
+            missing.push(name.to_os_string());
+            existing = existing
+                .parent()
+                .ok_or_else(|| denied("目标路径缺少有效祖先目录"))?;
+        }
+        let mut dir = Self::open_explicit(existing)?;
+        for name in missing.into_iter().rev() {
+            dir = dir.child(&name, true)?;
+        }
+        Ok(dir)
+    }
+
+    /// 打开相册根目录内的相对子目录（逐级无链接校验；`create = true` 时按需创建）。
+    pub fn open_album_subdir(root: &Path, relative: &Path, create: bool) -> io::Result<Self> {
+        let dir = Self::open(root)?;
+        dir.descend(relative, create)
+    }
+
+    pub fn try_clone(&self) -> io::Result<Self> {
+        Ok(Self(self.0.try_clone()?))
+    }
+
+    pub fn descend_cloned(&self, relative: &Path, create: bool) -> io::Result<Self> {
+        self.try_clone()?.descend(relative, create)
+    }
+
     pub fn child(&self, name: impl AsRef<Path>, create: bool) -> io::Result<Self> {
         let name = name.as_ref();
         one_name(name)?;
@@ -235,8 +275,105 @@ impl FileRef {
         check_handle(file)
     }
 
+    /// 安全读取目标文件的大小与修改时间指纹（不跟随符号链接/重解析点）。
+    pub fn fingerprint(&self) -> io::Result<Option<(u64, i64)>> {
+        let Some(file) = self.open_read()? else {
+            return Ok(None);
+        };
+        let meta = file.metadata()?;
+        Ok(crate::cache::metadata_fingerprint(&meta))
+    }
+
     pub fn write(&self, data: &[u8]) -> io::Result<()> {
         self.replace(|file| file.write_all(data))
+    }
+
+    /// 导出场景专用：按流式分块将已安全打开的源文件复制到临时文件，保留修改时间并原子替换。
+    /// 返回写入字节数与目标文件落盘后的 `(size, mtime_nanos)`。
+    pub fn copy_from_reader(
+        &self,
+        src: &mut File,
+        preserve_mtime: Option<std::time::SystemTime>,
+    ) -> io::Result<(u64, Option<i64>)> {
+        self.open_read()?; // 拒绝已存在的硬链接/重解析点
+        let mut entropy = [0u8; 16];
+        getrandom::fill(&mut entropy).map_err(|err| io::Error::other(err.to_string()))?;
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        let temp = format!(".firstcut-{}.tmp", URL_SAFE_NO_PAD.encode(entropy));
+        let temp_ref = self.parent.file(&temp)?;
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use cap_std::fs::OpenOptionsExt;
+            options.mode(0o644);
+        }
+        let mut file = temp_ref.open(&options)?;
+        let result = (|| {
+            let mut buf = vec![0u8; 256 * 1024];
+            let mut total = 0u64;
+            loop {
+                let n = src.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                file.write_all(&buf[..n])?;
+                total += n as u64;
+            }
+            if let Some(mtime) = preserve_mtime {
+                // 在 sync 与 rename 之前写回源修改时间；若目标文件系统不支持则降级忽略
+                let _ = file.set_modified(mtime);
+            }
+            file.sync_all()?;
+            check_handle(&file)?;
+            let actual_mtime = file
+                .metadata()
+                .ok()
+                .and_then(|m| crate::cache::metadata_fingerprint(&m))
+                .map(|(_, mt)| mt);
+            drop(file);
+            self.parent.0.rename(&temp, &self.parent.0, &self.name)?;
+            Ok((total, actual_mtime))
+        })();
+        if result.is_err() {
+            let _ = self.parent.unlink(&temp);
+        }
+        result
+    }
+
+    /// 导出场景专用：写出完整字节内容（如 XMP 侧车）并返回落盘后的 `(size, mtime_nanos)`。
+    pub fn write_exported_bytes(&self, data: &[u8]) -> io::Result<(u64, Option<i64>)> {
+        self.open_read()?;
+        let mut entropy = [0u8; 16];
+        getrandom::fill(&mut entropy).map_err(|err| io::Error::other(err.to_string()))?;
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        let temp = format!(".firstcut-{}.tmp", URL_SAFE_NO_PAD.encode(entropy));
+        let temp_ref = self.parent.file(&temp)?;
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use cap_std::fs::OpenOptionsExt;
+            options.mode(0o644);
+        }
+        let mut file = temp_ref.open(&options)?;
+        let result = (|| {
+            file.write_all(data)?;
+            file.sync_all()?;
+            check_handle(&file)?;
+            let actual_mtime = file
+                .metadata()
+                .ok()
+                .and_then(|m| crate::cache::metadata_fingerprint(&m))
+                .map(|(_, mt)| mt);
+            drop(file);
+            self.parent.0.rename(&temp, &self.parent.0, &self.name)?;
+            Ok((data.len() as u64, actual_mtime))
+        })();
+        if result.is_err() {
+            let _ = self.parent.unlink(&temp);
+        }
+        result
     }
 
     /// Never truncate a named file. Write a new file and then replace the
@@ -269,6 +406,46 @@ impl FileRef {
         }
         result
     }
+}
+
+/// 若 `path` 位于 `root` 之下（经 `std::path::absolute` 归一化，Windows 大小写不敏感），
+/// 返回相对 `root` 的路径。
+pub fn relative_under_album(root: &Path, path: &Path) -> io::Result<Option<PathBuf>> {
+    let abs_root = std::path::absolute(root)?;
+    let abs_path = std::path::absolute(path)?;
+    Ok(strip_album_prefix(&abs_root, &abs_path))
+}
+
+/// 查询目标路径所在卷的可用剩余字节数（沿祖先找到最近已存在目录；不支持平台返回 None）。
+pub fn available_disk_space(path: &Path) -> Option<u64> {
+    let abs = std::path::absolute(path).ok()?;
+    let existing = abs.ancestors().find(|p| p.exists())?;
+    available_disk_space_inner(existing)
+}
+
+#[cfg(windows)]
+fn available_disk_space_inner(existing: &Path) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+
+    let wide: Vec<u16> = existing.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut free_to_caller = 0u64;
+    let mut total_bytes = 0u64;
+    let mut total_free = 0u64;
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &mut free_to_caller,
+            &mut total_bytes,
+            &mut total_free,
+        )
+    };
+    (ok != 0).then_some(free_to_caller)
+}
+
+#[cfg(not(windows))]
+fn available_disk_space_inner(_existing: &Path) -> Option<u64> {
+    None
 }
 
 fn strip_album_prefix(root: &Path, path: &Path) -> Option<PathBuf> {

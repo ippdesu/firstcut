@@ -112,14 +112,12 @@ impl Snapshot {
 ///
 /// 缓存打不开（文件损坏/不存在）时降级为"全部未评分"，不阻塞浏览。
 pub fn build_snapshot(root: &Path, cfg: &ScoreConfig, cache_path: &Path,
-    manual_keep: &HashMap<String, bool>,
     scene_feedback: &HashMap<String, SceneFeedbackRecord>) -> anyhow::Result<Snapshot> {
-    build_snapshot_with_options(root, cfg, cache_path, manual_keep, scene_feedback, true, false,
+    build_snapshot_with_options(root, cfg, cache_path, scene_feedback, true, false,
         &|_, _, _| {})
 }
 
 pub fn build_snapshot_with_options(root: &Path, cfg: &ScoreConfig, cache_path: &Path,
-    manual_keep: &HashMap<String, bool>,
     scene_feedback: &HashMap<String, SceneFeedbackRecord>, include_raw: bool,
     skip_processed: bool,
     progress: &dyn Fn(&str, usize, usize)) -> anyhow::Result<Snapshot> {
@@ -180,25 +178,12 @@ pub fn build_snapshot_with_options(root: &Path, cfg: &ScoreConfig, cache_path: &
     progress("计算星级与连拍", 0, entries.len());
     let selection = crate::selection::build(root, &entries, &analyzed, cfg, None)?;
 
-    // 手动连拍保留覆盖以 JPG 相对路径持久化，通过 pair_id 同步到配对 RAW。
-    let mut manual_keep_by_pair: HashMap<&str, bool> = HashMap::new();
-    for e in entries.iter().filter(|e| !e.is_raw) {
-        let rel = rel_path(root, Path::new(&e.path));
-        if let Some(&keep) = manual_keep.get(&rel) {
-            manual_keep_by_pair.insert(e.pair_id(), keep);
-        }
-    }
-
     let mut photos: Vec<PhotoJson> = entries
         .iter()
         .map(|e| {
             let analyzed_result = analyzed.get(e.pair_id());
             let rel = rel_path(root, Path::new(&e.path));
             let ai_mode = mode_by_pair.get(e.pair_id()) == Some(&true);
-            let manual_burst_keep = manual_keep_by_pair
-                .get(e.pair_id())
-                .copied()
-                .or_else(|| manual_keep.get(&rel).copied());
             PhotoJson {
                 path: rel.clone(),
                 filename: e.filename.clone(),
@@ -232,9 +217,9 @@ pub fn build_snapshot_with_options(root: &Path, cfg: &ScoreConfig, cache_path: &
                     group: i.group,
                     size: i.size,
                     rank: i.rank,
-                    keep: manual_burst_keep.unwrap_or(i.keep),
-                    suggested_keep: i.keep,
-                    manual_keep: manual_burst_keep,
+                    keep: i.keep,
+                    suggested_keep: i.suggested_keep,
+                    manual_keep: i.manual_keep,
                     pose_cluster: i.pose_cluster,
                 }),
             }
@@ -359,10 +344,10 @@ mod tests {
         let root = temp.path().join("album");
         std::fs::create_dir_all(root.join("JPG")).unwrap();
         std::fs::create_dir_all(root.join("RAW")).unwrap();
-        let jpg_a = root.join("JPG/a.jpg");
-        let jpg_b = root.join("JPG/b.jpg");
-        let raw_a = root.join("RAW/a.ARW");
-        let raw_b = root.join("RAW/b.ARW");
+        let jpg_a = root.join("JPG").join("a.jpg");
+        let jpg_b = root.join("JPG").join("b.jpg");
+        let raw_a = root.join("RAW").join("a.ARW");
+        let raw_b = root.join("RAW").join("b.ARW");
         image::RgbImage::from_pixel(32, 32, image::Rgb([100, 120, 140])).save(&jpg_a).unwrap();
         image::RgbImage::from_pixel(32, 32, image::Rgb([100, 120, 140])).save(&jpg_b).unwrap();
         std::fs::write(&raw_a, b"raw").unwrap();
@@ -414,11 +399,12 @@ mod tests {
         }
         cache.flush().unwrap();
 
-        let overrides = HashMap::from([("JPG/a.jpg".to_string(), false)]);
-        let snap = build_snapshot(&root, &cfg, &cache_path, &overrides, &HashMap::new()).unwrap();
+        crate::decision::set_burst_keep(&root, &jpg_a, Some(false)).unwrap();
+        let snap = build_snapshot(&root, &cfg, &cache_path, &HashMap::new()).unwrap();
         let photo_jpg = snap.photos.iter().find(|p| p.path == "JPG/a.jpg").unwrap();
         let photo_raw = snap.photos.iter().find(|p| p.path == "RAW/a.ARW").unwrap();
         assert_eq!(photo_jpg.analysis_mode.as_deref(), Some("ai"), "无本地模型目录也应可读已有可移植 AI 缓存");
+        assert!(photo_jpg.burst.as_ref().unwrap().group > 0, "两张间隔 1 秒的照片应归入同一连拍组");
         assert_eq!(photo_jpg.burst.as_ref().unwrap().manual_keep, Some(false));
         assert!(!photo_jpg.burst.as_ref().unwrap().keep);
         assert_eq!(photo_raw.burst.as_ref().unwrap().manual_keep, Some(false), "配对 RAW 应同步手动连拍覆盖");
@@ -486,7 +472,7 @@ mod tests {
         drop(stale_cache);
 
         // 1) review 快照应跳过不匹配的相对路径记录，命中仍有效的旧版绝对路径记录
-        let snap = build_snapshot(&root, &cfg, &cache_path, &HashMap::new(), &HashMap::new()).unwrap();
+        let snap = build_snapshot(&root, &cfg, &cache_path, &HashMap::new()).unwrap();
         let photo = snap.photos.iter().find(|p| p.path == "JPG/a.jpg").unwrap();
         let scores = photo.scores.as_ref().expect("不应被不匹配的相对路径记录挡成未评分");
         assert_eq!(scores.sharpness, 82.0);
@@ -571,7 +557,7 @@ mod tests {
         drop(fresh_pixel);
 
         // 复核页必须显示最新写入的相对路径纯像素分数，而不是回退到旧绝对路径 AI 分数
-        let snap = build_snapshot(&root, &cfg, &cache_path, &HashMap::new(), &HashMap::new()).unwrap();
+        let snap = build_snapshot(&root, &cfg, &cache_path, &HashMap::new()).unwrap();
         let photo = snap.photos.iter().find(|p| p.path == "JPG/a.jpg").unwrap();
         let scores = photo.scores.as_ref().unwrap();
         assert_eq!(scores.total, 60.9);

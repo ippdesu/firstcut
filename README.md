@@ -68,11 +68,15 @@ pic_process score <照片目录> --xmp
 pic_process review <照片目录>
 pic_process review <照片目录> --port 9000 --config stage.toml
 
-# 5. 生成评分配置模板或场景预设（portrait / stage / highkey / sports / lowlight）
+# 5. 将筛选命中的 JPG/RAW/XMP 非破坏性复制到子目录（默认按 JPG/ + RAW/ 分开）
+pic_process export <照片目录> --min-stars 4 --keep-only --to Selected
+pic_process export <照片目录> --stars 4,5 --keep-only --layout flat --dry-run
+
+# 6. 生成评分配置模板或场景预设（portrait / stage / highkey / sports / lowlight）
 pic_process config-template
 pic_process config-template --preset stage -o <照片目录>/.firstcut/config.toml
 
-# 6. 辅助工具
+# 7. 辅助工具
 pic_process-gallery <照片目录>/.firstcut/report.csv   # 生成静态 HTML 联系表（默认输出到报告同目录）
 pic_process-tune <照片目录>                            # 导出原始指标（默认 <照片目录>/.firstcut/metrics.csv）
 ```
@@ -86,6 +90,13 @@ pic_process-tune <照片目录>                            # 导出原始指标�
 - `--no-ai`：跳过 AI 推理，仅跑纯像素模式
 - `--raw-csv`：输出不做表格公式转义的原始 CSV（仅限脚本读取，勿直接用电子表格打开不可信来源）
 - `--gpu`：实验性 DirectML GPU 推理（需 `--features gpu` 构建；历史实测无显著加速）
+
+常用 `export` 选项：
+- `--to <路径>`：导出目标；相对路径写入 `<照片目录>/<路径>`（默认 `Selected`），绝对路径写入该外部目录
+- `--min-stars <1-5>` / `--stars <如 4,5>`：按有效星级筛选（两者互斥）
+- `--keep-only`：保留全部非连拍单张 + 连拍组中有效保留（含人工覆盖）的帧；`--faces` 仅导出有人脸的照片
+- `--layout <split|flat|tree>`：目录布局——默认 `split`（`JPG/` + `RAW/` 双目录各附带 XMP），可选 `flat`（扁平化）或 `tree`（保持原目录结构）
+- `--no-jpg` / `--no-raw` / `--no-xmp`：按需关闭对应类型；`--xmp-exposure` 仅为新生成 XMP 附带建议曝光；`--dry-run` 仅预览不写盘
 
 > **访问凭据与链接**：复核链接自带自动登录凭据；使用 `--no-browser` 时请复制终端输出的完整链接（勿分享含凭据的链接）。直接访问不带凭据的地址需手动输入凭据或复用已有会话。
 
@@ -162,18 +173,18 @@ docker compose up -d
 ### 星级分档与连拍去重
 
 - **相对星级（默认 `star_mode = "relative"`）**：按批次内排名给星——5★ 前 10%、4★ 10%–30%、3★ 30%–65%、2★ 65%–90%、1★ 后 10%（同分并列取平均位次；建议整场活动一次评分，跨批次比较请看 `total_score`）。可切 `star_mode = "absolute"`（默认阈值 75/60/45/30）。
-- **人工星级优先**：通过复核界面设置的星级持久化在 `.firstcut/decisions.sqlite`，重评分不会覆盖，并同步给配对的 JPG/ARW。
-- **自适应连拍去重**：按 EXIF 时间 ≤ 2s 分连拍组 → dHash 汉明距离 ≤ 10 分近似子簇 → SCRFD 五关键点 10 维姿态描述子聚类（阈值 0.25）→ 每姿势簇保留 top-3（单组上限 20）。可在 `[dedup]` 关闭 `adaptive_keep` 回退纯 dHash 模式。`burst_keep` 仅为建议标记，工具永不删除文件。
+- **人工决定优先**：通过复核界面设置的星级与连拍保留/舍弃覆盖统一持久化在 `.firstcut/decisions.sqlite`（兼容旧版 `.firstcut/burst-overrides.json`），重评分不会覆盖，并同步作用于 CLI `score`（CSV/XMP）、`export` 与配对的 JPG/ARW。
+- **自适应连拍去重**：按 EXIF 时间 ≤ 2s 分连拍组 → dHash 汉明距离 ≤ 10 分近似子簇 → SCRFD 五关键点 10 维姿态描述子聚类（阈值 0.25）→ 每姿势簇保留 top-3（单组上限 20）。可在 `[dedup]` 关闭 `adaptive_keep` 回退纯 dHash 模式。`burst_keep` 仅为建议或人工标记，工具永不删除文件。
 
 ---
 
 ## 本地复核界面（`review`）
 
-- **缩略图墙与筛选侧栏**：分页懒加载、筛选排序自动记忆；默认按连拍组折叠显示代表帧，点击或右键可展开整组、手动覆盖保留/舍弃标记。侧栏筛选区可折叠并拖动调宽。
+- **缩略图墙与筛选侧栏**：分页懒加载、筛选排序自动记忆；默认按连拍组折叠显示代表帧，“连拍保留”支持「保留（含非连拍单张）」，点击或右键可展开整组、手动覆盖保留/舍弃标记。侧栏筛选区可折叠并拖动调宽。
 - **1:1 原图灯箱与连拍并排对比**：按需流式直读原图，支持滚轮缩放、拖拽平移、双击复位、`←/→` 组内切换、缩放百分比与带单位 EXIF（`f/`、`s`、`mm`）；支持勾选同组 2–4 张**同步缩放平移**对比合焦。
 - **RGBW 直方图**：可拖动悬浮面板，支持 W/R/G/B 通道独立开关，基于解码后 SDR JPEG 做网格抽样（默认 10%，可在设置中调为 1%–25%，仅内存缓存）。
 - **评分解释与场景反馈**：展示活动照片的五维子分、实际权重与贡献；支持记录真实场景纠正与备注至 `.firstcut/scene-feedback.jsonl`。
-- **界面内改星、跑批与调参**：灯箱内 `1–5` 快捷改星并同步 XMP；侧栏一键重评分（实时进度与时间日志）；表单化编辑配置并用 `toml_edit` 保留注释。
+- **界面内改星、跑批、调参与导出**：灯箱内 `1–5` 快捷改星并同步 XMP；侧栏一键重评分与表单化调参；支持**“导出筛选结果”弹窗**（导出前预览张数/体积/磁盘余量/重名改名，支持增量跳过、保护 PS/ACR 已编辑 XMP、中途取消，Windows 桌面端支持原生选目录与完成后一键打开导出文件夹）。
 
 ---
 
@@ -184,13 +195,13 @@ docker compose up -d
 | 路径 | 说明 |
 |---|---|
 | `.firstcut/cache.sqlite` | 可重建的分析缓存（删除后可重算） |
-| `.firstcut/decisions.sqlite` | 人工星级决定库（**备份照片时请保留**） |
-| `.firstcut/burst-overrides.json` | review 人工连拍保留/舍弃覆盖（**建议保留**） |
+| `.firstcut/decisions.sqlite` | 统一人工决定库：人工星级 + 人工连拍保留/舍弃覆盖（**备份照片时请保留**；自动兼容旧版 `burst-overrides.json`） |
 | `.firstcut/scene-feedback.jsonl` | 场景标注与备注记录（上限 16 MiB） |
 | `.firstcut/config.toml` / `ui-preferences.json` | 照片根级评分配置与 UI 偏好 |
 | `.firstcut/report.csv` / `scan-report.csv` / `metrics.csv` | 评分、扫描与调参报告 |
 | `.firstcut/thumbs/v2/` | 有界缩略图缓存（8192 槽，每槽上限 64 KiB） |
 | `.firstcut/review.log` | 任务时间日志（严格限制单文件 256 KiB） |
+| `<导出目录>/.firstcut-export` | 导出清单与防重扫标记（上级相册扫描时自动跳过该导出子树；记录已导文件指纹以支持增量跳过和保护 PS/ACR 修改过的 XMP） |
 | `<照片目录>/<stem>.xmp` | 默认写 `xmp:Rating`、`firstcut:*` 子分/连拍与 `firstcut:suggestedEV`；仅显式开启 `--xmp-exposure` / `exposure_write_crs = true` 或 UI 对应选项时，才为尚无曝光参数的侧车附加 `crs:Exposure2012`（含 `crs:HasSettings`），改星仅同步 `xmp:Rating`；不覆盖他人侧车，绝不覆盖或删除已有 Adobe 人工曝光，并兼容属性规范化写法 |
 
 > **安全边界**：程序拒绝通过符号链接或 Windows 重解析点读写相册状态，并拒绝读取带未关闭旁路日志的异常 SQLite 数据库（保留原件不破坏）。正常关闭的旧版评分库和决定库可直接继续使用。

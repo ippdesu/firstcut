@@ -143,16 +143,22 @@ let jpgs = [];              // 只展示非 RAW 行（分数与 JPG 相同）
 const PAGE = 500;
 let page = 0;
 let uiSession = null;
+let localDesktop = false;
+let serverIncludeRaw = true;
 
 async function loadAppControls(){
   try {
     const response = await apiFetch('/api/control', {cache:'no-store'});
     const data = await response.json();
+    localDesktop = data.local_desktop === true;
+    serverIncludeRaw = data.include_raw !== false;
+    document.getElementById('exportPickFolder').hidden = !localDesktop;
+    syncExportRawOption();
     if(data.enabled){
       uiSession = data.session;
       document.getElementById('appControls').hidden = false;
       document.getElementById('folderBlock').hidden = false;
-      document.getElementById('includeRaw').checked = data.include_raw !== false;
+      document.getElementById('includeRaw').checked = serverIncludeRaw;
     }
   } catch (_) {}
 }
@@ -367,12 +373,9 @@ function visible(){
   let list = jpgs.filter(p=>{
     if(f.search && !p.filename.toLowerCase().includes(f.search)) return false;
     if(f.stars.size && !(p.stars && f.stars.has(p.stars))) return false;
-    if(f.keep !== "all"){
-      if(!p.burst) return false;
-      if(f.keep === "keep" && !p.burst.keep) return false;
-      if(f.keep === "drop" && p.burst.keep) return false;
-    }
     const group = p.burst && p.burst.group;
+    if(f.keep === "keep" && group && !p.burst.keep) return false;
+    if(f.keep === "drop" && !(group && !p.burst.keep)) return false;
     if(f.group === "burst" && !group) return false;
     if(f.group === "single" && group) return false;
     if(f.group.startsWith("group:") && String(group || "") !== f.group.slice(6)) return false;
@@ -1090,23 +1093,49 @@ function toast(msg){
   clearTimeout(t._h); t._h = setTimeout(()=> t.style.display='none', 2600);
 }
 let jobPolling = null;
+let jobIsRunning = false;
+function formatBytes(bytes){
+  if(bytes == null || !Number.isFinite(bytes)) return '未知';
+  if(bytes >= 1024 ** 3) return `${(bytes / (1024 ** 3)).toFixed(2)} GB`;
+  if(bytes >= 1024 ** 2) return `${(bytes / (1024 ** 2)).toFixed(1)} MB`;
+  if(bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${bytes} B`;
+}
 function pollJob(){
   apiFetch('/api/job').then(r=>r.json()).then(j=>{
+    const isExport = j.kind === 'export';
+    jobIsRunning = j.state === 'running';
     const bar = document.getElementById('runBarWrap');
     const barIn = document.getElementById('runBar');
     const st = document.getElementById('runState');
     const log = document.getElementById('runLog');
     const btn = document.getElementById('runBtn');
+    const expBtn = document.getElementById('exportBtn');
+    const expGroup = document.getElementById('exportJobGroup');
+    const expBarWrap = document.getElementById('exportBarWrap');
+    const expBar = document.getElementById('exportBar');
+    const expState = document.getElementById('exportState');
+    const expLog = document.getElementById('exportLog');
+    const expCancel = document.getElementById('exportCancelJob');
+    const expOpen = document.getElementById('exportOpenDir');
+
     if(j.state === 'running'){
-      bar.style.display = 'block'; log.style.display = 'block'; btn.disabled = true;
-      btn.textContent = '评分中…';
+      bar.style.display = 'block'; log.style.display = 'block';
+      btn.disabled = true; expBtn.disabled = true;
+      btn.textContent = isExport ? '导出中…' : '评分中…';
       const pct = j.total ? Math.round(j.done/j.total*100) : 0;
       barIn.style.width = pct + '%';
-      st.style.display = 'block'; st.textContent = `进度 ${j.done}/${j.total}（${pct}%）`;
+      st.style.display = 'block';
+      st.style.color = 'var(--dim)';
+      st.textContent = isExport
+        ? `导出进度 ${j.done}/${j.total}（${pct}% · ${formatBytes(j.bytes_done||0)} / ${formatBytes(j.bytes_total||0)}）`
+        : `进度 ${j.done}/${j.total}（${pct}%）`;
       log.textContent = (j.log||[]).join('\n');
       log.scrollTop = log.scrollHeight;
     } else {
-      bar.style.display = 'none'; btn.disabled = false; btn.textContent = '▶ 重新评分';
+      bar.style.display = 'none';
+      btn.disabled = false; expBtn.disabled = false;
+      btn.textContent = '▶ 重新评分';
       if(j.state === 'done' || j.state === 'failed'){
         st.style.display = 'block';
         st.textContent = j.state==='done' ? `✓ ${j.summary}` : `✗ ${j.error}`;
@@ -1114,15 +1143,265 @@ function pollJob(){
       }
       log.style.display = (j.log||[]).length ? 'block' : 'none';
       if((j.log||[]).length) log.textContent = j.log.join('\n');
-      // 完成瞬间刷新数据
-      if(j.state === 'done' && jobPolling){ loadData(); }
+      // 仅评分任务完成时刷新快照数据
+      if(!isExport && j.state === 'done' && jobPolling){ loadData(); }
     }
-    // 运行中持续轮询；结束后再多拉一次就停
+
+    if(isExport && j.state !== 'idle'){
+      expGroup.hidden = false;
+      if(j.state === 'running'){
+        const pct = j.total ? Math.round(j.done/j.total*100) : 0;
+        expBarWrap.style.display = 'block';
+        expBar.style.width = pct + '%';
+        expState.style.color = 'var(--dim)';
+        const cur = j.current_file ? ` · 当前：${j.current_file}` : '';
+        expState.textContent = `正在导出 ${j.done}/${j.total}（${pct}% · ${formatBytes(j.bytes_done||0)} / ${formatBytes(j.bytes_total||0)}）${cur}`;
+        expCancel.hidden = !j.cancellable;
+        expCancel.disabled = false;
+        expOpen.hidden = true;
+      } else {
+        expBarWrap.style.display = 'none';
+        expCancel.hidden = true;
+        expState.textContent = j.state==='done' ? `✓ ${j.summary}` : `✗ ${j.error}`;
+        expState.style.color = j.state==='done' ? 'var(--acc)' : '#f44336';
+        expOpen.hidden = !(j.can_open_export && localDesktop);
+        if(document.getElementById('exportModal').style.display === 'flex' && jobPolling){
+          scheduleExportPreview(50);
+        }
+      }
+      expLog.style.display = (j.log||[]).length ? 'block' : 'none';
+      if((j.log||[]).length){
+        expLog.textContent = j.log.join('\n');
+        expLog.scrollTop = expLog.scrollHeight;
+      }
+    } else {
+      expCancel.hidden = true;
+      expOpen.hidden = true;
+    }
+    syncExportStartButton();
+
+    // 运行中持续轮询；结束后停止
     if(j.state === 'running'){ schedulePoll(); }
-    else { const keep = jobPolling; jobPolling = null; if(keep) setTimeout(()=>{}, 0); }
+    else { jobPolling = null; }
   }).catch(()=>{});
 }
 function schedulePoll(){ if(jobPolling) clearTimeout(jobPolling); jobPolling = setTimeout(pollJob, 600); }
+
+// ---------- 导出筛选结果弹窗 ----------
+const exportModal = document.getElementById('exportModal');
+const exportSubdirEl = document.getElementById('exportSubdir');
+const exportJpgEl = document.getElementById('exportJpg');
+const exportRawEl = document.getElementById('exportRaw');
+const exportXmpEl = document.getElementById('exportXmp');
+const exportXmpExposureEl = document.getElementById('exportXmpExposure');
+const exportLayoutEl = document.getElementById('exportLayout');
+let exportExternalTargetId = null;
+let exportExternalDisplay = '';
+let exportPreviewData = null;
+let exportPreviewTimer = null;
+let exportPreviewSeq = 0;
+
+function syncExportRawOption(){
+  exportRawEl.disabled = !serverIncludeRaw;
+  if(!serverIncludeRaw) exportRawEl.checked = false;
+  document.getElementById('exportRawDisabledNote').hidden = serverIncludeRaw;
+}
+function syncExportXmpExposure(){
+  const enabled = exportXmpEl.checked;
+  exportXmpExposureEl.disabled = !enabled;
+  if(!enabled) exportXmpExposureEl.checked = false;
+}
+function syncExportTargetUi(){
+  const hasExternal = !!exportExternalTargetId;
+  document.getElementById('exportSubdirRow').hidden = hasExternal;
+  document.getElementById('exportExternalRow').hidden = !hasExternal;
+  document.getElementById('exportExternalPath').textContent = exportExternalDisplay;
+}
+function syncExportStartButton(){
+  const startBtn = document.getElementById('exportStart');
+  const ok = !jobIsRunning && exportPreviewData && exportPreviewData.selected_photos > 0;
+  startBtn.disabled = !ok;
+}
+function buildExportRequestPayload(){
+  const xmp = exportXmpEl.checked;
+  return {
+    filter: {
+      search: f.search,
+      stars: [...f.stars],
+      keep: f.keep,
+      group: f.group,
+      faces: f.faces,
+      min: {...f.min},
+    },
+    subdir: exportExternalTargetId ? null : (exportSubdirEl.value.trim() || 'Selected'),
+    external_target_id: exportExternalTargetId,
+    layout: exportLayoutEl.value,
+    include_jpg: exportJpgEl.checked,
+    include_raw: serverIncludeRaw && exportRawEl.checked,
+    include_xmp: xmp,
+    xmp_exposure: xmp && exportXmpExposureEl.checked,
+  };
+}
+function renderExportPreview(p){
+  const box = document.getElementById('exportPreviewBox');
+  const lines = [];
+  lines.push(`<div><b>目标路径</b>：<code>${escapeHtml(p.target_display)}</code>${p.in_album ? ' <span class="dim">（相册内，写入 .firstcut-export 防重扫）</span>' : ' <span class="dim">（外部已授权目录）</span>'}</div>`);
+  lines.push(`<div><b>命中照片</b>：${p.selected_photos} 张 · <b>待写入</b>：JPG ${p.jpg_to_copy} / RAW ${p.raw_to_copy} / XMP ${p.xmp_to_write}${p.xmp_generated ? `（新生成 ${p.xmp_generated}）` : ''}</div>`);
+  const freeText = p.available_bytes != null ? ` · 目标卷可用 ${formatBytes(p.available_bytes)}` : '';
+  lines.push(`<div><b>预计复制</b>：${formatBytes(p.total_copy_bytes)}${freeText} · <b>增量跳过</b>：${p.skipped_unchanged} 个 · <b>保留既有</b>：${p.protected_existing} 个</div>`);
+  if(p.missing_raw_count > 0){
+    const samples = (p.missing_raw_samples||[]).map(escapeHtml).join('、');
+    lines.push(`<div class="warn">提示：${p.missing_raw_count} 张照片没有配对 RAW，已跳过其 RAW${samples ? `（例如：${samples}）` : ''}。</div>`);
+  }
+  if(p.missing_xmp_unscored > 0){
+    lines.push(`<div class="warn">提示：${p.missing_xmp_unscored} 张未评分且无原 XMP 的照片不会生成新侧车。</div>`);
+  }
+  if(p.renamed_count > 0){
+    const items = (p.renamed_samples||[]).map(c=>`<li>${escapeHtml(c.source)} → <code>${escapeHtml(c.exported_stem)}</code></li>`).join('');
+    lines.push(`<div class="warn">检测到 ${p.renamed_count} 张跨目录同文件名照片，导出时将自动加目录前缀防覆盖：</div><ul>${items}</ul>`);
+  }
+  if(p.protected_existing > 0 && (p.protected_samples||[]).length){
+    const items = p.protected_samples.map(s=>`<li><code>${escapeHtml(s)}</code></li>`).join('');
+    lines.push(`<div class="warn">以下既有目标文件将保留不覆盖：</div><ul>${items}</ul>`);
+  }
+  for(const w of (p.warnings||[])){
+    lines.push(`<div class="warn">⚠ ${escapeHtml(w)}</div>`);
+  }
+  box.innerHTML = lines.join('');
+}
+async function refreshExportPreview(){
+  const seq = ++exportPreviewSeq;
+  const box = document.getElementById('exportPreviewBox');
+  const matched = visible();
+  document.getElementById('exportFilterSummary').textContent =
+    `基于当前左侧筛选命中的全部 ${matched.length} 张照片（不受“按连拍组聚合”折叠影响）。`;
+  exportPreviewData = null;
+  syncExportStartButton();
+  box.innerHTML = '<span class="dim">正在计算导出预览…</span>';
+  try {
+    const response = await apiFetch('/api/export/preview', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(buildExportRequestPayload()),
+    });
+    if(seq !== exportPreviewSeq) return;
+    if(!response.ok){
+      const reason = await response.text();
+      box.innerHTML = `<div class="err">${escapeHtml(reason || `预览失败（${response.status}）`)}</div>`;
+      return;
+    }
+    const data = await response.json();
+    if(seq !== exportPreviewSeq) return;
+    exportPreviewData = data;
+    renderExportPreview(data);
+    syncExportStartButton();
+  } catch (err) {
+    if(seq !== exportPreviewSeq) return;
+    box.innerHTML = `<div class="err">预览失败：${escapeHtml(err.message || String(err))}</div>`;
+  }
+}
+function scheduleExportPreview(delay=220){
+  if(exportPreviewTimer) clearTimeout(exportPreviewTimer);
+  exportPreviewTimer = setTimeout(refreshExportPreview, delay);
+}
+exportXmpEl.addEventListener('change', ()=>{ syncExportXmpExposure(); scheduleExportPreview(0); });
+syncExportXmpExposure();
+for(const el of [exportJpgEl, exportRawEl, exportXmpExposureEl, exportLayoutEl]){
+  el.addEventListener('change', ()=> scheduleExportPreview(0));
+}
+exportSubdirEl.addEventListener('input', ()=> scheduleExportPreview(260));
+document.getElementById('exportBtn').addEventListener('click', ()=>{
+  syncExportRawOption();
+  syncExportXmpExposure();
+  syncExportTargetUi();
+  exportModal.style.display = 'flex';
+  refreshExportPreview();
+});
+document.getElementById('exportClose').addEventListener('click', ()=>{ exportModal.style.display = 'none'; });
+document.getElementById('exportUseSubdir').addEventListener('click', ()=>{
+  exportExternalTargetId = null;
+  exportExternalDisplay = '';
+  syncExportTargetUi();
+  scheduleExportPreview(0);
+});
+document.getElementById('exportPickFolder').addEventListener('click', async ()=>{
+  const btn = document.getElementById('exportPickFolder');
+  btn.disabled = true;
+  try {
+    const response = await apiFetch('/api/export/pick-folder', {
+      method:'POST', headers:{'Content-Type':'application/json'}, body:'{}',
+    });
+    if(!response.ok){
+      toast(await response.text() || `无法打开文件夹选择器（${response.status}）`);
+      return;
+    }
+    const data = await response.json();
+    if(data.cancelled) return;
+    if(data.in_album){
+      exportExternalTargetId = null;
+      exportExternalDisplay = '';
+      exportSubdirEl.value = data.subdir || 'Selected';
+    } else {
+      exportExternalTargetId = data.target_id;
+      exportExternalDisplay = data.display_path || '';
+    }
+    syncExportTargetUi();
+    scheduleExportPreview(0);
+  } catch (err) {
+    toast('选择文件夹失败：' + err);
+  } finally {
+    btn.disabled = false;
+  }
+});
+document.getElementById('exportStart').addEventListener('click', async ()=>{
+  const btn = document.getElementById('exportStart');
+  btn.disabled = true;
+  try {
+    const response = await apiFetch('/api/export/run', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(buildExportRequestPayload()),
+    });
+    if(!response.ok){
+      toast(await response.text() || `无法开始导出（${response.status}）`);
+      syncExportStartButton();
+      return;
+    }
+    document.getElementById('exportJobGroup').hidden = false;
+    jobPolling = setTimeout(pollJob, 200);
+  } catch (err) {
+    toast('无法开始导出：' + err);
+    syncExportStartButton();
+  }
+});
+document.getElementById('exportCancelJob').addEventListener('click', async ()=>{
+  const btn = document.getElementById('exportCancelJob');
+  btn.disabled = true;
+  try {
+    const response = await apiFetch('/api/export/cancel', {
+      method:'POST', headers:{'Content-Type':'application/json'}, body:'{}',
+    });
+    if(!response.ok) toast(await response.text() || '取消失败');
+    else toast('已发送取消请求，当前文件写完后立即停止');
+  } catch (err) {
+    toast('取消失败：' + err);
+  }
+});
+document.getElementById('exportOpenDir').addEventListener('click', async ()=>{
+  try {
+    const response = await apiFetch('/api/export/open', {
+      method:'POST', headers:{'Content-Type':'application/json'}, body:'{}',
+    });
+    if(!response.ok) toast(await response.text() || '无法打开目录');
+  } catch (err) {
+    toast('无法打开目录：' + err);
+  }
+});
+window.addEventListener('keydown', e=>{
+  if(e.key === 'Escape' && exportModal.style.display === 'flex' && lbEl.style.display !== 'flex'){
+    exportModal.style.display = 'none';
+  }
+});
 const runXmpEl = document.getElementById('runXmp');
 const runXmpExposureEl = document.getElementById('runXmpExposure');
 function syncRunXmpExposure(){

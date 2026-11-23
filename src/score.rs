@@ -661,7 +661,7 @@ fn apply_scores(
 }
 
 /// 把连拍信息写入 PhotoEntry 的 CSV 字段
-fn apply_burst(e: &mut PhotoEntry, info: &BurstInfo) {
+fn apply_burst(e: &mut PhotoEntry, info: &crate::decision::EffectiveBurst) {
     e.burst_group = if info.group == 0 { "0".into() } else { info.group.to_string() };
     e.burst_size = if info.size == 0 { String::new() } else { info.size.to_string() };
     e.burst_rank = if info.rank == 0 { String::new() } else { info.rank.to_string() };
