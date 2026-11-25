@@ -561,3 +561,77 @@ fn swapped_card_rescore_does_not_inherit_previous_manual_rating() {
         "换卡后不应出现 manual 覆盖记录: {report}"
     );
 }
+
+#[test]
+fn legacy_decisions_import_backfills_fingerprints_and_blocks_swapped_card_inheritance() {
+    let temp = tempfile::tempdir().unwrap();
+    let mount = temp.path().join("mount");
+    let state = temp.path().join("state");
+    std::fs::create_dir_all(mount.join(".firstcut")).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+
+    // 卡 A：1 张真实照片 + 1 条无法确认来源的缺失照片记录，写入旧版 2 列 decisions.sqlite
+    let photo = mount.join("DSC00001.JPG");
+    save_jpeg_with_exif_datetime(&photo, [20, 40, 60], "2026:11:25 10:00:00");
+    let legacy_db_path = mount.join(".firstcut/decisions.sqlite");
+    {
+        let conn = rusqlite::Connection::open(&legacy_db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE manual_rating (
+                photo_path TEXT PRIMARY KEY,
+                stars INTEGER NOT NULL CHECK(stars BETWEEN 1 AND 5)
+            );
+            INSERT INTO manual_rating (photo_path, stars) VALUES ('DSC00001.JPG', 1);
+            INSERT INTO manual_rating (photo_path, stars) VALUES ('MISSING.JPG', 5);",
+        )
+        .unwrap();
+    }
+    let legacy_bytes_before = std::fs::read(&legacy_db_path).unwrap();
+
+    let source = pic_process::workspace::WorkspaceSource::single(&mount).unwrap();
+    let paths = pic_process::workspace::WorkspacePaths::in_state_dir(state);
+    pic_process::workspace::import_legacy_state_if_needed(&source, &paths).unwrap();
+    assert_eq!(
+        std::fs::read(&legacy_db_path).unwrap(),
+        legacy_bytes_before,
+        "只读导入不得修改原相册的旧 decisions.sqlite"
+    );
+
+    let cfg = ScoreConfig::default();
+    let opts = score::ScoreJobOptions {
+        output_csv: paths.report.clone(),
+        raw_csv: false,
+        cache_path: paths.cache.clone(),
+        no_cache: false,
+        no_ai: true,
+        xmp: false,
+        xmp_exposure: false,
+        gpu: false,
+        keep_override: None,
+        include_raw: false,
+        skip_processed: true,
+    };
+
+    // 卡 A 评分：已补齐指纹的 DSC00001.JPG 应保留人工 1 星
+    score::run_score_job_in_workspace(&source, &paths, &cfg, &opts, &|_| {}).unwrap();
+    let report_a = std::fs::read_to_string(&paths.report).unwrap();
+    assert!(report_a.contains(",\"1\",\"manual\","), "卡 A 旧人工 1 星应生效: {report_a}");
+
+    // 换卡 B 到同一挂载路径：同路径放另一张合成照片，并出现同名的 MISSING.JPG
+    save_jpeg_with_exif_datetime(&photo, [230, 220, 210], "2026:11:25 14:30:00");
+    save_jpeg_with_exif_datetime(&mount.join("MISSING.JPG"), [100, 150, 200], "2026:11:25 14:31:00");
+    score::run_score_job_in_workspace(&source, &paths, &cfg, &opts, &|_| {}).unwrap();
+
+    let report_b = std::fs::read_to_string(&paths.report).unwrap();
+    assert!(
+        !report_b.contains(",\"manual\","),
+        "换卡 B 后旧记录（含已补指纹及无法确认来源的空指纹记录）均不得串星: {report_b}"
+    );
+    let stored = pic_process::decision::load_ratings_in(&paths.state_dir).unwrap();
+    assert!(
+        stored
+            .get("MISSING.JPG")
+            .is_some_and(|rows| rows.iter().any(|(fp, stars)| fp.is_empty() && *stars == 5)),
+        "无法确认来源的旧记录应保留在数据库中，只是不自动应用"
+    );
+}

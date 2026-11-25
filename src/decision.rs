@@ -73,19 +73,26 @@ fn relative_key(root: &Path, photo: &Path) -> Result<String> {
     Ok(relative)
 }
 
-fn photo_fingerprint(root: &Path, rel_key: &str) -> Option<String> {
+fn photo_fingerprint(root: &Path, rel_key: &str) -> Result<String> {
     let mut file = FileRef::inside(root, &root.join(rel_key))
-        .ok()?
+        .with_context(|| format!("无法安全打开照片文件以生成指纹: {rel_key}"))?
         .open_read()
-        .ok()??;
-    let len = file.metadata().ok()?.len();
+        .with_context(|| format!("读取照片文件失败: {rel_key}"))?
+        .with_context(|| format!("照片文件不存在或不可读，无法生成内容指纹: {rel_key}"))?;
+    let len = file
+        .metadata()
+        .with_context(|| format!("读取照片元数据失败: {rel_key}"))?
+        .len();
     let mut hasher = Sha256::new();
     hasher.update(len.to_le_bytes());
     let mut buf = [0u8; FINGERPRINT_SLICE_BYTES];
-    let head_target = usize::try_from(len.min(FINGERPRINT_SLICE_BYTES as u64)).unwrap_or(FINGERPRINT_SLICE_BYTES);
+    let head_target =
+        usize::try_from(len.min(FINGERPRINT_SLICE_BYTES as u64)).unwrap_or(FINGERPRINT_SLICE_BYTES);
     let mut read_head = 0usize;
     while read_head < head_target {
-        let n = file.read(&mut buf[read_head..head_target]).ok()?;
+        let n = file
+            .read(&mut buf[read_head..head_target])
+            .with_context(|| format!("读取照片头部字节失败: {rel_key}"))?;
         if n == 0 {
             break;
         }
@@ -93,10 +100,13 @@ fn photo_fingerprint(root: &Path, rel_key: &str) -> Option<String> {
     }
     hasher.update(&buf[..read_head]);
     if len > FINGERPRINT_SLICE_BYTES as u64 {
-        file.seek(SeekFrom::Start(len - FINGERPRINT_SLICE_BYTES as u64)).ok()?;
+        file.seek(SeekFrom::Start(len - FINGERPRINT_SLICE_BYTES as u64))
+            .with_context(|| format!("定位照片尾部字节失败: {rel_key}"))?;
         let mut read_tail = 0usize;
         while read_tail < FINGERPRINT_SLICE_BYTES {
-            let n = file.read(&mut buf[read_tail..]).ok()?;
+            let n = file
+                .read(&mut buf[read_tail..])
+                .with_context(|| format!("读取照片尾部字节失败: {rel_key}"))?;
             if n == 0 {
                 break;
             }
@@ -104,7 +114,7 @@ fn photo_fingerprint(root: &Path, rel_key: &str) -> Option<String> {
         }
         hasher.update(&buf[..read_tail]);
     }
-    Some(format!("v1:{len}:{:x}", hasher.finalize()))
+    Ok(format!("v1:{len}:{:x}", hasher.finalize()))
 }
 
 fn has_column(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
@@ -252,7 +262,7 @@ pub fn set(root: &Path, jpg: &Path, stars: u8) -> Result<()> {
 pub fn set_in(state_dir: &Path, jpg_root: &Path, jpg: &Path, stars: u8) -> Result<()> {
     anyhow::ensure!((1..=5).contains(&stars), "星级必须在 1~5");
     let key = relative_key(jpg_root, jpg)?;
-    let fp = photo_fingerprint(jpg_root, &key).unwrap_or_default();
+    let fp = photo_fingerprint(jpg_root, &key)?;
     let state = Folder::open_or_create_explicit(state_dir, true)?;
     let mut db = Database::open(state.file(DECISIONS_DB)?, true)?
         .context("人工评分数据库不可用")?;
@@ -351,7 +361,7 @@ pub fn set_burst_keep_in(
     keep: Option<bool>,
 ) -> Result<()> {
     let key = relative_key(jpg_root, jpg)?;
-    let fp = photo_fingerprint(jpg_root, &key).unwrap_or_default();
+    let fp = photo_fingerprint(jpg_root, &key)?;
     let state = Folder::open_or_create_explicit(state_dir, true)?;
     let mut db = Database::open(state.file(DECISIONS_DB)?, true)?
         .context("人工评分数据库不可用")?;
@@ -364,9 +374,10 @@ pub fn set_burst_keep_in(
     let tx = db.conn.transaction()?;
     if let Some(legacy_map) = legacy {
         for (legacy_path, legacy_keep) in legacy_map {
+            let legacy_fp = photo_fingerprint(jpg_root, &legacy_path).unwrap_or_default();
             tx.execute(
-                "INSERT OR IGNORE INTO manual_burst_keep(photo_path, photo_fp, keep) VALUES (?1, '', ?2)",
-                rusqlite::params![legacy_path, i64::from(legacy_keep)],
+                "INSERT OR IGNORE INTO manual_burst_keep(photo_path, photo_fp, keep) VALUES (?1, ?2, ?3)",
+                rusqlite::params![legacy_path, legacy_fp, i64::from(legacy_keep)],
             )?;
         }
         tx.execute(
@@ -405,22 +416,111 @@ pub fn set_burst_keep_in(
     db.save()
 }
 
+/// 从原相册导入旧版 `decisions.sqlite` / `burst-overrides.json` 后，按原相册照片补齐内容指纹；
+/// 无法读取照片的旧记录保留在数据库中（`photo_fp = ''`），但绝不在后续匹配中自动应用。
+pub fn backfill_fingerprints_in(state_dir: &Path, jpg_root: &Path) -> Result<()> {
+    let state = match Folder::open_or_create_explicit(state_dir, false) {
+        Ok(dir) => dir,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err.into()),
+    };
+    let has_db = state.file(DECISIONS_DB)?.open_read()?.is_some();
+    let has_legacy_json = state.file(LEGACY_BURST_JSON)?.open_read()?.is_some();
+    if !has_db && !has_legacy_json {
+        return Ok(());
+    }
+    let mut db = Database::open(state.file(DECISIONS_DB)?, true)?
+        .context("人工评分数据库不可用")?;
+    let upgraded_schema = !table_exists(&db.conn, "manual_rating")?
+        || !has_column(&db.conn, "manual_rating", "photo_fp")?
+        || !table_exists(&db.conn, "manual_burst_keep")?
+        || !has_column(&db.conn, "manual_burst_keep", "photo_fp")?;
+    ensure_schema(&db.conn)?;
+    let mut changed = upgraded_schema;
+
+    if !is_burst_json_migrated(&db.conn)? && has_legacy_json {
+        let legacy_map = load_legacy_burst_json(&state)?;
+        let tx = db.conn.transaction()?;
+        for (legacy_path, legacy_keep) in legacy_map {
+            let fp = photo_fingerprint(jpg_root, &legacy_path).unwrap_or_default();
+            tx.execute(
+                "INSERT OR IGNORE INTO manual_burst_keep(photo_path, photo_fp, keep) VALUES (?1, ?2, ?3)",
+                rusqlite::params![legacy_path, fp, i64::from(legacy_keep)],
+            )?;
+        }
+        tx.execute(
+            "INSERT OR REPLACE INTO decision_meta(key, value) VALUES (?1, '1')",
+            [META_BURST_JSON_MIGRATED],
+        )?;
+        tx.commit()?;
+        changed = true;
+    }
+
+    let rating_rows: Vec<(String, u8)> = {
+        let mut stmt = db
+            .conn
+            .prepare("SELECT photo_path, stars FROM manual_rating WHERE photo_fp = ''")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, u8>(1)?)))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let burst_rows: Vec<(String, i64)> = {
+        let mut stmt = db
+            .conn
+            .prepare("SELECT photo_path, keep FROM manual_burst_keep WHERE photo_fp = ''")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    if !rating_rows.is_empty() || !burst_rows.is_empty() {
+        let tx = db.conn.transaction()?;
+        for (path, stars) in rating_rows {
+            if let Ok(fp) = photo_fingerprint(jpg_root, &path) {
+                tx.execute(
+                    "INSERT INTO manual_rating(photo_path, photo_fp, stars) VALUES (?1, ?2, ?3)
+                     ON CONFLICT(photo_path, photo_fp) DO NOTHING",
+                    rusqlite::params![&path, &fp, stars],
+                )?;
+                tx.execute(
+                    "DELETE FROM manual_rating WHERE photo_path = ?1 AND photo_fp = ''",
+                    [&path],
+                )?;
+                changed = true;
+            }
+        }
+        for (path, keep) in burst_rows {
+            if let Ok(fp) = photo_fingerprint(jpg_root, &path) {
+                tx.execute(
+                    "INSERT INTO manual_burst_keep(photo_path, photo_fp, keep) VALUES (?1, ?2, ?3)
+                     ON CONFLICT(photo_path, photo_fp) DO NOTHING",
+                    rusqlite::params![&path, &fp, keep],
+                )?;
+                tx.execute(
+                    "DELETE FROM manual_burst_keep WHERE photo_path = ?1 AND photo_fp = ''",
+                    [&path],
+                )?;
+                changed = true;
+            }
+        }
+        tx.commit()?;
+    }
+
+    if changed {
+        db.save()?;
+    }
+    Ok(())
+}
+
 fn match_decision<T: Copy>(root: &Path, key: &str, candidates: &[(String, T)]) -> Option<T> {
     if candidates.is_empty() {
         return None;
     }
-    let current_fp = photo_fingerprint(root, key);
-    if let Some(ref fp) = current_fp {
-        if let Some((_, val)) = candidates.iter().find(|(stored_fp, _)| stored_fp == fp) {
-            return Some(*val);
-        }
-        // 仅回退到历史无指纹记录；若数据库里存有其他非空指纹则绝不误匹配（防换卡串图）
-        return candidates
-            .iter()
-            .find(|(stored_fp, _)| stored_fp.is_empty())
-            .map(|(_, val)| *val);
-    }
-    candidates.last().map(|(_, val)| *val)
+    let Ok(fp) = photo_fingerprint(root, key) else {
+        return None;
+    };
+    candidates
+        .iter()
+        .find(|(stored_fp, _)| !stored_fp.is_empty() && stored_fp == &fp)
+        .map(|(_, val)| *val)
 }
 
 /// JPG 的路径是人工决定的身份；配对键只负责把决定映射给同一张 ARW。
@@ -430,11 +530,32 @@ pub fn effective_ratings(
     algorithm: &HashMap<String, u8>,
     manual: &HashMap<String, u8>,
 ) -> Result<HashMap<String, EffectiveRating>> {
-    let wrapped: DecisionMap<u8> = manual
+    let mut out: HashMap<String, EffectiveRating> = algorithm
         .iter()
-        .map(|(k, &v)| (k.clone(), vec![(String::new(), v)]))
+        .map(|(key, &stars)| {
+            (
+                key.clone(),
+                EffectiveRating {
+                    stars,
+                    source: RatingSource::Algorithm,
+                },
+            )
+        })
         .collect();
-    effective_ratings_checked(root, entries, algorithm, &wrapped)
+    for e in entries.iter().filter(|e| !e.is_raw) {
+        let key = relative_key(root, Path::new(&e.path))?;
+        if let Some(&stars) = manual.get(&key) {
+            if photo_fingerprint(root, &key).is_ok() {
+                if let Some(value) = out.get_mut(e.pair_id()) {
+                    *value = EffectiveRating {
+                        stars,
+                        source: RatingSource::Manual,
+                    };
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
 pub fn effective_ratings_checked(
@@ -481,11 +602,37 @@ pub fn effective_bursts(
     algorithm: &HashMap<String, BurstInfo>,
     manual: &HashMap<String, bool>,
 ) -> Result<HashMap<String, EffectiveBurst>> {
-    let wrapped: DecisionMap<bool> = manual
+    let mut out: HashMap<String, EffectiveBurst> = algorithm
         .iter()
-        .map(|(k, &v)| (k.clone(), vec![(String::new(), v)]))
+        .map(|(key, info)| {
+            (
+                key.clone(),
+                EffectiveBurst {
+                    group: info.group,
+                    size: info.size,
+                    rank: info.rank,
+                    keep: info.keep,
+                    suggested_keep: info.keep,
+                    manual_keep: None,
+                    pose_cluster: info.pose_cluster,
+                },
+            )
+        })
         .collect();
-    effective_bursts_checked(root, entries, algorithm, &wrapped)
+    for e in entries.iter().filter(|e| !e.is_raw) {
+        let key = relative_key(root, Path::new(&e.path))?;
+        if let Some(&keep) = manual.get(&key) {
+            if photo_fingerprint(root, &key).is_ok() {
+                if let Some(value) = out.get_mut(e.pair_id()) {
+                    if value.group > 0 {
+                        value.keep = keep;
+                        value.manual_keep = Some(keep);
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
 pub fn effective_bursts_checked(
@@ -536,6 +683,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("firstcut_decisions_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let jpg = dir.join("a.jpg");
+        std::fs::write(&jpg, b"dummy-a-jpg").unwrap();
         set(&dir, &jpg, 1).unwrap();
         let manual = load(&dir).unwrap();
         let entries = vec![
@@ -580,8 +728,14 @@ mod tests {
         assert_eq!(loaded.get("JPG/b.jpg"), Some(&true));
 
         // 2) 清除 JPG/a.jpg 后，应把旧 JSON 一次性导入 SQLite 并删除 a，不被旧 JSON 复活
+        std::fs::create_dir_all(root.join("JPG")).unwrap();
         let jpg_a = root.join("JPG").join("a.jpg");
+        let jpg_b = root.join("JPG").join("b.jpg");
         let jpg_c = root.join("JPG").join("c.jpg");
+        std::fs::write(&jpg_a, b"jpg-a").unwrap();
+        std::fs::write(&jpg_b, b"jpg-b").unwrap();
+        std::fs::write(&jpg_c, b"jpg-c").unwrap();
+        backfill_fingerprints_in(&root.join(".firstcut"), root).unwrap();
         set_burst_keep(root, &jpg_a, None).unwrap();
         let after_clear = load_burst_overrides(root).unwrap();
         assert!(!after_clear.contains_key("JPG/a.jpg"), "清除后不应被旧 JSON 复活");
@@ -642,6 +796,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         std::fs::create_dir_all(&outside).unwrap();
         symlink(&outside, root.join(".firstcut")).unwrap();
+        std::fs::write(root.join("photo.jpg"), b"dummy-photo").unwrap();
 
         let result = set(&root, &root.join("photo.jpg"), 3);
         assert!(result.is_err());
@@ -668,6 +823,7 @@ mod tests {
         std::fs::create_dir_all(root.join(".firstcut")).unwrap();
         std::fs::write(&outside, b"leave this file alone").unwrap();
         symlink(&outside, root.join(".firstcut/decisions.sqlite")).unwrap();
+        std::fs::write(root.join("photo.jpg"), b"dummy-photo").unwrap();
 
         let result = set(&root, &root.join("photo.jpg"), 3);
         assert!(result.is_err());
@@ -739,5 +895,56 @@ mod tests {
                 .unwrap();
         assert_eq!(ratings_a_back["p1"].stars, 1);
         assert_eq!(ratings_a_back["p1"].source, RatingSource::Manual);
+    }
+
+    #[test]
+    fn missing_photo_fails_save_and_falls_back_to_algorithm_on_match() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("mount");
+        let state = temp.path().join("state");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        let photo = root.join("DSC00001.JPG");
+
+        std::fs::write(&photo, b"existing-photo-bytes").unwrap();
+        set_in(&state, &root, &photo, 1).unwrap();
+        set_burst_keep_in(&state, &root, &photo, Some(false)).unwrap();
+
+        // 模拟扫描后照片文件消失：匹配时不得套用人工 1 星 / 手动舍弃，保存必须返回错误且不写空指纹
+        std::fs::remove_file(&photo).unwrap();
+        let entries = vec![PhotoEntry {
+            path: photo.display().to_string(),
+            pair_id: "p1".into(),
+            ..Default::default()
+        }];
+        let algo_ratings = HashMap::from([("p1".into(), 4)]);
+        let algo_bursts = HashMap::from([(
+            "p1".into(),
+            BurstInfo {
+                group: 1,
+                size: 2,
+                rank: 1,
+                keep: true,
+                pose_cluster: 1,
+            },
+        )]);
+
+        let ratings =
+            effective_ratings_checked(&root, &entries, &algo_ratings, &load_ratings_in(&state).unwrap())
+                .unwrap();
+        assert_eq!(ratings["p1"].stars, 4);
+        assert_eq!(ratings["p1"].source, RatingSource::Algorithm);
+
+        let bursts =
+            effective_bursts_checked(&root, &entries, &algo_bursts, &load_bursts_in(&state).unwrap())
+                .unwrap();
+        assert!(bursts["p1"].keep);
+        assert_eq!(bursts["p1"].manual_keep, None);
+
+        assert!(set_in(&state, &root, &photo, 5).is_err());
+        assert!(set_burst_keep_in(&state, &root, &photo, Some(true)).is_err());
+        let stored_ratings = load_ratings_in(&state).unwrap();
+        assert!(!stored_ratings["DSC00001.JPG"].iter().any(|(fp, _)| fp.is_empty()));
+        assert!(!stored_ratings["DSC00001.JPG"].iter().any(|(_, s)| *s == 5));
     }
 }

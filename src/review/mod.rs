@@ -2287,7 +2287,8 @@ mod tests {
     async fn manual_burst_keep_persists_and_can_restore_suggestion() {
         let dir = std::env::temp_dir().join(format!("firstcut_burst_override_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(dir.join("scene")).unwrap();
+        std::fs::write(dir.join("scene/a.jpg"), b"dummy-a").unwrap();
         let photo = snapshot::PhotoJson {
             path: "scene/a.jpg".into(), filename: "a.jpg".into(), ext: "jpg".into(),
             is_raw: false, has_pair: false, pair_id: "a".into(), datetime: String::new(),
@@ -2414,6 +2415,9 @@ mod tests {
     async fn concurrent_rate_requests_serialize_without_lock_errors() {
         let temp = tempfile::tempdir().unwrap();
         let dir = temp.path().to_path_buf();
+        std::fs::create_dir_all(dir.join("scene")).unwrap();
+        std::fs::write(dir.join("scene/a.jpg"), b"dummy-a").unwrap();
+        std::fs::write(dir.join("scene/b.jpg"), b"dummy-b").unwrap();
         std::fs::write(dir.join("a.jpg"), b"jpg").unwrap();
         let photo = snapshot::PhotoJson {
             path: "a.jpg".into(), filename: "a.jpg".into(), ext: "jpg".into(),
@@ -2568,6 +2572,9 @@ mod tests {
     async fn cancelled_mutation_keeps_locks_and_updates_snapshot_before_next_write_or_job() {
         let temp = tempfile::tempdir().unwrap();
         let dir = temp.path().to_path_buf();
+        std::fs::create_dir_all(dir.join("scene")).unwrap();
+        std::fs::write(dir.join("scene/a.jpg"), b"dummy-a").unwrap();
+        std::fs::write(dir.join("scene/b.jpg"), b"dummy-b").unwrap();
         let make_photo = |name: &str, pair: &str| snapshot::PhotoJson {
             path: format!("scene/{name}"), filename: name.into(), ext: "jpg".into(),
             is_raw: false, has_pair: false, pair_id: pair.into(), datetime: String::new(),
