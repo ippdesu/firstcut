@@ -472,6 +472,21 @@ pub fn run_score_job(
     opts: &ScoreJobOptions,
     on_event: &(dyn Fn(ScoreEvent) + Sync),
 ) -> anyhow::Result<ScoreJobSummary> {
+    let source = crate::workspace::WorkspaceSource::Single {
+        root: dir.to_path_buf(),
+    };
+    let paths = crate::workspace::WorkspacePaths::in_state_dir(dir.join(".firstcut"));
+    run_score_job_in_workspace(&source, &paths, cfg, opts, on_event)
+}
+
+/// 统一工作区评分流水线（支持单目录与双目录；状态写入 `paths.state_dir`，双目录禁止写源 XMP）。
+pub fn run_score_job_in_workspace(
+    source: &crate::workspace::WorkspaceSource,
+    paths: &crate::workspace::WorkspacePaths,
+    cfg: &ScoreConfig,
+    opts: &ScoreJobOptions,
+    on_event: &(dyn Fn(ScoreEvent) + Sync),
+) -> anyhow::Result<ScoreJobSummary> {
     if opts.gpu && !cfg!(feature = "gpu") {
         anyhow::bail!("GPU 推理需要启用 DirectML 构建：cargo build --release --features gpu");
     }
@@ -481,13 +496,24 @@ pub fn run_score_job(
     if opts.xmp_exposure && !opts.xmp {
         anyhow::bail!("--xmp-exposure 需要同时开启 --xmp");
     }
+    if opts.xmp && source.is_dual() {
+        anyhow::bail!("双目录模式默认不对源目录/存储卡写入 XMP，请使用 export 导出到本机目录并生成 XMP");
+    }
 
+    let jpg_root = source.jpg_root();
     on_event(ScoreEvent::Info(format!(
-        "发现文件中…（目录 {}）",
-        dir.display()
+        "发现文件中…（{}）",
+        source.display_label()
     )));
-    let mut entries = scan::scan_directory_with_options(dir, opts.include_raw, opts.skip_processed)?;
-    on_event(ScoreEvent::Info(format!("发现 {} 个文件（JPG/ARW）", entries.len())));
+    let mut entries = scan::scan_workspace(
+        source,
+        Some(&paths.state_dir),
+        Some(&paths.report),
+        opts.include_raw,
+        opts.skip_processed,
+        &|_, _, _| {},
+    )?;
+    on_event(ScoreEvent::Info(format!("发现 {} 个文件（JPG/RAW）", entries.len())));
 
     // AI 引擎（加载失败降级为纯像素评分，不中断）
     let engine = if opts.no_ai {
@@ -509,8 +535,12 @@ pub fn run_score_job(
     let mut cache = if opts.no_cache {
         None
     } else {
-        match crate::cache::ScoreCache::open_in(dir, &opts.cache_path, crate::config::analysis_fingerprint(cfg, engine.is_enabled()), true)
-        {
+        match crate::cache::ScoreCache::open_in(
+            &paths.state_dir,
+            &opts.cache_path,
+            crate::config::analysis_fingerprint(cfg, engine.is_enabled()),
+            true,
+        ) {
             Ok(c) => c,
             Err(err) => {
                 on_event(ScoreEvent::Info(format!("缓存不可用（本次不使用）: {err:#}")));
@@ -522,7 +552,7 @@ pub fn run_score_job(
     // 分析（并行；进度经回调）
     let total_jpg = entries.iter().filter(|e| !e.is_raw).count();
     let cache_rows = cache.as_ref().map(|c| c.rows());
-    let outcome = analyze_jpgs(dir, &entries, &engine, cache_rows, cfg, &|done, total| {
+    let outcome = analyze_jpgs(jpg_root, &entries, &engine, cache_rows, cfg, &|done, total| {
         on_event(ScoreEvent::Progress { done, total });
     });
     on_event(ScoreEvent::Finished {
@@ -541,7 +571,14 @@ pub fn run_score_job(
 
     // 连拍去重（score/review 同一函数 + 同一参数合成）
     let analyzed_count = outcome.results.len();
-    let selection = crate::selection::build(dir, &entries, &outcome.results, cfg, opts.keep_override)?;
+    let selection = crate::selection::build_in(
+        &paths.state_dir,
+        jpg_root,
+        &entries,
+        &outcome.results,
+        cfg,
+        opts.keep_override,
+    )?;
     let burst_members = selection.bursts.values().filter(|i| i.group != 0).count();
     on_event(ScoreEvent::Info(format!(
         "连拍去重: {analyzed_count} 张 JPG 中 {burst_members} 张属于连拍组"
@@ -577,7 +614,7 @@ pub fn run_score_job(
     let unmapped_arw = entries.iter().filter(|e| e.is_raw && e.total_score.is_empty()).count();
     if unmapped_arw > 0 {
         on_event(ScoreEvent::Info(format!(
-            "警告: {unmapped_arw} 张 ARW 无同名 JPG 可映射分数（analysis_ok=false）"
+            "警告: {unmapped_arw} 张 RAW 无同名 JPG 可映射分数（analysis_ok=false）"
         )));
     }
 
@@ -590,7 +627,7 @@ pub fn run_score_job(
         }
     }
 
-    // XMP 侧车（按侧车最终路径去重；跨目录配对两端各一份）
+    // XMP 侧车（仅单目录且显式开启 opts.xmp 时写入源目录）
     if opts.xmp {
         let xmp_mode = if opts.xmp_exposure || cfg.metric.exposure_write_crs {
             crate::output::xmp::XmpWriteMode::ApplySuggestedExposure
@@ -614,7 +651,7 @@ pub fn run_score_job(
             let total = total_score(&r.scores, &cfg.weights);
             let rating = ratings.get(key).map(|r| r.stars).unwrap_or(3);
             match crate::output::xmp::write_sidecar_with_mode(
-                dir, e, &r.scores, total, rating, r.suggested_ev, xmp_mode,
+                jpg_root, e, &r.scores, total, rating, r.suggested_ev, xmp_mode,
             ) {
                 Ok(true) => written += 1,
                 Ok(false) => skipped += 1,
@@ -624,7 +661,7 @@ pub fn run_score_job(
         on_event(ScoreEvent::Info(format!("XMP 侧车写入 {written} 个，跳过 {skipped} 个")));
     }
 
-    crate::output::csv::write_csv_in(dir, &opts.output_csv, &entries, !opts.raw_csv)?;
+    crate::output::csv::write_csv_in(&paths.state_dir, &opts.output_csv, &entries, !opts.raw_csv)?;
     on_event(ScoreEvent::Info(format!("CSV 已写出: {}", opts.output_csv.display())));
 
     Ok(ScoreJobSummary {

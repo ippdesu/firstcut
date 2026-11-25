@@ -65,14 +65,36 @@ pub struct PhotoEntry {
     pub burst_pose: String,
 }
 
-/// 是否为支持的照片文件扩展名
-pub fn is_supported_file(name: &str) -> bool {
-    matches!(extension_of(name).as_str(), "jpg" | "jpeg" | "arw")
+/// 支持的主流相机 RAW 扩展名（全部小写；匹配时大小写不敏感）。
+pub const RAW_EXTENSIONS: &[&str] = &[
+    "arw", // Sony
+    "nef", "nrw", // Nikon
+    "cr2", "cr3", "crw", // Canon
+    "rw2", // Panasonic / Lumix
+    "raf", // Fujifilm
+    "dng", // Leica / Adobe / Ricoh / Hasselblad
+    "orf", // Olympus / OM System
+    "pef", // Pentax
+];
+
+/// 是否为支持的 RAW 扩展名（不含点，大小写不敏感）
+pub fn is_raw_extension(ext: &str) -> bool {
+    RAW_EXTENSIONS.iter().any(|&r| r.eq_ignore_ascii_case(ext))
 }
 
-/// 是否为 RAW 文件
+/// 是否为 JPEG 文件
+pub fn is_jpeg_file(name: &str) -> bool {
+    matches!(extension_of(name).as_str(), "jpg" | "jpeg")
+}
+
+/// 是否为支持的 RAW 文件
 pub fn is_raw_file(name: &str) -> bool {
-    extension_of(name) == "arw"
+    is_raw_extension(&extension_of(name))
+}
+
+/// 是否为支持的照片文件扩展名（JPG/JPEG 或任意受支持的 RAW）
+pub fn is_supported_file(name: &str) -> bool {
+    is_jpeg_file(name) || is_raw_file(name)
 }
 
 /// 小写扩展名（不含点）
@@ -151,9 +173,35 @@ pub fn scan_directory_with_options(dir: &Path, include_raw: bool, skip_processed
     scan_directory_inner(dir, None, include_raw, skip_processed, &|_, _, _| {})
 }
 
-fn load_report_exif(root: &Path, report: &Path) -> Option<(std::time::SystemTime, HashMap<String, PhotoEntry>)> {
+/// 统一工作区扫描（支持单目录，以及双目录/双卡直连模式）。
+pub fn scan_workspace(
+    source: &crate::workspace::WorkspaceSource,
+    state_dir: Option<&Path>,
+    report: Option<&Path>,
+    include_raw: bool,
+    skip_processed: bool,
+    progress: &dyn Fn(&str, usize, usize),
+) -> Result<Vec<PhotoEntry>> {
+    let exif_cache = match (state_dir, report) {
+        (Some(st), Some(rep)) => {
+            progress("读取已有报告", 0, 0);
+            load_report_exif(st, rep)
+        }
+        _ => None,
+    };
+    match source {
+        crate::workspace::WorkspaceSource::Single { root } => {
+            scan_directory_inner(root, exif_cache, include_raw, skip_processed, progress)
+        }
+        crate::workspace::WorkspaceSource::Dual { jpg_root, raw_root } => {
+            scan_dual_directories(jpg_root, raw_root, exif_cache, include_raw, skip_processed, progress)
+        }
+    }
+}
+
+fn load_report_exif(state_root: &Path, report: &Path) -> Option<(std::time::SystemTime, HashMap<String, PhotoEntry>)> {
     use std::io::Read;
-    let file = crate::storage::FileRef::inside(root, report).ok()?.open_read().ok()??;
+    let file = crate::storage::FileRef::at(state_root, report, false).ok()?.open_read().ok()??;
     let meta = file.metadata().ok()?;
     const REPORT_LIMIT: u64 = 128 * 1024 * 1024;
     if meta.len() > REPORT_LIMIT { return None; }
@@ -181,16 +229,14 @@ fn load_report_exif(root: &Path, report: &Path) -> Option<(std::time::SystemTime
     Some((report_time, rows))
 }
 
-fn scan_directory_inner(
+fn collect_files_filtered(
     dir: &Path,
-    exif_cache: Option<(std::time::SystemTime, HashMap<String, PhotoEntry>)>,
-    include_raw: bool,
     skip_processed: bool,
+    accept: &dyn Fn(&str) -> bool,
     progress: &dyn Fn(&str, usize, usize),
-) -> Result<Vec<PhotoEntry>> {
+) -> Result<Vec<PathBuf>> {
     let mut files: Vec<PathBuf> = Vec::new();
     let mut walker = walkdir::WalkDir::new(dir).follow_links(false).into_iter();
-    progress("查找照片文件", 0, 0);
     while let Some(entry) = walker.next() {
         let entry = entry?;
         if entry.depth() > 0 && entry.file_name().to_string_lossy().eq_ignore_ascii_case(CACHE_DIR_NAME) {
@@ -224,13 +270,30 @@ fn scan_directory_inner(
             // exactly one file. Don't alias a lossy display name.
             let Some(name) = entry.file_name().to_str() else { continue; };
             if entry.path().to_str().is_none() { continue; }
-            if is_supported_file(name) && (include_raw || !is_raw_file(name)) {
+            if accept(name) {
                 files.push(entry.path().to_path_buf());
                 if files.len() % 100 == 0 { progress("查找照片文件", files.len(), 0); }
             }
         }
     }
     files.sort();
+    Ok(files)
+}
+
+fn scan_directory_inner(
+    dir: &Path,
+    exif_cache: Option<(std::time::SystemTime, HashMap<String, PhotoEntry>)>,
+    include_raw: bool,
+    skip_processed: bool,
+    progress: &dyn Fn(&str, usize, usize),
+) -> Result<Vec<PhotoEntry>> {
+    progress("查找照片文件", 0, 0);
+    let files = collect_files_filtered(
+        dir,
+        skip_processed,
+        &|name| is_supported_file(name) && (include_raw || !is_raw_file(name)),
+        progress,
+    )?;
     progress("读取照片元数据", 0, files.len());
 
     // ---- 配对解析（两步：同目录优先，无歧义时跨目录兜底）----
@@ -308,6 +371,218 @@ fn scan_directory_inner(
         .collect();
 
     Ok(entries)
+}
+
+fn scan_dual_directories(
+    jpg_root: &Path,
+    raw_root: &Path,
+    exif_cache: Option<(std::time::SystemTime, HashMap<String, PhotoEntry>)>,
+    include_raw: bool,
+    skip_processed: bool,
+    progress: &dyn Fn(&str, usize, usize),
+) -> Result<Vec<PhotoEntry>> {
+    progress("查找照片文件", 0, 0);
+    let jpg_files = collect_files_filtered(jpg_root, skip_processed, &is_jpeg_file, progress)?;
+    let raw_files = if include_raw {
+        collect_files_filtered(raw_root, skip_processed, &is_raw_file, progress)?
+    } else {
+        Vec::new()
+    };
+    let total_files = jpg_files.len() + raw_files.len();
+    progress("读取照片元数据", 0, total_files);
+
+    let rel_dir_lower = |root: &Path, file: &Path| -> String {
+        file.strip_prefix(root)
+            .ok()
+            .and_then(|rel| rel.parent())
+            .map(|p| p.to_string_lossy().replace('\\', "/").trim_matches('/').to_ascii_lowercase())
+            .unwrap_or_default()
+    };
+
+    let read_entry = |root: &Path, path: &Path, is_raw: bool, done_idx: usize| -> PhotoEntry {
+        let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+        let exif = exif_cache
+            .as_ref()
+            .and_then(|(report_time, rows)| {
+                let modified = path.metadata().ok()?.modified().ok()?;
+                if modified > *report_time {
+                    return None;
+                }
+                let old = rows.get(&path.display().to_string())?;
+                Some(PhotoEntry {
+                    date_time_original: old.date_time_original.clone(),
+                    camera_make: old.camera_make.clone(),
+                    camera_model: old.camera_model.clone(),
+                    lens_model: old.lens_model.clone(),
+                    iso: old.iso.clone(),
+                    f_number: old.f_number.clone(),
+                    shutter_speed: old.shutter_speed.clone(),
+                    focal_length: old.focal_length.clone(),
+                    ..Default::default()
+                })
+            })
+            .unwrap_or_else(|| read_exif(root, path));
+        if (done_idx + 1) % 25 == 0 || done_idx + 1 == total_files {
+            progress("读取照片元数据", done_idx + 1, total_files);
+        }
+        PhotoEntry {
+            path: path.display().to_string(),
+            extension: extension_of(&name),
+            filename: name,
+            is_raw,
+            ..exif
+        }
+    };
+
+    let mut jpg_entries: Vec<PhotoEntry> = jpg_files
+        .iter()
+        .enumerate()
+        .map(|(i, p)| read_entry(jpg_root, p, false, i))
+        .collect();
+    let mut raw_entries: Vec<PhotoEntry> = raw_files
+        .iter()
+        .enumerate()
+        .map(|(i, p)| read_entry(raw_root, p, true, jpg_files.len() + i))
+        .collect();
+
+    let jpg_keys: Vec<(String, String, String)> = jpg_files
+        .iter()
+        .zip(jpg_entries.iter())
+        .map(|(p, e)| {
+            (
+                rel_dir_lower(jpg_root, p),
+                stem_of(&e.filename),
+                e.date_time_original.trim().to_string(),
+            )
+        })
+        .collect();
+    let raw_keys: Vec<(String, String, String)> = raw_files
+        .iter()
+        .zip(raw_entries.iter())
+        .map(|(p, e)| {
+            (
+                rel_dir_lower(raw_root, p),
+                stem_of(&e.filename),
+                e.date_time_original.trim().to_string(),
+            )
+        })
+        .collect();
+
+    let (jpg_resolved, raw_resolved) = resolve_dual_pairs(&jpg_keys, &raw_keys);
+    for (entry, (pair_id, paired)) in jpg_entries.iter_mut().zip(jpg_resolved.into_iter()) {
+        entry.pair_id = pair_id;
+        entry.has_pair = paired;
+    }
+    for (entry, (pair_id, paired)) in raw_entries.iter_mut().zip(raw_resolved.into_iter()) {
+        entry.pair_id = pair_id;
+        entry.has_pair = paired;
+    }
+
+    let mut combined = Vec::with_capacity(jpg_entries.len() + raw_entries.len());
+    combined.extend(jpg_entries);
+    combined.extend(raw_entries);
+    combined.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(combined)
+}
+
+/// 双目录三级配对解析（纯函数，便于单元测试）：
+/// 输入 `(rel_dir_lower, stem_lower, datetime_trimmed)`：
+/// 1. 同相对子目录 + 同主干唯一配对（防 `9999 -> 0001` 回绕）；
+/// 2. 剩余条目中全树唯一主干跨目录兜底（兼容两张卡 `100MSDCF` / `104MSDCF` 目录号不同）；
+/// 3. 仍有同名歧义时，用 `stem + 非空 EXIF DateTimeOriginal` 精确唯一配对；其余保持不配对。
+fn resolve_dual_pairs(
+    jpgs: &[(String, String, String)],
+    raws: &[(String, String, String)],
+) -> (Vec<(String, bool)>, Vec<(String, bool)>) {
+    let mut jpg_out: Vec<Option<(String, bool)>> = vec![None; jpgs.len()];
+    let mut raw_out: Vec<Option<(String, bool)>> = vec![None; raws.len()];
+
+    // Level 1: (rel_dir, stem)
+    let mut jpg_by_dir_stem: HashMap<(&str, &str), Vec<usize>> = HashMap::new();
+    let mut raw_by_dir_stem: HashMap<(&str, &str), Vec<usize>> = HashMap::new();
+    for (i, (dir, stem, _)) in jpgs.iter().enumerate() {
+        jpg_by_dir_stem.entry((dir.as_str(), stem.as_str())).or_default().push(i);
+    }
+    for (i, (dir, stem, _)) in raws.iter().enumerate() {
+        raw_by_dir_stem.entry((dir.as_str(), stem.as_str())).or_default().push(i);
+    }
+    for ((dir, stem), j_idxs) in &jpg_by_dir_stem {
+        if j_idxs.len() == 1 {
+            if let Some(r_idxs) = raw_by_dir_stem.get(&(*dir, *stem)) {
+                if r_idxs.len() == 1 {
+                    let pair_id = format!("dual|{dir}|{stem}");
+                    jpg_out[j_idxs[0]] = Some((pair_id.clone(), true));
+                    raw_out[r_idxs[0]] = Some((pair_id, true));
+                }
+            }
+        }
+    }
+
+    // Level 2: unique remaining stem across both trees
+    let mut jpg_by_stem: HashMap<&str, Vec<usize>> = HashMap::new();
+    let mut raw_by_stem: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (i, (_, stem, _)) in jpgs.iter().enumerate() {
+        if jpg_out[i].is_none() {
+            jpg_by_stem.entry(stem.as_str()).or_default().push(i);
+        }
+    }
+    for (i, (_, stem, _)) in raws.iter().enumerate() {
+        if raw_out[i].is_none() {
+            raw_by_stem.entry(stem.as_str()).or_default().push(i);
+        }
+    }
+    for (stem, j_idxs) in &jpg_by_stem {
+        if j_idxs.len() == 1 {
+            if let Some(r_idxs) = raw_by_stem.get(stem) {
+                if r_idxs.len() == 1 {
+                    let ji = j_idxs[0];
+                    let ri = r_idxs[0];
+                    let pair_id = format!("dual|{}|{stem}", jpgs[ji].0);
+                    jpg_out[ji] = Some((pair_id.clone(), true));
+                    raw_out[ri] = Some((pair_id, true));
+                }
+            }
+        }
+    }
+
+    // Level 3: unique (stem, non-empty DateTimeOriginal) among remaining
+    let mut jpg_by_dt: HashMap<(&str, &str), Vec<usize>> = HashMap::new();
+    let mut raw_by_dt: HashMap<(&str, &str), Vec<usize>> = HashMap::new();
+    for (i, (_, stem, dt)) in jpgs.iter().enumerate() {
+        if jpg_out[i].is_none() && !dt.is_empty() {
+            jpg_by_dt.entry((stem.as_str(), dt.as_str())).or_default().push(i);
+        }
+    }
+    for (i, (_, stem, dt)) in raws.iter().enumerate() {
+        if raw_out[i].is_none() && !dt.is_empty() {
+            raw_by_dt.entry((stem.as_str(), dt.as_str())).or_default().push(i);
+        }
+    }
+    for ((stem, _), j_idxs) in &jpg_by_dt {
+        if j_idxs.len() == 1 {
+            if let Some(r_idxs) = raw_by_dt.get(&(*stem, jpgs[j_idxs[0]].2.as_str())) {
+                if r_idxs.len() == 1 {
+                    let ji = j_idxs[0];
+                    let ri = r_idxs[0];
+                    let pair_id = format!("dual|{}|{stem}", jpgs[ji].0);
+                    jpg_out[ji] = Some((pair_id.clone(), true));
+                    raw_out[ri] = Some((pair_id, true));
+                }
+            }
+        }
+    }
+
+    let jpg_final = jpg_out
+        .into_iter()
+        .enumerate()
+        .map(|(i, res)| res.unwrap_or_else(|| (format!("jpg|{}|{}", jpgs[i].0, jpgs[i].1), false)))
+        .collect();
+    let raw_final = raw_out
+        .into_iter()
+        .enumerate()
+        .map(|(i, res)| res.unwrap_or_else(|| (format!("raw|{}|{}", raws[i].0, raws[i].1), false)))
+        .collect();
+    (jpg_final, raw_final)
 }
 
 /// 配对解析（纯函数，便于单元测试）
@@ -539,5 +814,84 @@ mod tests {
         let direct_entries = scan_directory(&selected).unwrap();
         assert_eq!(direct_entries.len(), 2);
         assert!(direct_entries.iter().all(|e| e.has_pair));
+    }
+
+    #[test]
+    fn multi_brand_raw_extensions_are_recognized_case_insensitively() {
+        for ext in [
+            "ARW", "arw", "NEF", "nef", "NRW", "nrw", "CR2", "CR3", "crw", "RW2", "RAF", "DNG",
+            "ORF", "PEF",
+        ] {
+            let name = format!("IMG_0001.{ext}");
+            assert!(is_raw_file(&name), "应识别 RAW 扩展名: {name}");
+            assert!(is_supported_file(&name));
+            assert!(!is_jpeg_file(&name));
+        }
+        assert!(is_jpeg_file("IMG_0001.JPG"));
+        assert!(is_jpeg_file("img.jpeg"));
+        assert!(!is_raw_file("IMG_0001.JPG"));
+        assert!(!is_supported_file("notes.xmp"));
+    }
+
+    #[test]
+    fn dual_pairs_three_levels_handle_rollover_cross_folder_and_exif_disambiguation() {
+        let jpgs = vec![
+            // Level 1: 同子目录同主干（即便回绕重名也能各自正确配对）
+            ("100msdcf".into(), "dsc0001".into(), "2026:11:25 10:00:00".into()),
+            ("101msdcf".into(), "dsc0001".into(), "2026:11:25 12:00:00".into()),
+            // Level 2: 两张卡子目录不同，但主干全局唯一
+            ("100msdcf".into(), "dsc0002".into(), "".into()),
+            // Level 3: 子目录不同且回绕重名，依靠 EXIF DateTimeOriginal 唯一消歧
+            ("102msdcf".into(), "dsc0003".into(), "2026:11:25 13:00:00".into()),
+            ("103msdcf".into(), "dsc0003".into(), "2026:11:25 14:00:00".into()),
+            // 仍无法消歧（无 EXIF）：保持不配对
+            ("104msdcf".into(), "dsc0004".into(), "".into()),
+        ];
+        let raws = vec![
+            ("100msdcf".into(), "dsc0001".into(), "2026:11:25 10:00:00".into()),
+            ("101msdcf".into(), "dsc0001".into(), "2026:11:25 12:00:00".into()),
+            ("200msdcf".into(), "dsc0002".into(), "".into()),
+            ("300msdcf".into(), "dsc0003".into(), "2026:11:25 14:00:00".into()),
+            ("301msdcf".into(), "dsc0003".into(), "2026:11:25 13:00:00".into()),
+            ("400msdcf".into(), "dsc0004".into(), "".into()),
+            ("401msdcf".into(), "dsc0004".into(), "".into()),
+        ];
+        let (jr, rr) = resolve_dual_pairs(&jpgs, &raws);
+        // Level 1
+        assert_eq!(jr[0].0, rr[0].0);
+        assert_eq!(jr[1].0, rr[1].0);
+        assert_ne!(jr[0].0, jr[1].0);
+        // Level 2
+        assert!(jr[2].1 && rr[2].1);
+        assert_eq!(jr[2].0, rr[2].0);
+        // Level 3（注意 raws[3] 时间 14:00 对应 jpgs[4]，raws[4] 时间 13:00 对应 jpgs[3]）
+        assert!(jr[3].1 && rr[4].1);
+        assert_eq!(jr[3].0, rr[4].0);
+        assert!(jr[4].1 && rr[3].1);
+        assert_eq!(jr[4].0, rr[3].0);
+        assert_ne!(jr[3].0, jr[4].0);
+        // Ambiguous without EXIF stays unpaired
+        assert!(!jr[5].1 && !rr[5].1 && !rr[6].1);
+    }
+
+    #[test]
+    fn scan_workspace_dual_isolates_formats_per_card() {
+        let temp = tempfile::tempdir().unwrap();
+        let jpg_card = temp.path().join("jpg_card");
+        let raw_card = temp.path().join("raw_card");
+        std::fs::create_dir_all(jpg_card.join("100MSDCF")).unwrap();
+        std::fs::create_dir_all(raw_card.join("104MSDCF")).unwrap();
+        std::fs::write(jpg_card.join("100MSDCF/IMG_0001.JPG"), b"jpg").unwrap();
+        // 故意在 JPG 卡放一个 RAW、RAW 卡放一个 JPG，验证双目录严格按角色过滤
+        std::fs::write(jpg_card.join("100MSDCF/WRONG.NEF"), b"wrong-raw").unwrap();
+        std::fs::write(raw_card.join("104MSDCF/IMG_0001.CR3"), b"raw").unwrap();
+        std::fs::write(raw_card.join("104MSDCF/WRONG.JPG"), b"wrong-jpg").unwrap();
+
+        let source = crate::workspace::WorkspaceSource::dual(&jpg_card, &raw_card).unwrap();
+        let entries = scan_workspace(&source, None, None, true, true, &|_, _, _| {}).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().all(|e| e.has_pair));
+        assert!(entries.iter().any(|e| !e.is_raw && e.filename == "IMG_0001.JPG"));
+        assert!(entries.iter().any(|e| e.is_raw && e.filename == "IMG_0001.CR3"));
     }
 }

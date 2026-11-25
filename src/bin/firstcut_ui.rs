@@ -12,17 +12,8 @@ fn main() {
         return;
     }
 
-    let root = std::env::args_os().nth(1).map(PathBuf::from).or_else(|| {
-        rfd::FileDialog::new()
-            .set_title("选择照片目录（若 JPG 和 RAW 分开放置，请选择同时包含两者的上级目录）")
-            .pick_folder()
-    });
-
-    let Some(root) = root else {
-        return;
-    };
-
-    if let Err(error) = run_review(&root) {
+    let initial_root = std::env::args_os().nth(1).map(PathBuf::from);
+    if let Err(error) = run_review(initial_root.as_deref()) {
         rfd::MessageDialog::new()
             .set_title("firstcut 启动失败")
             .set_description(format!("无法启动照片复核界面：\n\n{error:#}"))
@@ -53,16 +44,13 @@ fn already_running() -> bool {
 }
 
 #[cfg(windows)]
-fn run_review(root: &std::path::Path) -> anyhow::Result<()> {
-    anyhow::ensure!(root.is_dir(), "选择的路径不是目录：{}", root.display());
-    let root = pic_process::review::normal_photo_root(root)?;
+fn run_review(initial_root: Option<&std::path::Path>) -> anyhow::Result<()> {
+    if let Some(root) = initial_root {
+        anyhow::ensure!(root.is_dir(), "选择的路径不是目录：{}", root.display());
+    }
     use_model_directory_beside_executable()?;
 
-    pic_process::review::serve_ui(&root, || {
-        rfd::FileDialog::new()
-            .set_title("选择已评分的照片目录")
-            .pick_folder()
-    })?;
+    pic_process::review::serve_ui_app(initial_root)?;
     Ok(())
 }
 

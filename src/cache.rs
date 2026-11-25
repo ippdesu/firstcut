@@ -58,6 +58,9 @@ impl ScoreCache {
     }
 
     pub(crate) fn open_in(root: &Path, path: &Path, cfg_hash: i64, write: bool) -> Result<Option<Self>> {
+        if write {
+            crate::storage::Folder::open_or_create_explicit(root, true)?;
+        }
         let destination = match crate::storage::FileRef::at(root, path, write) {
             Ok(file) => file,
             Err(err) if !write && err.kind() == std::io::ErrorKind::NotFound => return Ok(None),

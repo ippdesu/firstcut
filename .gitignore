@@ -35,3 +35,4 @@
 
 # Local conversation context; never publish with the source tree.
 /memory.md
+/.firstcut-data/

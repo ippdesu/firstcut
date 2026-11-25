@@ -188,6 +188,25 @@
   #contextMenu button{display:block;width:100%;border:0;border-radius:4px;background:transparent;color:var(--fg);padding:8px 10px;text-align:left;font:inherit;cursor:pointer;white-space:nowrap}
   #contextMenu button:hover{background:#333}
   #contextMenu button:disabled{color:var(--dim);cursor:default}
+  /* ---- Web 欢迎入口页 ---- */
+  #welcomePanel{max-width:760px;margin:36px auto;padding:24px;background:var(--panel);border:1px solid var(--line);border-radius:10px}
+  #welcomePanel h2{margin:0 0 6px;font-size:18px}
+  #welcomePanel .sub{color:var(--dim);font-size:13px;line-height:1.5;margin:0 0 16px}
+  .w-tabs{display:flex;gap:8px;margin-bottom:16px}
+  .w-tab{flex:1;padding:10px 12px;background:#161616;border:1px solid var(--line);border-radius:6px;color:var(--fg);cursor:pointer;font-size:13px;font-weight:600;text-align:center}
+  .w-tab.on{background:#213622;border-color:var(--acc);color:#fff}
+  .w-card{background:#161616;border:1px solid var(--line);border-radius:8px;padding:14px}
+  .w-pick-row{display:flex;align-items:center;gap:10px;margin:10px 0;flex-wrap:wrap}
+  .w-pick-path{flex:1;min-width:200px;background:#101010;border:1px solid var(--line);border-radius:4px;padding:7px 10px;font-size:12px;color:var(--dim);word-break:break-all}
+  .w-pick-path.ok{color:var(--fg);border-color:#3a5f3b}
+  .w-recent{margin-top:20px;padding-top:14px;border-top:1px solid var(--line)}
+  .w-recent h3{margin:0 0 10px;font-size:13px;color:var(--dim)}
+  .w-recent-item{display:flex;align-items:center;gap:10px;padding:10px;background:#161616;border:1px solid var(--line);border-radius:6px;margin-bottom:8px;flex-wrap:wrap}
+  .w-recent-meta{flex:1;min-width:220px}
+  .w-badge{display:inline-block;font-size:11px;padding:1px 6px;border-radius:4px;background:#263238;color:#90caf9;margin-right:6px}
+  .w-badge.dual{background:#1b3a24;color:#a5d6a7}
+  .w-badge.off{background:#4a2323;color:#ef9a9a}
+  .w-recent-path{font-size:12px;margin-top:4px;word-break:break-all}
 </style>
 </head>
 <body>
@@ -201,14 +220,54 @@
   </div>
 </header>
 <div id="sidebarBackdrop" hidden></div>
+<section id="welcomePanel" hidden aria-labelledby="welcomeTitle">
+  <h2 id="welcomeTitle">选择照片工作区</h2>
+  <p class="sub">所有评分缓存、缩略图与人工星级均保存在本机应用数据目录，<b>不会向相机存储卡或原片目录写入任何文件</b>。选片完成后再通过「导出」把需要的 JPG / RAW / XMP 复制到处理目录。</p>
+  <div class="w-tabs" role="tablist">
+    <button type="button" class="w-tab on" id="wTabSingle" role="tab" aria-selected="true">单目录（相册 / 单卡）</button>
+    <button type="button" class="w-tab" id="wTabDual" role="tab" aria-selected="false">双目录 / 双卡直连（JPG + RAW）</button>
+  </div>
+  <div id="wSinglePane" class="w-card">
+    <div class="dim">适合 JPG 与 RAW 在同一主目录下（支持 JPG/、RAW/ 等多级子目录；兼容 ARW / NEF / CR2 / CR3 / RW2 / RAF / DNG 等）。</div>
+    <div class="w-pick-row">
+      <button type="button" class="btn" id="wPickSingle">选择照片文件夹…</button>
+      <div class="w-pick-path" id="wSinglePath">尚未选择文件夹</div>
+    </div>
+    <label style="display:flex;align-items:center;gap:6px;font-size:12px;margin:8px 0;cursor:pointer">
+      <input type="checkbox" id="wSingleIncludeRaw" checked> 关联同名 RAW 原片（关闭后仅扫描与导出 JPG）
+    </label>
+    <div style="display:flex;justify-content:flex-end;margin-top:10px">
+      <button type="button" class="btn primary" id="wOpenSingle" disabled>打开工作区</button>
+    </div>
+  </div>
+  <div id="wDualPane" class="w-card" hidden>
+    <div class="dim">适合双卡槽相机分别插入 JPG 卡与 RAW 卡直接选片，无需预先把全卡复制到本机硬盘；自动按子目录与 EXIF 时间精确配对。</div>
+    <div class="w-pick-row">
+      <button type="button" class="btn" id="wPickJpg">选择 JPG 文件夹…</button>
+      <div class="w-pick-path" id="wDualJpgPath">尚未选择 JPG 文件夹</div>
+    </div>
+    <div class="w-pick-row">
+      <button type="button" class="btn" id="wPickRaw">选择 RAW 文件夹…</button>
+      <div class="w-pick-path" id="wDualRawPath">尚未选择 RAW 文件夹</div>
+    </div>
+    <div style="display:flex;justify-content:flex-end;margin-top:10px">
+      <button type="button" class="btn primary" id="wOpenDual" disabled>打开双目录工作区</button>
+    </div>
+  </div>
+  <div class="w-recent" id="wRecentSection" hidden>
+    <h3>最近工作区</h3>
+    <div id="wRecentList"></div>
+  </div>
+</section>
 <div id="layout">
   <aside id="filterSidebar">
     <div id="asideMobileHead"><span>筛选与评分</span><button id="sidebarClose" type="button" aria-label="关闭筛选侧栏">关闭</button></div>
     <div id="folderBlock" hidden>
-      <button class="btn" id="chooseFolder">选择照片目录…</button>
-      <label title="关闭后仅载入和评分 JPG/JPEG，不关联或写入 RAW"><input type="checkbox" id="includeRaw"> 关联同名 RAW 照片</label>
+      <button class="btn" id="chooseFolder">切换工作区 / 返回入口</button>
+      <label id="includeRawRow" title="关闭后仅载入和评分 JPG/JPEG，不关联或导出 RAW"><input type="checkbox" id="includeRaw"> 关联同名 RAW 照片</label>
+      <div class="dim" id="readonlyBadge" style="margin-top:4px">源目录只读保护 · 状态保存在本机</div>
       <details class="side-section compact" id="directoryHelp"><summary>目录说明</summary>
-        <div class="dim">活动根目录可包含 JPG/、RAW/；Processed/ 子目录默认跳过。关闭关联后只处理 JPG。</div>
+        <div class="dim">支持单目录（含 JPG/、RAW/ 等子目录）或双目录直连（JPG 卡 + RAW 卡）；Processed/ 子目录默认跳过。兼容 ARW / NEF / CR2 / CR3 / RW2 / RAF / DNG 等 RAW。</div>
       </details>
     </div>
     <h3>搜索</h3>
@@ -244,8 +303,6 @@
     </select>
     <h3>评分</h3>
     <div id="runBlock">
-      <label><input type="checkbox" id="runXmp" checked> 跑批后写 XMP 侧车</label>
-      <label title="仅对尚无 Adobe 曝光参数的侧车写入建议 EV（crs:Exposure2012），绝不覆盖或删除已有的 Lightroom 人工曝光"><input type="checkbox" id="runXmpExposure"> 写入建议曝光到 Adobe 开发参数</label>
       <label><input type="checkbox" id="runNoAi"> 跳过 AI（纯像素快速）</label>
       <div style="display:flex;gap:6px;margin-top:6px">
         <button class="btn primary" id="runBtn" style="flex:1">▶ 重新评分</button>
@@ -255,7 +312,7 @@
       <div id="runBarWrap"><div id="runBar"></div></div>
       <div class="dim" id="runState" style="display:none"></div>
       <pre id="runLog"></pre>
-      <div class="dim">任务日志保存在照片目录的 .firstcut/review.log，文件上限 256 KiB。</div>
+      <div class="dim">缓存、星级与日志均保存在本机工作区目录（源目录零写入）；XMP 侧车在导出时自动生成或合并。</div>
     </div>
     <details class="side-section" id="usageHelp"><summary>使用说明</summary>
       <div class="dim">点击卡片看 1:1 原图（滚轮缩放 / 拖拽平移 / 双击复位 / ←→ 组内切换 / Esc 关闭）。连拍组内可在灯箱勾选 2~4 张进入同步缩放对比。</div>
@@ -293,7 +350,7 @@
   <div class="top">
     <span id="lbName"></span>
     <span class="meta" id="lbMeta"></span>
-    <span class="starbtns" id="lbStars" title="点击改星（快捷键 1~5），写入 XMP 侧车"></span>
+    <span class="starbtns" id="lbStars" title="点击改星（快捷键 1~5），保存在本机并在导出时合并进 XMP"></span>
     <button id="lbCompare">并排对比</button>
     <span id="lbZoom" role="status" aria-live="polite" title="相对于照片适配窗格尺寸的缩放倍率">缩放 100%</span>
     <button id="lbHistogramToggle" aria-expanded="true">直方图</button>
@@ -355,18 +412,19 @@
         <button class="btn" type="button" id="exportPickFolder" hidden>选择其他文件夹…</button>
       </div>
       <div class="row" id="exportExternalRow" hidden>
-        <span class="dim">外部目标：</span>
-        <code id="exportExternalPath" style="font-size:12px;word-break:break-all"></code>
+        <span class="dim">导出目标：</span>
+        <code id="exportExternalPath" style="font-size:12px;word-break:break-all">尚未选择本机目录</code>
+        <button class="btn" type="button" id="exportPickFolderDual" hidden>选择导出目录…</button>
         <button class="btn" type="button" id="exportUseSubdir">改回相册子目录</button>
       </div>
-      <div class="dim">严格非破坏增量复制：跳过大小与时间一致的已有文件，绝不删除目标目录任何既有文件，保护你在 PS/ACR 修改过的 XMP；相册内导出自动写 `.firstcut-export` 防止下次重复扫入。</div>
+      <div class="dim">严格非破坏增量复制：跳过大小与时间一致的已有文件，绝不删除目标目录任何既有文件，保护你在 PS/ACR 修改过的 XMP；导出时将本机最新星级合并写入目标 XMP。</div>
     </div>
     <div class="grp">
       <b>文件类型与目录布局</b>
       <div class="row">
         <label class="chk"><input type="checkbox" id="exportJpg" checked> JPG</label>
-        <label class="chk"><input type="checkbox" id="exportRaw" checked> RAW (ARW)</label>
-        <label class="chk"><input type="checkbox" id="exportXmp" checked> XMP 侧车（已有原样复制，无侧车自动生成）</label>
+        <label class="chk"><input type="checkbox" id="exportRaw" checked> RAW 原片（ARW / NEF / CR2 / CR3 / RW2 / RAF / DNG 等）</label>
+        <label class="chk"><input type="checkbox" id="exportXmp" checked> XMP 侧车（合并最新星级并保护已有 Adobe 曝光）</label>
       </div>
       <div class="row">
         <label class="chk" title="仅对原目录尚无侧车、本次在导出目录新生成的 XMP 生效；原目录已有侧车一律原样复制"><input type="checkbox" id="exportXmpExposure"> 新建 XMP 附带 Adobe 建议曝光（crs:Exposure2012）</label>
@@ -401,7 +459,7 @@
 </div>
 <div id="toast"></div>
 <div id="contextMenu" role="menu" aria-label="照片快捷筛选"></div>
-<div id="serviceStopped" hidden>服务已关闭。再次双击 firstcut-ui.exe 可选择照片目录并打开。</div>
+<div id="serviceStopped" hidden>服务已关闭。再次双击 firstcut-ui.exe 即可打开工作区入口。</div>
 <div id="missingScores" hidden>
   <div class="box" role="dialog" aria-modal="true" aria-labelledby="missingScoresTitle">
     <strong id="missingScoresTitle">没有找到可用评分</strong>

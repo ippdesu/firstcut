@@ -88,14 +88,24 @@ pub struct BurstJson {
 #[derive(Debug, Clone, Serialize)]
 pub struct Snapshot {
     pub root: String,
+    pub source_mode: String,
+    pub jpg_root: String,
+    pub raw_root: Option<String>,
     pub weights: WeightsJson,
     pub photos: Vec<PhotoJson>,
 }
 
 impl Snapshot {
     pub fn empty(root: &Path, cfg: &ScoreConfig) -> Self {
+        Self::empty_for_source(&crate::workspace::WorkspaceSource::Single { root: root.to_path_buf() }, cfg)
+    }
+
+    pub fn empty_for_source(source: &crate::workspace::WorkspaceSource, cfg: &ScoreConfig) -> Self {
         Self {
-            root: root.display().to_string(),
+            root: source.display_label(),
+            source_mode: source.mode_str().to_string(),
+            jpg_root: source.jpg_root().display().to_string(),
+            raw_root: source.is_dual().then(|| source.raw_root().display().to_string()),
             weights: WeightsJson {
                 sharpness: cfg.weights.sharpness,
                 exposure: cfg.weights.exposure,
@@ -121,8 +131,25 @@ pub fn build_snapshot_with_options(root: &Path, cfg: &ScoreConfig, cache_path: &
     scene_feedback: &HashMap<String, SceneFeedbackRecord>, include_raw: bool,
     skip_processed: bool,
     progress: &dyn Fn(&str, usize, usize)) -> anyhow::Result<Snapshot> {
-    let entries = scan::scan_review_directory(
-        root, &root.join(".firstcut").join("report.csv"), include_raw, skip_processed, progress)?;
+    let source = crate::workspace::WorkspaceSource::Single { root: root.to_path_buf() };
+    let paths = crate::workspace::WorkspacePaths::in_state_dir(root.join(".firstcut"));
+    build_snapshot_for_workspace(
+        &source, &paths, cfg, cache_path, scene_feedback, include_raw, skip_processed, progress,
+    )
+}
+
+pub fn build_snapshot_for_workspace(
+    source: &crate::workspace::WorkspaceSource,
+    paths: &crate::workspace::WorkspacePaths,
+    cfg: &ScoreConfig,
+    cache_path: &Path,
+    scene_feedback: &HashMap<String, SceneFeedbackRecord>,
+    include_raw: bool,
+    skip_processed: bool,
+    progress: &dyn Fn(&str, usize, usize),
+) -> anyhow::Result<Snapshot> {
+    let entries = scan::scan_workspace(
+        source, Some(&paths.state_dir), Some(&paths.report), include_raw, skip_processed, progress)?;
     progress("匹配评分缓存", 0, entries.len());
     let pixel_hash = crate::config::analysis_fingerprint(cfg, false);
     let ai_hash = crate::config::analysis_fingerprint(cfg, true);
@@ -130,10 +157,11 @@ pub fn build_snapshot_with_options(root: &Path, cfg: &ScoreConfig, cache_path: &
         .ok()
         .map(|_| crate::config::legacy_ai_fingerprint(cfg));
 
+    let jpg_root = source.jpg_root();
     // 打开缓存并按「size+mtime+version+cfg_hash」过滤出本次可用的分析结果
     let mut analyzed: HashMap<String, AnalysisResult> = HashMap::new();
     let mut mode_by_pair: HashMap<String, bool> = HashMap::new();
-    let cache = match ScoreCache::open_in(root, cache_path, pixel_hash, false) {
+    let cache = match ScoreCache::open_in(&paths.state_dir, cache_path, pixel_hash, false) {
         Ok(c) => c,
         Err(err) => {
             super::quiet_log(format!("[review] 警告: 缓存不可用（{err:#}），全部照片将显示为未评分"));
@@ -144,7 +172,7 @@ pub fn build_snapshot_with_options(root: &Path, cfg: &ScoreConfig, cache_path: &
         for (index, e) in entries.iter().filter(|e| !e.is_raw).enumerate() {
             if index % 50 == 0 { progress("匹配评分缓存", index, entries.len()); }
             let full = Path::new(&e.path);
-            let Some((size, mtime)) = crate::storage::FileRef::inside(root, full).ok()
+            let Some((size, mtime)) = source.file_ref_for_photo(false, full).ok()
                 .and_then(|file| file.open_read().ok().flatten())
                 .and_then(|file| file.metadata().ok())
                 .and_then(|meta| cache::metadata_fingerprint(&meta)) else {
@@ -165,7 +193,7 @@ pub fn build_snapshot_with_options(root: &Path, cfg: &ScoreConfig, cache_path: &
                 }
             };
             if let Some((row, _)) =
-                cache::find_matching(c.rows(), root, &e.path, |row| classify(row).is_some())
+                cache::find_matching(c.rows(), jpg_root, &e.path, |row| classify(row).is_some())
             {
                 if let Some(is_ai) = classify(row) {
                     analyzed.insert(e.pair_id().to_string(), row.result);
@@ -176,13 +204,13 @@ pub fn build_snapshot_with_options(root: &Path, cfg: &ScoreConfig, cache_path: &
     }
 
     progress("计算星级与连拍", 0, entries.len());
-    let selection = crate::selection::build(root, &entries, &analyzed, cfg, None)?;
+    let selection = crate::selection::build_in(&paths.state_dir, jpg_root, &entries, &analyzed, cfg, None)?;
 
     let mut photos: Vec<PhotoJson> = entries
         .iter()
         .map(|e| {
             let analyzed_result = analyzed.get(e.pair_id());
-            let rel = rel_path(root, Path::new(&e.path));
+            let rel = source.photo_rel(e.is_raw, Path::new(&e.path));
             let ai_mode = mode_by_pair.get(e.pair_id()) == Some(&true);
             PhotoJson {
                 path: rel.clone(),
@@ -229,7 +257,10 @@ pub fn build_snapshot_with_options(root: &Path, cfg: &ScoreConfig, cache_path: &
     progress("准备页面数据", entries.len(), entries.len());
 
     Ok(Snapshot {
-        root: root.display().to_string(),
+        root: source.display_label(),
+        source_mode: source.mode_str().to_string(),
+        jpg_root: jpg_root.display().to_string(),
+        raw_root: source.is_dual().then(|| source.raw_root().display().to_string()),
         weights: WeightsJson {
             sharpness: cfg.weights.sharpness,
             exposure: cfg.weights.exposure,
@@ -258,6 +289,7 @@ fn scene_hint(analysis: Option<&AnalysisResult>, ai_mode: bool) -> SceneHintJson
 
 
 /// 绝对/相对路径 → 相对 root 的正斜杠路径（越界时退回完整路径展示）
+#[cfg(test)]
 fn rel_path(root: &Path, p: &Path) -> String {
     let path = p.strip_prefix(root).unwrap_or(p).to_string_lossy();
     #[cfg(windows)]

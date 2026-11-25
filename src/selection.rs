@@ -24,10 +24,21 @@ pub fn build(
     cfg: &ScoreConfig,
     keep_override: Option<usize>,
 ) -> Result<SelectionResult> {
+    build_in(&root.join(".firstcut"), root, entries, analyzed, cfg, keep_override)
+}
+
+pub fn build_in(
+    state_dir: &Path,
+    jpg_root: &Path,
+    entries: &[PhotoEntry],
+    analyzed: &HashMap<String, AnalysisResult>,
+    cfg: &ScoreConfig,
+    keep_override: Option<usize>,
+) -> Result<SelectionResult> {
     let dedup = crate::config::effective_dedup(keep_override, cfg);
     let algo_bursts = score::analyze_photo_bursts(entries, analyzed, &dedup, &cfg.weights);
-    let manual_bursts = decision::load_burst_overrides(root)?;
-    let bursts = decision::effective_bursts(root, entries, &algo_bursts, &manual_bursts)?;
+    let manual_bursts = decision::load_bursts_in(state_dir)?;
+    let bursts = decision::effective_bursts_checked(jpg_root, entries, &algo_bursts, &manual_bursts)?;
     let totals: Vec<(String, f64)> = analyzed
         .iter()
         .map(|(key, result)| {
@@ -38,7 +49,7 @@ pub fn build(
         })
         .collect();
     let recommended = xmp::assign_ratings(&totals, &cfg.metric);
-    let manual = decision::load(root)?;
-    let ratings = decision::effective_ratings(root, entries, &recommended, &manual)?;
+    let manual = decision::load_ratings_in(state_dir)?;
+    let ratings = decision::effective_ratings_checked(jpg_root, entries, &recommended, &manual)?;
     Ok(SelectionResult { bursts, ratings })
 }

@@ -38,7 +38,7 @@ KKKACiiigAooooAKKKKAP//Z
 """
 
 
-def check(port, token, album):
+def check(port, token, album, data_dir):
     origin = f"http://127.0.0.1:{port}"
     opener = build_opener(ProxyHandler({}))
 
@@ -97,20 +97,27 @@ def check(port, token, album):
         raise AssertionError("scoring did not finish")
     _, body = request("/api/photos", 200, session=session)
     assert json.loads(body)["photos"][0]["scores"] is not None
-    assert (album / ".firstcut" / "report.csv").is_file(), "scoring report was not persisted"
+    assert not (album / ".firstcut").exists(), "source album must remain zero-write"
+    reports = list(data_dir.glob("workspaces/*/report.csv"))
+    assert len(reports) == 1 and reports[0].is_file(), "scoring report was not persisted in local data dir"
     print("Verified: authenticated review, JPEG responses, rescoring, and persisted report.")
 
 
-def run(port, album, binary):
+def run(port, album, data_dir, binary):
     token = secrets.token_hex(32)
     origin = f"http://127.0.0.1:{port}"
-    env = {**os.environ, "FIRSTCUT_ACCESS_TOKEN": token, "FIRSTCUT_PUBLIC_URL": origin}
+    env = {
+        **os.environ,
+        "FIRSTCUT_ACCESS_TOKEN": token,
+        "FIRSTCUT_PUBLIC_URL": origin,
+        "FIRSTCUT_DATA_DIR": str(data_dir),
+    }
     with subprocess.Popen(
         [str(binary.resolve()), "review", str(album), "--port", str(port), "--no-browser"],
         env=env,
     ) as process:
         try:
-            check(port, token, album)
+            check(port, token, album, data_dir)
         finally:
             process.terminate()
             try:
@@ -128,9 +135,13 @@ def main():
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
     with tempfile.TemporaryDirectory(prefix="firstcut-smoke-") as temp:
-        album = Path(temp).resolve()
+        base = Path(temp).resolve()
+        album = base / "album"
+        data_dir = base / "data"
+        album.mkdir()
+        data_dir.mkdir()
         (album / "sample.jpg").write_bytes(base64.b64decode(SAMPLE))
-        run(port, album, args.binary)
+        run(port, album, data_dir, args.binary)
 
 
 if __name__ == "__main__":
