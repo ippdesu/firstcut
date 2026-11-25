@@ -635,3 +635,70 @@ fn legacy_decisions_import_backfills_fingerprints_and_blocks_swapped_card_inheri
         "无法确认来源的旧记录应保留在数据库中，只是不自动应用"
     );
 }
+
+#[test]
+fn swapped_card_importing_burst_json_does_not_bind_previous_card_orphan_rating() {
+    let temp = tempfile::tempdir().unwrap();
+    let mount = temp.path().join("mount");
+    let state = temp.path().join("state");
+    std::fs::create_dir_all(mount.join(".firstcut")).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+
+    // 卡 A：1 条在卡 A 上找不到原照片的人工 1 星旧记录，且卡 A 没有 burst-overrides.json
+    save_jpeg_with_exif_datetime(&mount.join("DSC00001.JPG"), [30, 40, 50], "2026:11:25 10:00:00");
+    {
+        let conn = rusqlite::Connection::open(mount.join(".firstcut/decisions.sqlite")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE manual_rating (
+                photo_path TEXT PRIMARY KEY,
+                stars INTEGER NOT NULL CHECK(stars BETWEEN 1 AND 5)
+            );
+            INSERT INTO manual_rating (photo_path, stars) VALUES ('MISSING.JPG', 1);",
+        )
+        .unwrap();
+    }
+
+    let source = pic_process::workspace::WorkspaceSource::single(&mount).unwrap();
+    let paths = pic_process::workspace::WorkspacePaths::in_state_dir(state);
+    pic_process::workspace::import_legacy_state_if_needed(&source, &paths).unwrap();
+
+    // 换卡 B 到同一挂载路径：卡 B 只有旧版 burst-overrides.json（没有 decisions.sqlite），且刚好有同名 MISSING.JPG
+    std::fs::remove_file(mount.join(".firstcut/decisions.sqlite")).unwrap();
+    std::fs::write(
+        mount.join(".firstcut/burst-overrides.json"),
+        r#"{"MISSING.JPG": true}"#,
+    )
+    .unwrap();
+    save_jpeg_with_exif_datetime(&mount.join("MISSING.JPG"), [210, 220, 230], "2026:11:25 15:00:00");
+
+    pic_process::workspace::import_legacy_state_if_needed(&source, &paths).unwrap();
+
+    let cfg = ScoreConfig::default();
+    let opts = score::ScoreJobOptions {
+        output_csv: paths.report.clone(),
+        raw_csv: false,
+        cache_path: paths.cache.clone(),
+        no_cache: false,
+        no_ai: true,
+        xmp: false,
+        xmp_exposure: false,
+        gpu: false,
+        keep_override: None,
+        include_raw: false,
+        skip_processed: true,
+    };
+    score::run_score_job_in_workspace(&source, &paths, &cfg, &opts, &|_| {}).unwrap();
+
+    let report = std::fs::read_to_string(&paths.report).unwrap();
+    assert!(
+        !report.contains(",\"manual\","),
+        "导入卡 B 的 burst-overrides.json 时绝不能把卡 A 遗留的空指纹人工 1 星绑定到卡 B 同名照片: {report}"
+    );
+    let stored = pic_process::decision::load_ratings_in(&paths.state_dir).unwrap();
+    assert!(
+        stored
+            .get("MISSING.JPG")
+            .is_some_and(|rows| rows.iter().any(|(fp, stars)| fp.is_empty() && *stars == 1)),
+        "卡 A 无法确认来源的空指纹人工 1 星应保持未绑定状态: {stored:?}"
+    );
+}

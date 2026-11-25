@@ -300,7 +300,8 @@ pub fn import_legacy_state_if_needed(
     };
     let state_folder = paths.ensure_state_dir()?;
 
-    let mut imported_decisions = false;
+    let mut imported_decisions_db = false;
+    let mut imported_burst_json = false;
     for db_name in ["cache.sqlite", "decisions.sqlite"] {
         if state_folder
             .file(db_name)
@@ -323,7 +324,7 @@ pub fn import_legacy_state_if_needed(
         {
             let _ = state_folder.file(db_name)?.write(&bytes);
             if db_name == "decisions.sqlite" {
-                imported_decisions = true;
+                imported_decisions_db = true;
             }
         }
     }
@@ -349,13 +350,18 @@ pub fn import_legacy_state_if_needed(
         {
             let _ = state_folder.file(small_name)?.write(&bytes);
             if small_name == "burst-overrides.json" {
-                imported_decisions = true;
+                imported_burst_json = true;
             }
         }
     }
 
-    if imported_decisions {
-        crate::decision::backfill_fingerprints_in(&paths.state_dir, root)?;
+    if imported_decisions_db || imported_burst_json {
+        crate::decision::backfill_imported_decisions_in(
+            &paths.state_dir,
+            root,
+            imported_decisions_db,
+            imported_burst_json,
+        )?;
     }
 
     Ok(())

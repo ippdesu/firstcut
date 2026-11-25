@@ -376,7 +376,11 @@ pub fn set_burst_keep_in(
         for (legacy_path, legacy_keep) in legacy_map {
             let legacy_fp = photo_fingerprint(jpg_root, &legacy_path).unwrap_or_default();
             tx.execute(
-                "INSERT OR IGNORE INTO manual_burst_keep(photo_path, photo_fp, keep) VALUES (?1, ?2, ?3)",
+                "INSERT OR IGNORE INTO manual_burst_keep(photo_path, photo_fp, keep)
+                 SELECT ?1, ?2, ?3
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM manual_burst_keep WHERE photo_path = ?1 AND photo_fp = ''
+                 )",
                 rusqlite::params![legacy_path, legacy_fp, i64::from(legacy_keep)],
             )?;
         }
@@ -419,6 +423,20 @@ pub fn set_burst_keep_in(
 /// 从原相册导入旧版 `decisions.sqlite` / `burst-overrides.json` 后，按原相册照片补齐内容指纹；
 /// 无法读取照片的旧记录保留在数据库中（`photo_fp = ''`），但绝不在后续匹配中自动应用。
 pub fn backfill_fingerprints_in(state_dir: &Path, jpg_root: &Path) -> Result<()> {
+    backfill_imported_decisions_in(state_dir, jpg_root, true, true)
+}
+
+/// 仅对本次从当前相册新导入的文件执行指纹补齐/迁移（避免导入新卡的 `burst-overrides.json` 时
+/// 意外把旧卡遗留的空指纹记录绑定到新卡同名照片），且严格先迁移 SQLite 再导入 JSON 以维持 SQLite 优先。
+pub fn backfill_imported_decisions_in(
+    state_dir: &Path,
+    jpg_root: &Path,
+    backfill_db_rows: bool,
+    import_burst_json: bool,
+) -> Result<()> {
+    if !backfill_db_rows && !import_burst_json {
+        return Ok(());
+    }
     let state = match Folder::open_or_create_explicit(state_dir, false) {
         Ok(dir) => dir,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -426,7 +444,7 @@ pub fn backfill_fingerprints_in(state_dir: &Path, jpg_root: &Path) -> Result<()>
     };
     let has_db = state.file(DECISIONS_DB)?.open_read()?.is_some();
     let has_legacy_json = state.file(LEGACY_BURST_JSON)?.open_read()?.is_some();
-    if !has_db && !has_legacy_json {
+    if !(backfill_db_rows && has_db) && !(import_burst_json && has_legacy_json) {
         return Ok(());
     }
     let mut db = Database::open(state.file(DECISIONS_DB)?, true)?
@@ -438,13 +456,69 @@ pub fn backfill_fingerprints_in(state_dir: &Path, jpg_root: &Path) -> Result<()>
     ensure_schema(&db.conn)?;
     let mut changed = upgraded_schema;
 
-    if !is_burst_json_migrated(&db.conn)? && has_legacy_json {
+    // Step A: 先为本次导入的 SQLite 空指纹记录补齐指纹，确保同照片在后续 JSON 导入时已占位（维持 SQLite 优先）
+    if backfill_db_rows && has_db {
+        let rating_rows: Vec<(String, u8)> = {
+            let mut stmt = db
+                .conn
+                .prepare("SELECT photo_path, stars FROM manual_rating WHERE photo_fp = ''")?;
+            let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, u8>(1)?)))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let burst_rows: Vec<(String, i64)> = {
+            let mut stmt = db
+                .conn
+                .prepare("SELECT photo_path, keep FROM manual_burst_keep WHERE photo_fp = ''")?;
+            let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        if !rating_rows.is_empty() || !burst_rows.is_empty() {
+            let tx = db.conn.transaction()?;
+            for (path, stars) in rating_rows {
+                if let Ok(fp) = photo_fingerprint(jpg_root, &path) {
+                    tx.execute(
+                        "INSERT INTO manual_rating(photo_path, photo_fp, stars) VALUES (?1, ?2, ?3)
+                         ON CONFLICT(photo_path, photo_fp) DO NOTHING",
+                        rusqlite::params![&path, &fp, stars],
+                    )?;
+                    tx.execute(
+                        "DELETE FROM manual_rating WHERE photo_path = ?1 AND photo_fp = ''",
+                        [&path],
+                    )?;
+                    changed = true;
+                }
+            }
+            for (path, keep) in burst_rows {
+                if let Ok(fp) = photo_fingerprint(jpg_root, &path) {
+                    tx.execute(
+                        "INSERT INTO manual_burst_keep(photo_path, photo_fp, keep) VALUES (?1, ?2, ?3)
+                         ON CONFLICT(photo_path, photo_fp) DO NOTHING",
+                        rusqlite::params![&path, &fp, keep],
+                    )?;
+                    tx.execute(
+                        "DELETE FROM manual_burst_keep WHERE photo_path = ?1 AND photo_fp = ''",
+                        [&path],
+                    )?;
+                    changed = true;
+                }
+            }
+            tx.commit()?;
+        }
+    }
+
+    // Step B: 再导入本次的 burst-overrides.json（跳过 SQLite 已存在同指纹或空指纹的记录）
+    if import_burst_json && has_legacy_json && !is_burst_json_migrated(&db.conn)? {
         let legacy_map = load_legacy_burst_json(&state)?;
         let tx = db.conn.transaction()?;
         for (legacy_path, legacy_keep) in legacy_map {
             let fp = photo_fingerprint(jpg_root, &legacy_path).unwrap_or_default();
             tx.execute(
-                "INSERT OR IGNORE INTO manual_burst_keep(photo_path, photo_fp, keep) VALUES (?1, ?2, ?3)",
+                "INSERT OR IGNORE INTO manual_burst_keep(photo_path, photo_fp, keep)
+                 SELECT ?1, ?2, ?3
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM manual_burst_keep WHERE photo_path = ?1 AND photo_fp = ''
+                 )",
                 rusqlite::params![legacy_path, fp, i64::from(legacy_keep)],
             )?;
         }
@@ -454,54 +528,6 @@ pub fn backfill_fingerprints_in(state_dir: &Path, jpg_root: &Path) -> Result<()>
         )?;
         tx.commit()?;
         changed = true;
-    }
-
-    let rating_rows: Vec<(String, u8)> = {
-        let mut stmt = db
-            .conn
-            .prepare("SELECT photo_path, stars FROM manual_rating WHERE photo_fp = ''")?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, u8>(1)?)))?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()?
-    };
-    let burst_rows: Vec<(String, i64)> = {
-        let mut stmt = db
-            .conn
-            .prepare("SELECT photo_path, keep FROM manual_burst_keep WHERE photo_fp = ''")?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()?
-    };
-
-    if !rating_rows.is_empty() || !burst_rows.is_empty() {
-        let tx = db.conn.transaction()?;
-        for (path, stars) in rating_rows {
-            if let Ok(fp) = photo_fingerprint(jpg_root, &path) {
-                tx.execute(
-                    "INSERT INTO manual_rating(photo_path, photo_fp, stars) VALUES (?1, ?2, ?3)
-                     ON CONFLICT(photo_path, photo_fp) DO NOTHING",
-                    rusqlite::params![&path, &fp, stars],
-                )?;
-                tx.execute(
-                    "DELETE FROM manual_rating WHERE photo_path = ?1 AND photo_fp = ''",
-                    [&path],
-                )?;
-                changed = true;
-            }
-        }
-        for (path, keep) in burst_rows {
-            if let Ok(fp) = photo_fingerprint(jpg_root, &path) {
-                tx.execute(
-                    "INSERT INTO manual_burst_keep(photo_path, photo_fp, keep) VALUES (?1, ?2, ?3)
-                     ON CONFLICT(photo_path, photo_fp) DO NOTHING",
-                    rusqlite::params![&path, &fp, keep],
-                )?;
-                tx.execute(
-                    "DELETE FROM manual_burst_keep WHERE photo_path = ?1 AND photo_fp = ''",
-                    [&path],
-                )?;
-                changed = true;
-            }
-        }
-        tx.commit()?;
     }
 
     if changed {
@@ -946,5 +972,60 @@ mod tests {
         let stored_ratings = load_ratings_in(&state).unwrap();
         assert!(!stored_ratings["DSC00001.JPG"].iter().any(|(fp, _)| fp.is_empty()));
         assert!(!stored_ratings["DSC00001.JPG"].iter().any(|(_, s)| *s == 5));
+    }
+
+    #[test]
+    fn migration_preserves_sqlite_priority_over_legacy_burst_json() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("album");
+        let state = temp.path().join("state");
+        std::fs::create_dir_all(root.join("JPG")).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        let photo = root.join("JPG/a.jpg");
+        std::fs::write(&photo, b"same-photo-bytes").unwrap();
+
+        // 旧版 2 列 SQLite 标为「舍弃 (0)」，旧版 burst-overrides.json 标为「保留 (true)」
+        {
+            let conn = rusqlite::Connection::open(state.join("decisions.sqlite")).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE manual_burst_keep (
+                    photo_path TEXT PRIMARY KEY,
+                    keep INTEGER NOT NULL CHECK(keep IN (0, 1))
+                );
+                INSERT INTO manual_burst_keep (photo_path, keep) VALUES ('JPG/a.jpg', 0);",
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            state.join("burst-overrides.json"),
+            r#"{"JPG/a.jpg": true}"#,
+        )
+        .unwrap();
+
+        // 迁移前：SQLite 优先 => false
+        assert_eq!(load_burst_overrides_in(&state).unwrap().get("JPG/a.jpg"), Some(&false));
+
+        // 执行迁移并补齐指纹
+        backfill_imported_decisions_in(&state, &root, true, true).unwrap();
+
+        let entries = vec![PhotoEntry {
+            path: photo.display().to_string(),
+            pair_id: "p1".into(),
+            ..Default::default()
+        }];
+        let algo = HashMap::from([(
+            "p1".into(),
+            BurstInfo {
+                group: 1,
+                size: 2,
+                rank: 1,
+                keep: true,
+                pose_cluster: 1,
+            },
+        )]);
+        let eff = effective_bursts_checked(&root, &entries, &algo, &load_bursts_in(&state).unwrap())
+            .unwrap();
+        assert!(!eff["p1"].keep, "迁移后必须延续 SQLite（舍弃）优先于 JSON（保留）的规则");
+        assert_eq!(eff["p1"].manual_keep, Some(false));
     }
 }
