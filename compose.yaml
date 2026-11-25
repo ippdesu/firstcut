@@ -7,12 +7,17 @@ services:
     environment:
       FIRSTCUT_ACCESS_TOKEN: ${FIRSTCUT_ACCESS_TOKEN:?Generate a random access token and set it in .env}
       FIRSTCUT_PUBLIC_URL: ${FIRSTCUT_PUBLIC_URL:-http://127.0.0.1:8787}
+      FIRSTCUT_DATA_DIR: /app/data
+      FIRSTCUT_WORKSPACE_KEY: ${PHOTO_DIR:?Set PHOTO_DIR in .env to your activity photo directory}
     ports:
       - "127.0.0.1:8787:8787"
     volumes:
       - type: bind
         source: ${PHOTO_DIR:?Set PHOTO_DIR in .env to your activity photo directory}
         target: /photos
+      - type: bind
+        source: ${DATA_DIR:?Set DATA_DIR in .env to a writable host directory for firstcut state}
+        target: /app/data
       - type: bind
         source: ${MODEL_DIR:-./models}
         target: /app/models

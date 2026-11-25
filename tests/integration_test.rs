@@ -514,3 +514,50 @@ fn dual_folder_multi_brand_raw_and_zero_source_write_end_to_end() {
         .unwrap()
         .contains("<xmp:Rating>5</xmp:Rating>"));
 }
+
+#[test]
+fn swapped_card_rescore_does_not_inherit_previous_manual_rating() {
+    let temp = tempfile::tempdir().unwrap();
+    let mount = temp.path().join("mount");
+    let state = temp.path().join("state");
+    std::fs::create_dir_all(&mount).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+
+    let photo = mount.join("DSC00001.JPG");
+    save_jpeg_with_exif_datetime(&photo, [20, 40, 60], "2026:11:25 10:00:00");
+
+    let source = pic_process::workspace::WorkspaceSource::single(&mount).unwrap();
+    let paths = pic_process::workspace::WorkspacePaths::in_state_dir(state);
+    paths.ensure_state_dir().unwrap();
+    let cfg = ScoreConfig::default();
+    let opts = score::ScoreJobOptions {
+        output_csv: paths.report.clone(),
+        raw_csv: false,
+        cache_path: paths.cache.clone(),
+        no_cache: false,
+        no_ai: true,
+        xmp: false,
+        xmp_exposure: false,
+        gpu: false,
+        keep_override: None,
+        include_raw: false,
+        skip_processed: true,
+    };
+
+    score::run_score_job_in_workspace(&source, &paths, &cfg, &opts, &|_| {}).unwrap();
+    pic_process::decision::set_in(&paths.state_dir, source.jpg_root(), &photo, 1).unwrap();
+
+    // 换卡后同路径写入另一张完全不同的照片并重新评分
+    save_jpeg_with_exif_datetime(&photo, [230, 220, 210], "2026:11:25 14:30:00");
+    score::run_score_job_in_workspace(&source, &paths, &cfg, &opts, &|_| {}).unwrap();
+
+    let report = std::fs::read_to_string(&paths.report).unwrap();
+    assert!(
+        report.contains(",\"5\",\"algorithm\","),
+        "换卡重评分后应按新照片重新给星，不得继承旧卡的人工 1 星: {report}"
+    );
+    assert!(
+        !report.contains(",\"manual\","),
+        "换卡后不应出现 manual 覆盖记录: {report}"
+    );
+}

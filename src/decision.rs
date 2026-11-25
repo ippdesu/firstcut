@@ -2,18 +2,25 @@
 //! `.firstcut/decisions.sqlite`（并兼容读取/单向迁移旧版 `.firstcut/burst-overrides.json`）。
 
 use std::collections::HashMap;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use rusqlite::Connection;
+use sha2::{Digest, Sha256};
 
 use crate::dedup::BurstInfo;
 use crate::scan::PhotoEntry;
-use crate::storage::{Database, Folder};
+use crate::storage::{Database, FileRef, Folder};
 
 const DECISIONS_DB: &str = "decisions.sqlite";
 const LEGACY_BURST_JSON: &str = "burst-overrides.json";
 const META_BURST_JSON_MIGRATED: &str = "burst_json_migrated";
+const FINGERPRINT_SLICE_BYTES: usize = 64 * 1024;
+
+/// 人工决定映射：相对路径 → `Vec<(photo_fp, value)>`。
+/// `photo_fp` 为空串表示历史无指纹记录（仅当没有精确指纹匹配时才兼容回退）。
+pub type DecisionMap<T> = HashMap<String, Vec<(String, T)>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RatingSource {
@@ -66,21 +73,100 @@ fn relative_key(root: &Path, photo: &Path) -> Result<String> {
     Ok(relative)
 }
 
+fn photo_fingerprint(root: &Path, rel_key: &str) -> Option<String> {
+    let mut file = FileRef::inside(root, &root.join(rel_key))
+        .ok()?
+        .open_read()
+        .ok()??;
+    let len = file.metadata().ok()?.len();
+    let mut hasher = Sha256::new();
+    hasher.update(len.to_le_bytes());
+    let mut buf = [0u8; FINGERPRINT_SLICE_BYTES];
+    let head_target = usize::try_from(len.min(FINGERPRINT_SLICE_BYTES as u64)).unwrap_or(FINGERPRINT_SLICE_BYTES);
+    let mut read_head = 0usize;
+    while read_head < head_target {
+        let n = file.read(&mut buf[read_head..head_target]).ok()?;
+        if n == 0 {
+            break;
+        }
+        read_head += n;
+    }
+    hasher.update(&buf[..read_head]);
+    if len > FINGERPRINT_SLICE_BYTES as u64 {
+        file.seek(SeekFrom::Start(len - FINGERPRINT_SLICE_BYTES as u64)).ok()?;
+        let mut read_tail = 0usize;
+        while read_tail < FINGERPRINT_SLICE_BYTES {
+            let n = file.read(&mut buf[read_tail..]).ok()?;
+            if n == 0 {
+                break;
+            }
+            read_tail += n;
+        }
+        hasher.update(&buf[..read_tail]);
+    }
+    Some(format!("v1:{len}:{:x}", hasher.finalize()))
+}
+
+fn has_column(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
+    let pragma = format!("PRAGMA table_info({table})");
+    let mut stmt = conn.prepare(&pragma)?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        if row.get::<_, String>(1).is_ok_and(|name| name == column) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS manual_rating (
-            photo_path TEXT PRIMARY KEY,
-            stars INTEGER NOT NULL CHECK(stars BETWEEN 1 AND 5)
+            photo_path TEXT NOT NULL,
+            photo_fp TEXT NOT NULL DEFAULT '',
+            stars INTEGER NOT NULL CHECK(stars BETWEEN 1 AND 5),
+            PRIMARY KEY (photo_path, photo_fp)
         );
         CREATE TABLE IF NOT EXISTS manual_burst_keep (
-            photo_path TEXT PRIMARY KEY,
-            keep INTEGER NOT NULL CHECK(keep IN (0, 1))
+            photo_path TEXT NOT NULL,
+            photo_fp TEXT NOT NULL DEFAULT '',
+            keep INTEGER NOT NULL CHECK(keep IN (0, 1)),
+            PRIMARY KEY (photo_path, photo_fp)
         );
         CREATE TABLE IF NOT EXISTS decision_meta (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
         );",
-    )
+    )?;
+    if !has_column(conn, "manual_rating", "photo_fp")? {
+        conn.execute_batch(
+            "CREATE TABLE manual_rating_v2 (
+                photo_path TEXT NOT NULL,
+                photo_fp TEXT NOT NULL DEFAULT '',
+                stars INTEGER NOT NULL CHECK(stars BETWEEN 1 AND 5),
+                PRIMARY KEY (photo_path, photo_fp)
+            );
+            INSERT INTO manual_rating_v2 (photo_path, photo_fp, stars)
+                SELECT photo_path, '', stars FROM manual_rating;
+            DROP TABLE manual_rating;
+            ALTER TABLE manual_rating_v2 RENAME TO manual_rating;",
+        )?;
+    }
+    if !has_column(conn, "manual_burst_keep", "photo_fp")? {
+        conn.execute_batch(
+            "CREATE TABLE manual_burst_keep_v2 (
+                photo_path TEXT NOT NULL,
+                photo_fp TEXT NOT NULL DEFAULT '',
+                keep INTEGER NOT NULL CHECK(keep IN (0, 1)),
+                PRIMARY KEY (photo_path, photo_fp)
+            );
+            INSERT INTO manual_burst_keep_v2 (photo_path, photo_fp, keep)
+                SELECT photo_path, '', keep FROM manual_burst_keep;
+            DROP TABLE manual_burst_keep;
+            ALTER TABLE manual_burst_keep_v2 RENAME TO manual_burst_keep;",
+        )?;
+    }
+    Ok(())
 }
 
 fn table_exists(conn: &Connection, name: &str) -> rusqlite::Result<bool> {
@@ -117,6 +203,14 @@ pub fn load(root: &Path) -> Result<HashMap<String, u8>> {
 }
 
 pub fn load_in(state_dir: &Path) -> Result<HashMap<String, u8>> {
+    let map = load_ratings_in(state_dir)?;
+    Ok(map
+        .into_iter()
+        .filter_map(|(k, v)| v.last().map(|(_, stars)| (k, *stars)))
+        .collect())
+}
+
+pub fn load_ratings_in(state_dir: &Path) -> Result<DecisionMap<u8>> {
     let state = match Folder::open_or_create_explicit(state_dir, false) {
         Ok(dir) => dir,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
@@ -128,10 +222,27 @@ pub fn load_in(state_dir: &Path) -> Result<HashMap<String, u8>> {
     if !table_exists(&db.conn, "manual_rating")? {
         return Ok(HashMap::new());
     }
-    let mut stmt = db.conn.prepare("SELECT photo_path, stars FROM manual_rating")?;
-    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, u8>(1)?)))?;
-    rows.collect::<rusqlite::Result<HashMap<_, _>>>()
-        .map_err(Into::into)
+    let mut out: DecisionMap<u8> = HashMap::new();
+    if has_column(&db.conn, "manual_rating", "photo_fp")? {
+        let mut stmt = db
+            .conn
+            .prepare("SELECT photo_path, photo_fp, stars FROM manual_rating")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, u8>(2)?))
+        })?;
+        for row in rows {
+            let (path, fp, stars) = row?;
+            out.entry(path).or_default().push((fp, stars));
+        }
+    } else {
+        let mut stmt = db.conn.prepare("SELECT photo_path, stars FROM manual_rating")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, u8>(1)?)))?;
+        for row in rows {
+            let (path, stars) = row?;
+            out.entry(path).or_default().push((String::new(), stars));
+        }
+    }
+    Ok(out)
 }
 
 pub fn set(root: &Path, jpg: &Path, stars: u8) -> Result<()> {
@@ -141,15 +252,24 @@ pub fn set(root: &Path, jpg: &Path, stars: u8) -> Result<()> {
 pub fn set_in(state_dir: &Path, jpg_root: &Path, jpg: &Path, stars: u8) -> Result<()> {
     anyhow::ensure!((1..=5).contains(&stars), "星级必须在 1~5");
     let key = relative_key(jpg_root, jpg)?;
+    let fp = photo_fingerprint(jpg_root, &key).unwrap_or_default();
     let state = Folder::open_or_create_explicit(state_dir, true)?;
     let mut db = Database::open(state.file(DECISIONS_DB)?, true)?
         .context("人工评分数据库不可用")?;
     ensure_schema(&db.conn)?;
-    db.conn.execute(
-        "INSERT INTO manual_rating(photo_path, stars) VALUES (?1, ?2)
-        ON CONFLICT(photo_path) DO UPDATE SET stars=excluded.stars",
-        rusqlite::params![key, stars],
+    let tx = db.conn.transaction()?;
+    tx.execute(
+        "INSERT INTO manual_rating(photo_path, photo_fp, stars) VALUES (?1, ?2, ?3)
+        ON CONFLICT(photo_path, photo_fp) DO UPDATE SET stars=excluded.stars",
+        rusqlite::params![key, fp, stars],
     )?;
+    if !fp.is_empty() {
+        tx.execute(
+            "DELETE FROM manual_rating WHERE photo_path = ?1 AND photo_fp = ''",
+            [&key],
+        )?;
+    }
+    tx.commit()?;
     db.save()
 }
 
@@ -162,27 +282,55 @@ pub fn load_burst_overrides(root: &Path) -> Result<HashMap<String, bool>> {
 }
 
 pub fn load_burst_overrides_in(state_dir: &Path) -> Result<HashMap<String, bool>> {
+    let map = load_bursts_in(state_dir)?;
+    Ok(map
+        .into_iter()
+        .filter_map(|(k, v)| v.last().map(|(_, keep)| (k, *keep)))
+        .collect())
+}
+
+pub fn load_bursts_in(state_dir: &Path) -> Result<DecisionMap<bool>> {
     let state = match Folder::open_or_create_explicit(state_dir, false) {
         Ok(dir) => dir,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
         Err(err) => return Err(err.into()),
     };
-    let mut out = HashMap::new();
+    let mut out: DecisionMap<bool> = HashMap::new();
     let mut migrated = false;
     if let Some(db) = Database::open(state.file(DECISIONS_DB)?, false)? {
         migrated = is_burst_json_migrated(&db.conn)?;
         if table_exists(&db.conn, "manual_burst_keep")? {
-            let mut stmt = db.conn.prepare("SELECT photo_path, keep FROM manual_burst_keep")?;
-            let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? != 0)))?;
-            for row in rows {
-                let (path, keep) = row?;
-                out.insert(path, keep);
+            if has_column(&db.conn, "manual_burst_keep", "photo_fp")? {
+                let mut stmt = db
+                    .conn
+                    .prepare("SELECT photo_path, photo_fp, keep FROM manual_burst_keep")?;
+                let rows = stmt.query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)? != 0,
+                    ))
+                })?;
+                for row in rows {
+                    let (path, fp, keep) = row?;
+                    out.entry(path).or_default().push((fp, keep));
+                }
+            } else {
+                let mut stmt = db.conn.prepare("SELECT photo_path, keep FROM manual_burst_keep")?;
+                let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? != 0)))?;
+                for row in rows {
+                    let (path, keep) = row?;
+                    out.entry(path).or_default().push((String::new(), keep));
+                }
             }
         }
     }
     if !migrated {
         for (path, keep) in load_legacy_burst_json(&state)? {
-            out.entry(path).or_insert(keep);
+            let entries = out.entry(path).or_default();
+            if entries.is_empty() {
+                entries.push((String::new(), keep));
+            }
         }
     }
     Ok(out)
@@ -203,6 +351,7 @@ pub fn set_burst_keep_in(
     keep: Option<bool>,
 ) -> Result<()> {
     let key = relative_key(jpg_root, jpg)?;
+    let fp = photo_fingerprint(jpg_root, &key).unwrap_or_default();
     let state = Folder::open_or_create_explicit(state_dir, true)?;
     let mut db = Database::open(state.file(DECISIONS_DB)?, true)?
         .context("人工评分数据库不可用")?;
@@ -216,7 +365,7 @@ pub fn set_burst_keep_in(
     if let Some(legacy_map) = legacy {
         for (legacy_path, legacy_keep) in legacy_map {
             tx.execute(
-                "INSERT OR IGNORE INTO manual_burst_keep(photo_path, keep) VALUES (?1, ?2)",
+                "INSERT OR IGNORE INTO manual_burst_keep(photo_path, photo_fp, keep) VALUES (?1, '', ?2)",
                 rusqlite::params![legacy_path, i64::from(legacy_keep)],
             )?;
         }
@@ -228,20 +377,50 @@ pub fn set_burst_keep_in(
     match keep {
         Some(val) => {
             tx.execute(
-                "INSERT INTO manual_burst_keep(photo_path, keep) VALUES (?1, ?2)
-                 ON CONFLICT(photo_path) DO UPDATE SET keep = excluded.keep",
-                rusqlite::params![key, i64::from(val)],
+                "INSERT INTO manual_burst_keep(photo_path, photo_fp, keep) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(photo_path, photo_fp) DO UPDATE SET keep = excluded.keep",
+                rusqlite::params![key, fp, i64::from(val)],
             )?;
+            if !fp.is_empty() {
+                tx.execute(
+                    "DELETE FROM manual_burst_keep WHERE photo_path = ?1 AND photo_fp = ''",
+                    [&key],
+                )?;
+            }
         }
         None => {
             tx.execute(
-                "DELETE FROM manual_burst_keep WHERE photo_path = ?1",
-                [key],
+                "DELETE FROM manual_burst_keep WHERE photo_path = ?1 AND photo_fp = ?2",
+                rusqlite::params![key, fp],
             )?;
+            if !fp.is_empty() {
+                tx.execute(
+                    "DELETE FROM manual_burst_keep WHERE photo_path = ?1 AND photo_fp = ''",
+                    [&key],
+                )?;
+            }
         }
     }
     tx.commit()?;
     db.save()
+}
+
+fn match_decision<T: Copy>(root: &Path, key: &str, candidates: &[(String, T)]) -> Option<T> {
+    if candidates.is_empty() {
+        return None;
+    }
+    let current_fp = photo_fingerprint(root, key);
+    if let Some(ref fp) = current_fp {
+        if let Some((_, val)) = candidates.iter().find(|(stored_fp, _)| stored_fp == fp) {
+            return Some(*val);
+        }
+        // 仅回退到历史无指纹记录；若数据库里存有其他非空指纹则绝不误匹配（防换卡串图）
+        return candidates
+            .iter()
+            .find(|(stored_fp, _)| stored_fp.is_empty())
+            .map(|(_, val)| *val);
+    }
+    candidates.last().map(|(_, val)| *val)
 }
 
 /// JPG 的路径是人工决定的身份；配对键只负责把决定映射给同一张 ARW。
@@ -250,6 +429,19 @@ pub fn effective_ratings(
     entries: &[PhotoEntry],
     algorithm: &HashMap<String, u8>,
     manual: &HashMap<String, u8>,
+) -> Result<HashMap<String, EffectiveRating>> {
+    let wrapped: DecisionMap<u8> = manual
+        .iter()
+        .map(|(k, &v)| (k.clone(), vec![(String::new(), v)]))
+        .collect();
+    effective_ratings_checked(root, entries, algorithm, &wrapped)
+}
+
+pub fn effective_ratings_checked(
+    root: &Path,
+    entries: &[PhotoEntry],
+    algorithm: &HashMap<String, u8>,
+    manual: &DecisionMap<u8>,
 ) -> Result<HashMap<String, EffectiveRating>> {
     let mut out: HashMap<String, EffectiveRating> = algorithm
         .iter()
@@ -265,13 +457,15 @@ pub fn effective_ratings(
         .collect();
     for e in entries.iter().filter(|e| !e.is_raw) {
         let key = relative_key(root, Path::new(&e.path))?;
-        if let Some(&stars) = manual.get(&key) {
-            // 未分析的照片仍未评分；人工覆盖只替代已存在的算法建议。
-            if let Some(value) = out.get_mut(e.pair_id()) {
-                *value = EffectiveRating {
-                    stars,
-                    source: RatingSource::Manual,
-                };
+        if let Some(candidates) = manual.get(&key) {
+            if let Some(stars) = match_decision(root, &key, candidates) {
+                // 未分析的照片仍未评分；人工覆盖只替代已存在的算法建议。
+                if let Some(value) = out.get_mut(e.pair_id()) {
+                    *value = EffectiveRating {
+                        stars,
+                        source: RatingSource::Manual,
+                    };
+                }
             }
         }
     }
@@ -286,6 +480,19 @@ pub fn effective_bursts(
     entries: &[PhotoEntry],
     algorithm: &HashMap<String, BurstInfo>,
     manual: &HashMap<String, bool>,
+) -> Result<HashMap<String, EffectiveBurst>> {
+    let wrapped: DecisionMap<bool> = manual
+        .iter()
+        .map(|(k, &v)| (k.clone(), vec![(String::new(), v)]))
+        .collect();
+    effective_bursts_checked(root, entries, algorithm, &wrapped)
+}
+
+pub fn effective_bursts_checked(
+    root: &Path,
+    entries: &[PhotoEntry],
+    algorithm: &HashMap<String, BurstInfo>,
+    manual: &DecisionMap<bool>,
 ) -> Result<HashMap<String, EffectiveBurst>> {
     let mut out: HashMap<String, EffectiveBurst> = algorithm
         .iter()
@@ -306,11 +513,13 @@ pub fn effective_bursts(
         .collect();
     for e in entries.iter().filter(|e| !e.is_raw) {
         let key = relative_key(root, Path::new(&e.path))?;
-        if let Some(&keep) = manual.get(&key) {
-            if let Some(value) = out.get_mut(e.pair_id()) {
-                if value.group > 0 {
-                    value.keep = keep;
-                    value.manual_keep = Some(keep);
+        if let Some(candidates) = manual.get(&key) {
+            if let Some(keep) = match_decision(root, &key, candidates) {
+                if let Some(value) = out.get_mut(e.pair_id()) {
+                    if value.group > 0 {
+                        value.keep = keep;
+                        value.manual_keep = Some(keep);
+                    }
                 }
             }
         }
@@ -465,5 +674,70 @@ mod tests {
         assert_eq!(std::fs::read(&outside).unwrap(), b"leave this file alone");
 
         std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn swapped_card_same_path_does_not_inherit_manual_rating_or_burst_keep() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("mount");
+        let state = temp.path().join("state");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        let photo = root.join("IMG_0001.JPG");
+
+        // 卡 A 写入照片内容并打 1 星 + 手动设为舍弃
+        std::fs::write(&photo, b"card-a-jpeg-bytes-111").unwrap();
+        set_in(&state, &root, &photo, 1).unwrap();
+        set_burst_keep_in(&state, &root, &photo, Some(false)).unwrap();
+
+        let entries = vec![PhotoEntry {
+            path: photo.display().to_string(),
+            pair_id: "p1".into(),
+            ..Default::default()
+        }];
+        let algo_ratings = HashMap::from([("p1".into(), 4)]);
+        let algo_bursts = HashMap::from([(
+            "p1".into(),
+            BurstInfo {
+                group: 1,
+                size: 2,
+                rank: 1,
+                keep: true,
+                pose_cluster: 1,
+            },
+        )]);
+
+        let ratings_a =
+            effective_ratings_checked(&root, &entries, &algo_ratings, &load_ratings_in(&state).unwrap())
+                .unwrap();
+        assert_eq!(ratings_a["p1"].stars, 1);
+        assert_eq!(ratings_a["p1"].source, RatingSource::Manual);
+        let bursts_a =
+            effective_bursts_checked(&root, &entries, &algo_bursts, &load_bursts_in(&state).unwrap())
+                .unwrap();
+        assert!(!bursts_a["p1"].keep);
+        assert_eq!(bursts_a["p1"].manual_keep, Some(false));
+
+        // 换卡 B（同一路径，不同照片内容）——绝不能继承卡 A 的人工 1 星和人工舍弃
+        std::fs::write(&photo, b"card-b-completely-different-photo-2222").unwrap();
+        let ratings_b =
+            effective_ratings_checked(&root, &entries, &algo_ratings, &load_ratings_in(&state).unwrap())
+                .unwrap();
+        assert_eq!(ratings_b["p1"].stars, 4);
+        assert_eq!(ratings_b["p1"].source, RatingSource::Algorithm);
+        let bursts_b =
+            effective_bursts_checked(&root, &entries, &algo_bursts, &load_bursts_in(&state).unwrap())
+                .unwrap();
+        assert!(bursts_b["p1"].keep);
+        assert_eq!(bursts_b["p1"].manual_keep, None);
+
+        // 给卡 B 打 5 星后，换回卡 A 仍能找回卡 A 自己的 1 星
+        set_in(&state, &root, &photo, 5).unwrap();
+        std::fs::write(&photo, b"card-a-jpeg-bytes-111").unwrap();
+        let ratings_a_back =
+            effective_ratings_checked(&root, &entries, &algo_ratings, &load_ratings_in(&state).unwrap())
+                .unwrap();
+        assert_eq!(ratings_a_back["p1"].stars, 1);
+        assert_eq!(ratings_a_back["p1"].source, RatingSource::Manual);
     }
 }

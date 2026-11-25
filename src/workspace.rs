@@ -85,8 +85,21 @@ impl WorkspaceSource {
     }
 
     /// 稳定的 16 位十六进制工作区哈希（Windows 路径大小写不敏感）。
+    ///
+    /// 若设置 `FIRSTCUT_WORKSPACE_KEY`（例如 Docker Compose 传入宿主机 `PHOTO_DIR`），
+    /// 则将其一并纳入哈希，使不同宿主机相册即使挂载到相同的容器路径 `/photos` 也能严格隔离。
     pub fn workspace_id(&self) -> String {
+        let key = workspace_key_override();
+        self.workspace_id_with_key(key.as_deref())
+    }
+
+    pub fn workspace_id_with_key(&self, key_override: Option<&str>) -> String {
         let mut hasher = Sha256::new();
+        if let Some(key) = key_override.and_then(normalize_workspace_key) {
+            hasher.update(b"key\0");
+            hasher.update(key.as_bytes());
+            hasher.update(b"\0");
+        }
         match self {
             Self::Single { root } => {
                 hasher.update(b"single\0");
@@ -159,6 +172,24 @@ pub fn normal_root(root: &Path) -> Result<PathBuf> {
         }
     }
     Ok(absolute)
+}
+
+fn normalize_workspace_key(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let normalized = trimmed.trim_end_matches(['/', '\\']);
+    if normalized.is_empty() {
+        Some("/".to_string())
+    } else {
+        Some(normalized.to_string())
+    }
+}
+
+fn workspace_key_override() -> Option<String> {
+    std::env::var_os("FIRSTCUT_WORKSPACE_KEY")
+        .and_then(|v| v.to_str().and_then(normalize_workspace_key))
 }
 
 fn canonical_key_str(path: &Path) -> String {
@@ -510,5 +541,23 @@ mod tests {
         let after = remove_recent_workspace_at(&base, &first_id).unwrap();
         assert_eq!(after.len(), MAX_RECENT_WORKSPACES - 1);
         assert!(after.iter().all(|e| e.id != first_id));
+    }
+
+    #[test]
+    fn workspace_key_override_isolates_same_mount_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let mount = temp.path().join("photos");
+        std::fs::create_dir_all(&mount).unwrap();
+        let src = WorkspaceSource::single(&mount).unwrap();
+
+        let base_id = src.workspace_id_with_key(None);
+        let id_a = src.workspace_id_with_key(Some("/host/albums/2026-11-concert"));
+        let id_a_slash = src.workspace_id_with_key(Some("/host/albums/2026-11-concert/"));
+        let id_b = src.workspace_id_with_key(Some("/host/albums/2026-11-portrait"));
+
+        assert_eq!(id_a, id_a_slash, "末尾斜杠不应改变工作区隔离键");
+        assert_ne!(id_a, id_b, "相同容器挂载点下不同宿主机相册必须生成不同工作区 ID");
+        assert_ne!(id_a, base_id);
+        assert_eq!(src.workspace_id_with_key(Some("   ")), base_id);
     }
 }

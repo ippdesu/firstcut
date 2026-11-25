@@ -518,6 +518,17 @@ async fn welcome_pick_folder(
     }
 }
 
+fn apply_welcome_single_preferences(
+    source: &WorkspaceSource,
+    paths: &WorkspacePaths,
+    include_raw: bool,
+) {
+    let _ = crate::workspace::import_legacy_state_if_needed(source, paths);
+    let mut prefs = load_ui_preferences_in(&paths.state_dir);
+    prefs.include_raw = include_raw;
+    let _ = save_ui_preferences_in(&paths.state_dir, &prefs);
+}
+
 #[derive(Deserialize)]
 struct WelcomeOpenRequest {
     #[serde(default)]
@@ -575,9 +586,7 @@ async fn welcome_open(
                 };
                 if let Some(inc_raw) = req.include_raw {
                     if let Ok(paths) = WorkspacePaths::for_source(&s) {
-                        let mut prefs = load_ui_preferences_in(&paths.state_dir);
-                        prefs.include_raw = inc_raw;
-                        let _ = save_ui_preferences_in(&paths.state_dir, &prefs);
+                        apply_welcome_single_preferences(&s, &paths, inc_raw);
                     }
                 }
                 s
@@ -2933,5 +2942,35 @@ mod tests {
         assert_eq!(ok_resp.status(), StatusCode::OK);
         let outcome = state.outcome.lock().unwrap().take();
         assert!(matches!(outcome, Some(WelcomeOutcome::Open(WorkspaceSource::Dual { .. }))));
+    }
+
+    #[test]
+    fn welcome_open_imports_legacy_ui_preferences_before_saving_include_raw() {
+        let temp = tempfile::tempdir().unwrap();
+        let album = temp.path().join("legacy_album");
+        let legacy_dir = album.join(".firstcut");
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        let legacy_prefs = legacy_dir.join("ui-preferences.json");
+        std::fs::write(
+            &legacy_prefs,
+            br#"{"include_raw":true,"histogram_sample_percent":22}"#,
+        )
+        .unwrap();
+
+        let source = WorkspaceSource::single(&album).unwrap();
+        let paths = WorkspacePaths::in_state_dir(temp.path().join("local_state"));
+
+        apply_welcome_single_preferences(&source, &paths, false);
+
+        let migrated = load_ui_preferences_in(&paths.state_dir);
+        assert!(!migrated.include_raw);
+        assert_eq!(
+            migrated.histogram_sample_percent, 22,
+            "欢迎页保存 include_raw 前必须先导入旧版 ui-preferences.json，保留原直方图采样比例"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&legacy_prefs).unwrap(),
+            r#"{"include_raw":true,"histogram_sample_percent":22}"#
+        );
     }
 }
