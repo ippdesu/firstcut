@@ -5,7 +5,7 @@
 
 ## 1. 产品边界与交付状态
 
-firstcut 是 Rust 编写的本地照片初筛与复核工具。扫描索尼 JPG+ARW，分析 JPG 的清晰度、曝光、噪点、构图和美学，生成连拍候选，把结果映射给配对 ARW，输出 CSV 与供 Lightroom 使用的 XMP。工具不会删除、移动或修改照片像素；分析和人工反馈留在本机。
+firstcut 是 Rust 编写的本地照片初筛与复核工具。支持单目录或双卡/双目录（`jpg_root` + `raw_root`）扫描多品牌相机 JPG+RAW（索尼 `.arw`、尼康 `.nef`/`.nrw`、佳能 `.cr2`/`.cr3`/`.crw`、松下 `.rw2`、富士 `.raf` 及 `.dng`/`.orf`/`.pef`），分析 JPG 的清晰度、曝光、噪点、构图和美学，生成连拍候选，把结果映射给配对 RAW，输出 CSV 与供 Lightroom 使用的 XMP。工具不会删除、移动或修改照片像素；Web UI 对源照片目录/存储卡保持只读，分析与人工状态统一留在本机数据目录。
 
 | 能力 | 当前状态与边界 |
 |---|---|
@@ -38,28 +38,37 @@ firstcut 是 Rust 编写的本地照片初筛与复核工具。扫描索尼 JPG+
 
 ### 3.1 扫描及 JPG/RAW 配对
 
-选一次拍摄活动的根目录，支持同目录 JPG+ARW，也支持 `JPG/`、`RAW/` 子目录布局。配对先匹配同目录同主干，再对剩余同名且无歧义的 JPG/ARW 跨目录兜底；遇到歧义不猜测，避免相机编号回绕导致错误合并。
+支持两种工作区形态：
+- **单目录模式**：选一次拍摄活动的根目录，支持同目录 JPG+RAW，也支持 `JPG/`、`RAW/` 子目录布局。
+- **双目录/双卡直连模式**：分别指定 `jpg_root` 与 `raw_root`（CLI `--raw-dir` 或 Web 欢迎页双目录标签），在只读挂载/双卡槽场景下直接配对。
 
-“关联同名 RAW 照片”是照片根目录级偏好，UI、CLI `score` 和 `review` 共用；关闭后只处理 JPG。扫描跳过 `.firstcut/`、所选根下的 `Processed/` 输出子树，以及任何包含 `.firstcut-export` 标记文件的导出子目录；直接选择 `Processed/` 或导出目录本身则可以单独浏览。根目录顶层的成片 JPG 无法自动区分，建议单独放在 `Processed/`。
+配对按三级策略执行：（1）同相对子目录且主干名一致 `(rel_dir_lower, stem_lower)`；（2）剩余未配对中全局唯一的主干名 `stem_lower`；（3）仍不唯一时按 `(stem_lower, 非空 EXIF DateTimeOriginal)` 唯一匹配；仍存在歧义的不猜测，保持未配对。
 
-照片根统一规范化，Windows 去掉影响旧缓存匹配的 `\\?\` 路径形式。同一根目录不应因启动器、CLI 或进程工作目录不同而产生不同默认状态位置。
+“关联同名 RAW 照片”是工作区级偏好，UI、CLI `score` 和 `review` 共用；关闭后只处理 JPG。扫描跳过 `.firstcut/`、所选根下的 `Processed/` 输出子树，以及任何包含 `.firstcut-export` 标记文件的导出子目录；直接选择 `Processed/` 或导出目录本身则可以单独浏览。根目录顶层的成片 JPG 无法自动区分，建议单独放在 `Processed/`。
+
+照片根统一规范化，Windows 去掉影响旧缓存匹配的 `\\?\` 路径形式。同一工作区不应因启动器、CLI 或进程工作目录不同而产生不同默认状态位置。
 
 ### 3.2 默认文件布局
 
-| 照片根目录下的路径 | 用途 / 保留方式 |
-|---|---|
-| `.firstcut/cache.sqlite` | 可重建的分析缓存 |
-| `.firstcut/decisions.sqlite` | 统一人工决定库（人工星级 + 人工连拍保留/舍弃覆盖），随照片备份；自动兼容并迁移旧版 `.firstcut/burst-overrides.json` |
-| `.firstcut/scene-feedback.jsonl` | 场景纠正、备注与当时评分线索，需保留 |
-| `.firstcut/config.toml` | 当前评分配置；不存在时使用内置默认值 |
-| `.firstcut/ui-preferences.json` | RAW 关联和直方图抽样比例等照片根级偏好 |
-| `.firstcut/report.csv`、`scan-report.csv`、`metrics.csv` | 评分、扫描和调参报告 |
-| `.firstcut/thumbs/v2/` | 按照片清单身份生成；8192 个固定槽、每槽最多 64 KiB，碰撞时可重新生成 |
-| `.firstcut/review.log` | 评分与导出任务时间日志，严格限制为单文件 256 KiB |
-| 照片旁的 `<stem>.xmp` | 唯一有意放在照片旁的元数据导出，供 Lightroom 发现 |
-| `<导出子目录>/.firstcut-export` | 导出清单与防二次扫描标记（上级扫描自动跳过该导出目录） |
+所有运行期状态默认写入本机应用数据目录（Windows 为 `%LOCALAPPDATA%\firstcut\workspaces\<工作区ID>\`，Unix 为 `${XDG_DATA_HOME:-$HOME/.local/share}/firstcut/workspaces/<工作区ID>/`，可通过环境变量 `FIRSTCUT_DATA_DIR` 覆盖；单目录首次打开自动只读导入遗留 `<照片目录>/.firstcut/` 数据）：
 
-默认应用状态集中到 `.firstcut/`。CLI 显式 `--cache`、`--output`、`--config` 可覆盖对应路径；旧工作目录缓存不自动猜测或搬移，可用 `--cache` 明确读取。`config-template` 没有照片根参数，默认写当前目录 `.firstcut/firstcut-template.toml`；gallery 默认输出到输入报告旁，常规工作流因此仍在 `.firstcut/`。
+| 本机工作区状态目录下路径 | 用途 / 保留方式 |
+|---|---|
+| `cache.sqlite` | 可重建的分析缓存 |
+| `decisions.sqlite` | 统一人工决定库（人工星级 + 人工连拍保留/舍弃覆盖）；自动兼容并迁移旧版 `burst-overrides.json` |
+| `scene-feedback.jsonl` | 场景纠正、备注与当时评分线索，需保留 |
+| `config.toml` | 当前评分配置；不存在时使用内置默认值 |
+| `ui-preferences.json` | RAW 关联和直方图抽样比例等工作区级偏好 |
+| `workspace.json` & 上级 `recent-workspaces.json` | 工作区元信息（含上次导出目录）与最近工作区历史（最多 10 条） |
+| `report.csv`、`scan-report.csv`、`metrics.csv` | 评分、扫描和调参报告 |
+| `thumbs/v2/` | 按照片清单身份生成；8192 个固定槽、每槽最多 64 KiB，碰撞时可重新生成 |
+| `review.log` | 评分与导出任务时间日志，严格限制为单文件 256 KiB |
+
+导出与 XMP 规则：
+- 单目录 CLI `score --xmp` 仍可在源目录照片旁写出 `<stem>.xmp`；Web UI 及双目录模式绝不向源目录/存储卡写 `.firstcut/` 或 `.xmp`。
+- `export` 导出到目标目录时，若存在源 XMP（或已有人工决定），会在内存中无损合并最新人工星级后写入导出目录旁 `<stem>.xmp`（不修改源 XMP，也不覆盖已有 `crs:Exposure2012`）；目标根目录写 `.firstcut-export` 防二次扫描标记。
+
+CLI 显式 `--cache`、`--output`、`--config` 可覆盖对应路径；旧工作目录缓存不自动猜测或搬移，可用 `--cache` 明确读取。`config-template` 没有照片根参数，默认写当前目录 `.firstcut/firstcut-template.toml`；gallery 默认输出到输入报告旁。
 
 ### 3.3 缓存与配置语义
 

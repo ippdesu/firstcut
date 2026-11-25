@@ -145,6 +145,7 @@ let page = 0;
 let uiSession = null;
 let localDesktop = false;
 let serverIncludeRaw = true;
+let sourceMode = 'single';
 
 async function loadAppControls(){
   try {
@@ -153,12 +154,26 @@ async function loadAppControls(){
     localDesktop = data.local_desktop === true;
     serverIncludeRaw = data.include_raw !== false;
     document.getElementById('exportPickFolder').hidden = !localDesktop;
+    document.getElementById('exportPickFolderDual').hidden = !localDesktop;
     syncExportRawOption();
     if(data.enabled){
       uiSession = data.session;
       document.getElementById('appControls').hidden = false;
       document.getElementById('folderBlock').hidden = false;
       document.getElementById('includeRaw').checked = serverIncludeRaw;
+    }
+  } catch (_) {}
+  try {
+    const ws = await apiFetch('/api/workspace/status', {cache:'no-store'}).then(r=>r.json());
+    if(ws.state === 'active'){
+      sourceMode = ws.source_mode || 'single';
+      const rawRow = document.getElementById('includeRawRow');
+      if(rawRow) rawRow.hidden = sourceMode === 'dual';
+      if(ws.last_export_target_id && !exportExternalTargetId){
+        exportExternalTargetId = ws.last_export_target_id;
+        exportExternalDisplay = ws.last_export_display || '';
+      }
+      syncExportTargetUi();
     }
   } catch (_) {}
 }
@@ -916,7 +931,7 @@ function renderLBDetails(){
     <label for="lbSceneNote">补充说明（可选）</label>
     <textarea id="lbSceneNote" maxlength="1000" placeholder="例如：这是舞台演出，不是普通人像">${escapeHtml(feedback?.note || '')}</textarea>
     <button class="detail-save" id="lbSceneSave">保存场景记录</button>
-    <p class="detail-note">记录会保存到照片目录的 .firstcut/scene-feedback.jsonl，供后续改进识别与评分。</p>`;
+    <p class="detail-note">记录会保存到本机工作区状态目录的 scene-feedback.jsonl（源目录零写入），供后续改进识别与评分。</p>`;
   document.getElementById('lbSceneSave').addEventListener('click', ()=>saveSceneFeedback(photo));
 }
 document.getElementById('lbDetailsPhoto').addEventListener('change', e=>{
@@ -1212,14 +1227,18 @@ function syncExportXmpExposure(){
   if(!enabled) exportXmpExposureEl.checked = false;
 }
 function syncExportTargetUi(){
+  const isDual = sourceMode === 'dual';
   const hasExternal = !!exportExternalTargetId;
-  document.getElementById('exportSubdirRow').hidden = hasExternal;
-  document.getElementById('exportExternalRow').hidden = !hasExternal;
-  document.getElementById('exportExternalPath').textContent = exportExternalDisplay;
+  document.getElementById('exportSubdirRow').hidden = isDual || hasExternal;
+  document.getElementById('exportExternalRow').hidden = !(isDual || hasExternal);
+  document.getElementById('exportUseSubdir').hidden = isDual;
+  document.getElementById('exportPickFolderDual').hidden = !localDesktop;
+  document.getElementById('exportExternalPath').textContent = exportExternalDisplay || '尚未选择本机处理目录';
 }
 function syncExportStartButton(){
   const startBtn = document.getElementById('exportStart');
-  const ok = !jobIsRunning && exportPreviewData && exportPreviewData.selected_photos > 0;
+  const needsExternal = sourceMode === 'dual' && !exportExternalTargetId;
+  const ok = !jobIsRunning && !needsExternal && exportPreviewData && exportPreviewData.selected_photos > 0;
   startBtn.disabled = !ok;
 }
 function buildExportRequestPayload(){
@@ -1277,6 +1296,10 @@ async function refreshExportPreview(){
     `基于当前左侧筛选命中的全部 ${matched.length} 张照片（不受“按连拍组聚合”折叠影响）。`;
   exportPreviewData = null;
   syncExportStartButton();
+  if(sourceMode === 'dual' && !exportExternalTargetId){
+    box.innerHTML = '<div class="warn">双目录模式下请点击上方「选择导出目录…」选择本机处理目录（避免写入相机存储卡）。</div>';
+    return;
+  }
   box.innerHTML = '<span class="dim">正在计算导出预览…</span>';
   try {
     const response = await apiFetch('/api/export/preview', {
@@ -1324,9 +1347,9 @@ document.getElementById('exportUseSubdir').addEventListener('click', ()=>{
   syncExportTargetUi();
   scheduleExportPreview(0);
 });
-document.getElementById('exportPickFolder').addEventListener('click', async ()=>{
-  const btn = document.getElementById('exportPickFolder');
-  btn.disabled = true;
+async function pickExportFolder(){
+  const btns = [document.getElementById('exportPickFolder'), document.getElementById('exportPickFolderDual')];
+  btns.forEach(b=>{ if(b) b.disabled = true; });
   try {
     const response = await apiFetch('/api/export/pick-folder', {
       method:'POST', headers:{'Content-Type':'application/json'}, body:'{}',
@@ -1350,9 +1373,11 @@ document.getElementById('exportPickFolder').addEventListener('click', async ()=>
   } catch (err) {
     toast('选择文件夹失败：' + err);
   } finally {
-    btn.disabled = false;
+    btns.forEach(b=>{ if(b) b.disabled = false; });
   }
-});
+}
+document.getElementById('exportPickFolder').addEventListener('click', pickExportFolder);
+document.getElementById('exportPickFolderDual').addEventListener('click', pickExportFolder);
 document.getElementById('exportStart').addEventListener('click', async ()=>{
   const btn = document.getElementById('exportStart');
   btn.disabled = true;
@@ -1402,20 +1427,9 @@ window.addEventListener('keydown', e=>{
     exportModal.style.display = 'none';
   }
 });
-const runXmpEl = document.getElementById('runXmp');
-const runXmpExposureEl = document.getElementById('runXmpExposure');
-function syncRunXmpExposure(){
-  const enabled = runXmpEl.checked;
-  runXmpExposureEl.disabled = !enabled;
-  if(!enabled) runXmpExposureEl.checked = false;
-}
-runXmpEl.addEventListener('change', syncRunXmpExposure);
-syncRunXmpExposure();
 document.getElementById('runBtn').addEventListener('click', ()=>{
-  const xmp = runXmpEl.checked;
-  const xmpExposure = xmp && runXmpExposureEl.checked;
   apiFetch('/api/score/run', {method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({xmp, xmp_exposure: xmpExposure, no_ai: document.getElementById('runNoAi').checked})
+    body: JSON.stringify({no_ai: document.getElementById('runNoAi').checked})
   }).then(async r=>{
     if(!r.ok){
       toast(await r.text() || `无法开始评分（${r.status}）`);
@@ -1584,7 +1598,7 @@ document.getElementById('uiSettingsSave').addEventListener('click', async ()=>{
     if(!response.ok) throw new Error(result.error || result.message || body || '保存失败');
     histogramSamplePercent = samplePercent;
     document.getElementById('histogramSampleRange').value = samplePercent;
-    document.getElementById('uiSettingsStatus').textContent = '已保存在当前照片目录的 .firstcut/ui-preferences.json';
+    document.getElementById('uiSettingsStatus').textContent = '已保存在本机工作区状态目录（源目录零写入）';
     if(LB?.histogramOpen) renderLBHistogram();
   } catch(error){ toast('界面设置保存失败：'+error.message); }
   finally { button.disabled = false; }
@@ -1645,6 +1659,137 @@ document.getElementById('accessForm').addEventListener('submit', async event=>{
     accessStatus.textContent = error.message;
   }
 });
+const welcomeState = {
+  singlePickId: null,
+  jpgPickId: null,
+  rawPickId: null,
+};
+function setWelcomeTab(mode){
+  const isDual = mode === 'dual';
+  document.getElementById('wTabSingle').classList.toggle('on', !isDual);
+  document.getElementById('wTabDual').classList.toggle('on', isDual);
+  document.getElementById('wTabSingle').setAttribute('aria-selected', String(!isDual));
+  document.getElementById('wTabDual').setAttribute('aria-selected', String(isDual));
+  document.getElementById('wSinglePane').hidden = isDual;
+  document.getElementById('wDualPane').hidden = !isDual;
+}
+async function pickWelcomeFolder(role, pathElId, onPicked){
+  try {
+    const resp = await apiFetch('/api/workspace/pick-folder', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({role}),
+    });
+    if(!resp.ok){ toast(await resp.text() || '选择目录失败'); return; }
+    const data = await resp.json();
+    if(data.cancelled) return;
+    const el = document.getElementById(pathElId);
+    el.textContent = data.display_path;
+    el.classList.add('ok');
+    onPicked(data.pick_id);
+  } catch (err) { toast('选择目录失败：' + err); }
+}
+async function waitSessionReload(){
+  for(let attempt=0; attempt<200; attempt++){
+    await new Promise(resolve => setTimeout(resolve, 250));
+    try {
+      const next = await apiFetch('/api/control', {cache:'no-store'}).then(r=>r.json());
+      if(next.enabled && next.session !== uiSession){ location.reload(); return; }
+    } catch (_) {}
+  }
+  toast('工作区切换超时，请刷新页面重试');
+}
+async function openWelcomeWorkspace(payload){
+  document.querySelectorAll('#welcomePanel button').forEach(b=> b.disabled = true);
+  try {
+    const resp = await apiFetch('/api/workspace/open', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(payload),
+    });
+    if(!resp.ok){
+      toast(await resp.text() || '打开工作区失败');
+      document.querySelectorAll('#welcomePanel button').forEach(b=> b.disabled = false);
+      document.getElementById('wOpenSingle').disabled = !welcomeState.singlePickId;
+      document.getElementById('wOpenDual').disabled = !(welcomeState.jpgPickId && welcomeState.rawPickId);
+      return;
+    }
+    document.getElementById('info').textContent = '正在打开工作区…';
+    await waitSessionReload();
+  } catch (err) {
+    toast('打开工作区失败：' + err);
+    document.querySelectorAll('#welcomePanel button').forEach(b=> b.disabled = false);
+  }
+}
+function renderRecentWorkspaces(recent){
+  const sec = document.getElementById('wRecentSection');
+  const list = document.getElementById('wRecentList');
+  if(!recent || !recent.length){ sec.hidden = true; list.innerHTML = ''; return; }
+  sec.hidden = false;
+  list.innerHTML = '';
+  for(const item of recent){
+    const row = document.createElement('div');
+    row.className = 'w-recent-item';
+    const meta = document.createElement('div');
+    meta.className = 'w-recent-meta';
+    const badge = item.mode === 'dual'
+      ? '<span class="w-badge dual">双目录</span>'
+      : '<span class="w-badge">单目录</span>';
+    const off = item.available ? '' : '<span class="w-badge off">目录暂不可用</span>';
+    const ts = item.last_opened_unix_ms ? new Date(item.last_opened_unix_ms).toLocaleString() : '';
+    meta.innerHTML = `${badge}${off}<span class="dim">${escapeHtml(ts)}</span><div class="w-recent-path">${escapeHtml(item.display_label)}</div>`;
+    const openBtn = document.createElement('button');
+    openBtn.className = 'btn primary';
+    openBtn.textContent = '打开';
+    openBtn.disabled = !item.available;
+    openBtn.addEventListener('click', ()=> openWelcomeWorkspace({recent_id: item.id}));
+    const rmBtn = document.createElement('button');
+    rmBtn.className = 'btn';
+    rmBtn.textContent = '移除';
+    rmBtn.addEventListener('click', async ()=>{
+      const resp = await apiFetch('/api/workspace/recent/remove', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({id: item.id}),
+      });
+      if(resp.ok){
+        const data = await resp.json();
+        renderRecentWorkspaces(data.recent || []);
+      }
+    });
+    row.append(meta, openBtn, rmBtn);
+    list.appendChild(row);
+  }
+}
+function initWelcomePanel(ws){
+  document.getElementById('welcomePanel').hidden = false;
+  document.getElementById('layout').hidden = true;
+  document.getElementById('loadPanel').hidden = true;
+  document.getElementById('info').textContent = '请选择照片工作区';
+  renderRecentWorkspaces(ws.recent || []);
+}
+document.getElementById('wTabSingle').addEventListener('click', ()=> setWelcomeTab('single'));
+document.getElementById('wTabDual').addEventListener('click', ()=> setWelcomeTab('dual'));
+document.getElementById('wPickSingle').addEventListener('click', ()=> pickWelcomeFolder('single', 'wSinglePath', id=>{
+  welcomeState.singlePickId = id;
+  document.getElementById('wOpenSingle').disabled = false;
+}));
+document.getElementById('wPickJpg').addEventListener('click', ()=> pickWelcomeFolder('jpg', 'wDualJpgPath', id=>{
+  welcomeState.jpgPickId = id;
+  document.getElementById('wOpenDual').disabled = !(welcomeState.jpgPickId && welcomeState.rawPickId);
+}));
+document.getElementById('wPickRaw').addEventListener('click', ()=> pickWelcomeFolder('raw', 'wDualRawPath', id=>{
+  welcomeState.rawPickId = id;
+  document.getElementById('wOpenDual').disabled = !(welcomeState.jpgPickId && welcomeState.rawPickId);
+}));
+document.getElementById('wOpenSingle').addEventListener('click', ()=> openWelcomeWorkspace({
+  mode: 'single',
+  root_pick_id: welcomeState.singlePickId,
+  include_raw: document.getElementById('wSingleIncludeRaw').checked,
+}));
+document.getElementById('wOpenDual').addEventListener('click', ()=> openWelcomeWorkspace({
+  mode: 'dual',
+  jpg_pick_id: welcomeState.jpgPickId,
+  raw_pick_id: welcomeState.rawPickId,
+}));
+
 async function startReview(){
   const launchKey = new URLSearchParams(location.hash.slice(1)).get('access');
   if(launchKey !== null){
@@ -1658,6 +1803,33 @@ async function startReview(){
       return false;
     }
   }
+  try {
+    const ctrl = await apiFetch('/api/control', {cache:'no-store'});
+    if(ctrl.status === 401){
+      try { localStorage.removeItem(sessionStorageKey); } catch (_) {}
+      document.getElementById('info').textContent = '请登录';
+      document.getElementById('loadPanel').hidden = true;
+      accessPanel.hidden = false;
+      return false;
+    }
+    if(ctrl.ok){
+      const cdata = await ctrl.json();
+      if(cdata.enabled){
+        uiSession = cdata.session;
+        document.getElementById('appControls').hidden = false;
+        document.getElementById('restartService').hidden = false;
+      }
+    }
+    const wsResp = await apiFetch('/api/workspace/status', {cache:'no-store'});
+    if(wsResp.ok){
+      const ws = await wsResp.json();
+      if(ws.state === 'welcome'){
+        document.getElementById('restartService').hidden = true;
+        initWelcomePanel(ws);
+        return false;
+      }
+    }
+  } catch (_) {}
   return boot();
 }
 startReview().then(ready=>{

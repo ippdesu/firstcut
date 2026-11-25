@@ -16,9 +16,12 @@ struct Cli {
 enum Commands {
     /// 扫描目录，读取 EXIF 建立照片索引，输出 CSV 报告（不含评分）
     Scan {
-        /// 照片目录
+        /// 照片目录（或双目录模式下的 JPG 目录）
         dir: PathBuf,
-        /// 输出 CSV 路径（默认 <照片目录>/.firstcut/scan-report.csv）
+        /// 双目录模式：指定独立 RAW 目录（与 `dir` 的 JPG 目录配对，支持子目录）
+        #[arg(long)]
+        raw_dir: Option<PathBuf>,
+        /// 输出 CSV 路径（默认本机工作区状态目录的 scan-report.csv）
         #[arg(short, long)]
         output: Option<PathBuf>,
         /// 写出未做表格公式保护的原始 CSV，供程序读取
@@ -27,9 +30,12 @@ enum Commands {
     },
     /// 扫描并评分（清晰度/曝光/噪点/构图/美学 + 连拍去重），输出 CSV
     Score {
-        /// 照片目录
+        /// 照片目录（或双目录模式下的 JPG 目录）
         dir: PathBuf,
-        /// 输出 CSV 路径（默认 <照片目录>/.firstcut/report.csv）
+        /// 双目录模式：指定独立 RAW 目录（与 `dir` 的 JPG 目录配对，支持子目录）
+        #[arg(long)]
+        raw_dir: Option<PathBuf>,
+        /// 输出 CSV 路径（默认本机工作区状态目录的 report.csv）
         #[arg(short, long)]
         output: Option<PathBuf>,
         /// 写出未做表格公式保护的原始 CSV，供程序读取
@@ -42,19 +48,19 @@ enum Commands {
         /// 跳过 AI 推理（无模型时快速预览）
         #[arg(long)]
         no_ai: bool,
-        /// 写 XMP 星级侧车（xmp:Rating + firstcut 子分；默认不写 Adobe crs:* 开发字段）
+        /// 写 XMP 星级侧车（仅单目录显式传入时写入源目录；双目录模式请用 export）
         #[arg(long)]
         xmp: bool,
         /// 显式将建议曝光写入 Adobe crs:Exposure2012 开发字段（需配合 --xmp，不覆盖已有人工曝光）
         #[arg(long)]
         xmp_exposure: bool,
-        /// 增量缓存文件路径（默认 <照片目录>/.firstcut/cache.sqlite）
+        /// 增量缓存文件路径（默认本机工作区状态目录的 cache.sqlite）
         #[arg(long)]
         cache: Option<PathBuf>,
         /// 禁用增量缓存
         #[arg(long)]
         no_cache: bool,
-        /// 评分配置文件（默认优先读取 <照片目录>/.firstcut/config.toml）
+        /// 评分配置文件（默认优先读取本机工作区状态目录的 config.toml）
         #[arg(long)]
         config: Option<PathBuf>,
         /// 实验性：用 DirectML GPU 推理（需 cargo build --features gpu；
@@ -73,12 +79,15 @@ enum Commands {
     },
     /// 本地 Web 复核界面（缩略图墙 / 1:1 原图 / 连拍对比，浏览器打开）
     Review {
-        /// 已用 score 评分过的照片目录
+        /// 照片目录（或双目录模式下的 JPG 目录）
         dir: PathBuf,
+        /// 双目录模式：指定独立 RAW 目录（与 `dir` 的 JPG 目录配对，支持子目录）
+        #[arg(long)]
+        raw_dir: Option<PathBuf>,
         /// 评分配置（与 score 相同的 TOML；影响总分/星级/连拍划分）
         #[arg(long)]
         config: Option<PathBuf>,
-        /// 增量缓存文件（默认 <照片目录>/.firstcut/cache.sqlite）
+        /// 增量缓存文件（默认本机工作区状态目录的 cache.sqlite）
         #[arg(long)]
         cache: Option<PathBuf>,
         /// 监听地址（容器部署时可用 0.0.0.0，并将宿主机端口限制为本机）
@@ -96,9 +105,12 @@ enum Commands {
     },
     /// 将筛选命中的 JPG/RAW/XMP 非破坏性复制到指定子目录或目标文件夹
     Export {
-        /// 照片目录
+        /// 照片目录（或双目录模式下的 JPG 目录）
         dir: PathBuf,
-        /// 目标目录：相对路径写入 <照片目录>/<路径>（默认 Selected），绝对路径写入该外部目录
+        /// 双目录模式：指定独立 RAW 目录（与 `dir` 的 JPG 目录配对，支持子目录）
+        #[arg(long)]
+        raw_dir: Option<PathBuf>,
+        /// 目标目录：单目录相对路径写入 <照片目录>/<路径>（默认 Selected），绝对路径写入该外部目录
         #[arg(long, default_value = "Selected")]
         to: PathBuf,
         /// 最低星级（1~5；与 --stars 互斥）
@@ -119,7 +131,7 @@ enum Commands {
         /// 不复制 JPG（默认复制）
         #[arg(long)]
         no_jpg: bool,
-        /// 不复制 RAW/ARW（默认复制）
+        /// 不复制 RAW（默认复制）
         #[arg(long)]
         no_raw: bool,
         /// 不复制/生成 XMP 侧车（默认启用）
@@ -131,25 +143,41 @@ enum Commands {
         /// 仅预览待复制文件与预计空间占用，不写磁盘
         #[arg(long)]
         dry_run: bool,
-        /// 评分配置文件（默认优先读取 <照片目录>/.firstcut/config.toml）
+        /// 评分配置文件（默认优先读取本机工作区状态目录的 config.toml）
         #[arg(long)]
         config: Option<PathBuf>,
-        /// 增量缓存文件（默认 <照片目录>/.firstcut/cache.sqlite）
+        /// 增量缓存文件（默认本机工作区状态目录的 cache.sqlite）
         #[arg(long)]
         cache: Option<PathBuf>,
     },
 }
 
+fn open_workspace(
+    dir: &std::path::Path,
+    raw_dir: Option<&std::path::Path>,
+) -> Result<(
+    pic_process::workspace::WorkspaceSource,
+    pic_process::workspace::WorkspacePaths,
+)> {
+    let source = match raw_dir {
+        Some(raw) => pic_process::workspace::WorkspaceSource::dual(dir, raw)?,
+        None => pic_process::workspace::WorkspaceSource::single(dir)?,
+    };
+    let paths = pic_process::workspace::WorkspacePaths::for_source(&source)?;
+    pic_process::workspace::import_legacy_state_if_needed(&source, &paths)?;
+    Ok((source, paths))
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Scan { dir, output, raw_csv } => {
-            let dir = pic_process::review::normal_photo_root(&dir)?;
-            let paths = pic_process::review::photo_root_paths(&dir);
-            let output = pic_process::storage::absolute_output(output)?.unwrap_or(paths.scan_report);
-            let entries = scan::scan_directory(&dir)?;
-            eprintln!("[scan] 发现 {} 个文件（JPG/ARW）", entries.len());
-            pic_process::output::csv::write_csv_in(&dir, &output, &entries, !raw_csv)?;
+        Commands::Scan { dir, raw_dir, output, raw_csv } => {
+            let (source, paths) = open_workspace(&dir, raw_dir.as_deref())?;
+            let output = pic_process::storage::absolute_output(output)?.unwrap_or(paths.scan_report.clone());
+            let entries = scan::scan_workspace(&source, None, None, true, false, &|_, _, _| {})?;
+            eprintln!("[scan] 发现 {} 个文件（JPG/RAW）", entries.len());
+            paths.ensure_state_dir()?;
+            pic_process::output::csv::write_csv_in(&paths.state_dir, &output, &entries, !raw_csv)?;
             eprintln!("[scan] CSV 已写出: {}", output.display());
         }
         Commands::ConfigTemplate { output, preset } => {
@@ -173,38 +201,34 @@ fn main() -> Result<()> {
             pic_process::storage::FileRef::at(&current, &output, true)?.write(text.as_bytes())?;
             eprintln!("[config] 已写出: {}", output.display());
         }
-        Commands::Score { dir, output, raw_csv, keep, no_ai, xmp, xmp_exposure, cache, no_cache, config, gpu } => {
-            let dir = pic_process::review::normal_photo_root(&dir)?;
-            let paths = pic_process::review::photo_root_paths(&dir);
-            // 0) 评分配置（默认或文件）
-            //    显式传入的配置加载失败必须硬报错：静默回退默认值会让用户
-            //    以为参数已生效（M6-4 同类问题的解析层版本）
-            pic_process::storage::Folder::open(&dir)?.state(true)?;
+        Commands::Score { dir, raw_dir, output, raw_csv, keep, no_ai, xmp, xmp_exposure, cache, no_cache, config, gpu } => {
+            let (source, paths) = open_workspace(&dir, raw_dir.as_deref())?;
+            paths.ensure_state_dir()?;
             let config = pic_process::storage::absolute_output(config)?;
-            let (cfg, exists) = pic_process::review::load_review_config(&dir, config.as_deref())?;
+            let (cfg, exists) = pic_process::review::load_review_config_in(&paths.state_dir, config.as_deref())?;
             let selected_config = config.as_ref().unwrap_or(&paths.config);
             if exists {
                 eprintln!("[score] 配置已加载: {}", selected_config.display());
             } else {
-                eprintln!("[score] 使用内置默认配置（照片根目录尚无 UI 配置）");
+                eprintln!("[score] 使用内置默认配置（工作区尚无 UI 配置）");
             }
 
-            // 评分流水线在库内（score::run_score_job），review 界面的"重新评分"共用同一实现
-            let preferences = pic_process::review::load_ui_preferences(&dir);
+            let preferences = pic_process::review::load_ui_preferences_in(&paths.state_dir);
+            let include_raw = if source.is_dual() { true } else { preferences.include_raw };
             let opts = score::ScoreJobOptions {
-                output_csv: pic_process::storage::absolute_output(output)?.unwrap_or(paths.report),
+                output_csv: pic_process::storage::absolute_output(output)?.unwrap_or(paths.report.clone()),
                 raw_csv,
-                cache_path: pic_process::storage::absolute_output(cache)?.unwrap_or(paths.cache),
+                cache_path: pic_process::storage::absolute_output(cache)?.unwrap_or(paths.cache.clone()),
                 no_cache,
                 no_ai,
                 xmp,
                 xmp_exposure,
                 gpu,
                 keep_override: keep,
-                include_raw: preferences.include_raw,
+                include_raw,
                 skip_processed: true,
             };
-            score::run_score_job(&dir, &cfg, &opts, &|ev| match ev {
+            score::run_score_job_in_workspace(&source, &paths, &cfg, &opts, &|ev| match ev {
                 score::ScoreEvent::Info(s) => eprintln!("[score] {s}"),
                 score::ScoreEvent::Progress { done, total } => {
                     eprintln!("[score] 进度 {}/{}", done, total)
@@ -215,23 +239,22 @@ fn main() -> Result<()> {
                 ),
             })?;
         }
-        Commands::Review { dir, config, cache, bind, public_url, port, no_browser } => {
-            let dir = pic_process::review::normal_photo_root(&dir)?;
-            let paths = pic_process::review::photo_root_paths(&dir);
-            // 与 score 相同的 fail-fast 配置加载
+        Commands::Review { dir, raw_dir, config, cache, bind, public_url, port, no_browser } => {
+            let (source, paths) = open_workspace(&dir, raw_dir.as_deref())?;
             let config = pic_process::storage::absolute_output(config)?;
-            let (cfg, _) = pic_process::review::load_review_config(&dir, config.as_deref())?;
+            let (cfg, _) = pic_process::review::load_review_config_in(&paths.state_dir, config.as_deref())?;
             if config.is_some() {
                 eprintln!("[review] 配置已加载: {}", config.as_ref().unwrap().display());
             }
-            let cache = pic_process::storage::absolute_output(cache)?.unwrap_or(paths.cache);
-            pic_process::review::serve_with_bind(
-                &dir, &cfg, &cache, bind, port, !no_browser, config.as_deref(), public_url.as_deref(),
+            let cache = pic_process::storage::absolute_output(cache)?.unwrap_or(paths.cache.clone());
+            pic_process::review::serve_with_bind_workspace(
+                &source, &paths, &cfg, &cache, bind, port, !no_browser, config.as_deref(), public_url.as_deref(),
             )
                 .with_context(|| "复核服务启动失败")?;
         }
         Commands::Export {
             dir,
+            raw_dir,
             to,
             min_stars,
             stars,
@@ -246,11 +269,13 @@ fn main() -> Result<()> {
             config,
             cache,
         } => {
-            let dir = pic_process::review::normal_photo_root(&dir)?;
-            let paths = pic_process::review::photo_root_paths(&dir);
+            let (source, paths) = open_workspace(&dir, raw_dir.as_deref())?;
+            if source.is_dual() && !to.is_absolute() {
+                anyhow::bail!("双目录模式下请通过 --to <本机绝对路径> 指定独立的处理目录，避免写入相机存储卡");
+            }
             let config = pic_process::storage::absolute_output(config)?;
-            let (cfg, _) = pic_process::review::load_review_config(&dir, config.as_deref())?;
-            let cache = pic_process::storage::absolute_output(cache)?.unwrap_or(paths.cache);
+            let (cfg, _) = pic_process::review::load_review_config_in(&paths.state_dir, config.as_deref())?;
+            let cache = pic_process::storage::absolute_output(cache)?.unwrap_or(paths.cache.clone());
             let layout = match layout.trim().to_ascii_lowercase().as_str() {
                 "split" | "split_by_type" => pic_process::export::ExportLayout::SplitByType,
                 "flat" => pic_process::export::ExportLayout::Flat,
@@ -270,7 +295,7 @@ fn main() -> Result<()> {
                 faces_only: faces,
             };
             let (items, all_sources) =
-                pic_process::export::collect_items_for_cli(&dir, &cfg, &cache, &filter)?;
+                pic_process::export::collect_items_for_cli_in_workspace(&source, &paths, &cfg, &cache, &filter)?;
             let opts = pic_process::export::ExportOptions {
                 target,
                 layout,
@@ -279,7 +304,7 @@ fn main() -> Result<()> {
                 include_xmp: !no_xmp,
                 xmp_exposure,
             };
-            let plan = pic_process::export::plan_export(&dir, &items, &all_sources, &opts)?;
+            let plan = pic_process::export::plan_export_workspace(&source, &items, &all_sources, &opts)?;
             let p = &plan.preview;
             eprintln!(
                 "[export] 目标: {} | 命中 {} 张照片 | 待写入: JPG {} / RAW {} / XMP {}（新生成 {}）| 跳过未变 {} | 保留既有 {} | 预计 {:.1} MB",

@@ -30,6 +30,7 @@ use tokio::sync::{Notify, Semaphore};
 use crate::config::ScoreConfig;
 use crate::review::job::{JobState, JobStatus};
 use crate::storage::{FileRef, Folder};
+use crate::workspace::{WorkspacePaths, WorkspaceSource};
 use scene_feedback::SceneFeedbackRecord;
 use snapshot::Snapshot;
 
@@ -68,7 +69,11 @@ impl Default for UiPreferences {
 }
 
 pub fn load_ui_preferences(root: &Path) -> UiPreferences {
-    match state_file(root, "ui-preferences.json", false).and_then(|file| file.read(16 * 1024)) {
+    load_ui_preferences_in(&root.join(".firstcut"))
+}
+
+pub fn load_ui_preferences_in(state_dir: &Path) -> UiPreferences {
+    match state_file(state_dir, "ui-preferences.json", false).and_then(|file| file.read(16 * 1024)) {
         Ok(Some(bytes)) => serde_json::from_slice(&bytes).unwrap_or_else(|err| {
             quiet_log(format!("[review] 界面偏好无效，使用默认值: {err}"));
             UiPreferences::default()
@@ -103,18 +108,28 @@ pub fn photo_root_paths(root: &Path) -> PhotoRootPaths {
     }
 }
 
-fn save_ui_preferences(root: &Path, preferences: &UiPreferences) -> Result<()> {
-    state_file(root, "ui-preferences.json", true)?.write(&serde_json::to_vec_pretty(preferences)?)?;
+fn save_ui_preferences_in(state_dir: &Path, preferences: &UiPreferences) -> Result<()> {
+    state_file(state_dir, "ui-preferences.json", true)?
+        .write(&serde_json::to_vec_pretty(preferences)?)?;
     Ok(())
 }
 
-fn state_file(root: &Path, name: &str, create: bool) -> std::io::Result<FileRef> {
-    Folder::open(root)?.state(create)?.file(name)
+fn state_file(state_dir: &Path, name: &str, create: bool) -> std::io::Result<FileRef> {
+    Folder::open_or_create_explicit(state_dir, create)?.file(name)
 }
 
 pub fn load_review_config(root: &Path, explicit: Option<&Path>) -> Result<(ScoreConfig, bool)> {
-    let path = explicit.map(Path::to_path_buf).unwrap_or_else(|| photo_root_paths(root).config);
-    let bytes = match FileRef::at(root, &path, false) {
+    load_review_config_in(&root.join(".firstcut"), explicit)
+}
+
+pub fn load_review_config_in(
+    state_dir: &Path,
+    explicit: Option<&Path>,
+) -> Result<(ScoreConfig, bool)> {
+    let path = explicit
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| state_dir.join("config.toml"));
+    let bytes = match FileRef::at(state_dir, &path, false) {
         Ok(file) => file.read(1024 * 1024)?,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound && explicit.is_none() => None,
         Err(err) => return Err(err.into()),
@@ -129,17 +144,7 @@ pub fn load_review_config(root: &Path, explicit: Option<&Path>) -> Result<(Score
 
 /// Windows 的 `canonicalize` 会加上 `\\?\`，与原有缓存中的普通绝对路径不相等。
 pub fn normal_photo_root(root: &Path) -> Result<PathBuf> {
-    let absolute = root.canonicalize()?;
-    #[cfg(windows)] {
-        let value = absolute.to_string_lossy();
-        if let Some(rest) = value.strip_prefix(r"\\?\UNC\") {
-            return Ok(PathBuf::from(format!(r"\\{}", rest)));
-        }
-        if let Some(rest) = value.strip_prefix(r"\\?\") {
-            return Ok(PathBuf::from(rest));
-        }
-    }
-    Ok(absolute)
+    crate::workspace::normal_root(root)
 }
 
 struct UiControl {
@@ -149,9 +154,11 @@ struct UiControl {
 }
 
 pub struct AppState {
+    source: WorkspaceSource,
+    paths: WorkspacePaths,
     root: PathBuf,
     cache_path: PathBuf,
-    /// UI 配置编辑的目标文件（--config 指定；缺省 <照片根>/.firstcut/config.toml）
+    /// UI 配置编辑的目标文件（--config 指定；缺省本机工作区 `config.toml`）
     config_path: PathBuf,
     config_explicit: bool,
     scene_feedback: RwLock<HashMap<String, SceneFeedbackRecord>>,
@@ -168,6 +175,8 @@ pub struct AppState {
     local_desktop: bool,
     /// 本机桌面原生文件夹选择器已授权的外部导出目录（不透明 target_id → 路径，上限 32）
     approved_export_dirs: Mutex<Vec<(String, PathBuf)>>,
+    /// 记忆的上次外部导出目录（target_id, display_path）
+    last_export_target: Option<(String, String)>,
     /// 全局单后台任务（评分与导出互斥）
     job: Arc<JobState>,
     /// 串行化前端写操作（改星/连拍覆盖/场景反馈/配置保存），防止快速连点触发 SQLite 锁冲突或乱序写 XMP。
@@ -205,6 +214,33 @@ pub fn serve_with_bind(
     config_path: Option<&Path>,
     public_url: Option<&str>,
 ) -> Result<()> {
+    let source = WorkspaceSource::single(root)?;
+    let paths = WorkspacePaths::for_source(&source)?;
+    crate::workspace::import_legacy_state_if_needed(&source, &paths)?;
+    serve_with_bind_workspace(
+        &source,
+        &paths,
+        cfg,
+        cache_path,
+        bind,
+        port,
+        open_browser,
+        config_path,
+        public_url,
+    )
+}
+
+pub fn serve_with_bind_workspace(
+    source: &WorkspaceSource,
+    paths: &WorkspacePaths,
+    cfg: &ScoreConfig,
+    cache_path: &Path,
+    bind: IpAddr,
+    port: u16,
+    open_browser: bool,
+    config_path: Option<&Path>,
+    public_url: Option<&str>,
+) -> Result<()> {
     anyhow::ensure!(port != 0, "复核服务端口必须为 1–65535");
     let configured_key = match std::env::var("FIRSTCUT_ACCESS_TOKEN") {
         Ok(key) => Some(key),
@@ -212,48 +248,84 @@ pub fn serve_with_bind(
         Err(err) => return Err(err.into()),
     };
     let access = Arc::new(access::Access::new(bind, port, public_url, configured_key.as_deref())?);
-    Folder::open(root)?.state(true)?;
-    let preferences = load_ui_preferences(root);
-    serve_once(root, cfg, cache_path, bind, port, open_browser, config_path,
-        false, preferences.include_raw, true, access)?;
+    paths.ensure_state_dir()?;
+    let preferences = load_ui_preferences_in(&paths.state_dir);
+    let include_raw = if source.is_dual() { true } else { preferences.include_raw };
+    serve_once_workspace(
+        source,
+        paths,
+        cfg,
+        cache_path,
+        bind,
+        port,
+        open_browser,
+        config_path,
+        false,
+        include_raw,
+        true,
+        access,
+    )?;
     Ok(())
 }
 
-/// Windows 双击启动器：在同一进程中重启服务，退出时正常释放端口。
-pub fn serve_ui(root: &Path, pick_root: impl Fn() -> Option<PathBuf>) -> Result<()> {
-    let mut root = normal_photo_root(root)?;
+/// Windows 双击启动器：直接进入 Web 欢迎页（或在传入初始目录时直接打开），支持单/双目录与无缝切换。
+pub fn serve_ui_app(initial_root: Option<&Path>) -> Result<()> {
+    let mut active: Option<WorkspaceSource> = initial_root
+        .map(WorkspaceSource::single)
+        .transpose()?;
     let mut open_browser = true;
     let bind = IpAddr::V4(Ipv4Addr::LOCALHOST);
     let access = Arc::new(access::Access::new(bind, 8787, None, None)?);
     #[cfg(windows)]
     let _reopen_guard = UiReopenListener::start(access.url());
     loop {
-        let paths = photo_root_paths(&root);
-        Folder::open(&root)?.state(true)?;
-        let cache_path = paths.cache;
-        let (config, _) = load_review_config(&root, None)?;
-        let preferences = load_ui_preferences(&root);
-        let include_raw = preferences.include_raw;
-        match serve_once(&root, &config, &cache_path,
-            bind, 8787, open_browser, None,
-            true, include_raw, true, access.clone())? {
+        let Some(source) = active.clone() else {
+            match serve_welcome(bind, 8787, open_browser, access.clone())? {
+                WelcomeOutcome::Open(next) => {
+                    active = Some(next);
+                    open_browser = false;
+                }
+                WelcomeOutcome::Exit => return Ok(()),
+            }
+            continue;
+        };
+
+        let paths = WorkspacePaths::for_source(&source)?;
+        crate::workspace::import_legacy_state_if_needed(&source, &paths)?;
+        paths.ensure_state_dir()?;
+        let _ = crate::workspace::record_recent_workspace(&source, None);
+        let (config, _) = load_review_config_in(&paths.state_dir, None)?;
+        let preferences = load_ui_preferences_in(&paths.state_dir);
+        let include_raw = if source.is_dual() { true } else { preferences.include_raw };
+        match serve_once_workspace(
+            &source,
+            &paths,
+            &config,
+            &paths.cache,
+            bind,
+            8787,
+            open_browser,
+            None,
+            true,
+            include_raw,
+            true,
+            access.clone(),
+        )? {
             Some(UiAction::Restart) => open_browser = false,
             Some(UiAction::Choose) => {
-                if let Some(next) = pick_root() {
-                    root = normal_photo_root(&next)?;
-                }
+                active = None;
                 open_browser = false;
             }
             Some(UiAction::Rawon) => {
-                let mut preferences = load_ui_preferences(&root);
+                let mut preferences = load_ui_preferences_in(&paths.state_dir);
                 preferences.include_raw = true;
-                save_ui_preferences(&root, &preferences)?;
+                save_ui_preferences_in(&paths.state_dir, &preferences)?;
                 open_browser = false;
             }
             Some(UiAction::Rawoff) => {
-                let mut preferences = load_ui_preferences(&root);
+                let mut preferences = load_ui_preferences_in(&paths.state_dir);
                 preferences.include_raw = false;
-                save_ui_preferences(&root, &preferences)?;
+                save_ui_preferences_in(&paths.state_dir, &preferences)?;
                 open_browser = false;
             }
             _ => return Ok(()),
@@ -261,8 +333,326 @@ pub fn serve_ui(root: &Path, pick_root: impl Fn() -> Option<PathBuf>) -> Result<
     }
 }
 
-fn serve_once(
-    root: &Path,
+/// 兼容旧签名：保留供外部调用方使用。
+pub fn serve_ui(root: &Path, _pick_root: impl Fn() -> Option<PathBuf>) -> Result<()> {
+    serve_ui_app(Some(root))
+}
+
+enum WelcomeOutcome {
+    Open(WorkspaceSource),
+    Exit,
+}
+
+struct WelcomeState {
+    local_desktop: bool,
+    approved_picks: Mutex<Vec<(String, PathBuf)>>,
+    outcome: Mutex<Option<WelcomeOutcome>>,
+    notify: Notify,
+    session_id: u64,
+}
+
+fn serve_welcome(
+    bind: IpAddr,
+    port: u16,
+    open_browser: bool,
+    access: Arc<access::Access>,
+) -> Result<WelcomeOutcome> {
+    let state = Arc::new(WelcomeState {
+        local_desktop: cfg!(windows) && bind.is_loopback(),
+        approved_picks: Mutex::new(Vec::new()),
+        outcome: Mutex::new(None),
+        notify: Notify::new(),
+        session_id: NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed),
+    });
+    let shutdown_state = Arc::clone(&state);
+    let router_state = Arc::clone(&state);
+    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    runtime.block_on(async move {
+        let app = welcome_router(router_state, access.clone());
+        let listener = tokio::net::TcpListener::bind((bind, port)).await?;
+        let url = access.url();
+        if open_browser {
+            if let Err(err) = open_review_browser(&url) {
+                quiet_log(format!("[review] 无法自动打开浏览器：{err:#}"));
+            }
+        }
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                shutdown_state.notify.notified().await;
+            })
+            .await
+    })?;
+    let outcome = state
+        .outcome
+        .lock()
+        .unwrap()
+        .take()
+        .unwrap_or(WelcomeOutcome::Exit);
+    Ok(outcome)
+}
+
+fn welcome_router(state: Arc<WelcomeState>, access: Arc<access::Access>) -> Router {
+    let session = Router::new()
+        .route("/api/session", post(access::sign_in))
+        .with_state(access.clone());
+    Router::new()
+        .route("/", get(index))
+        .route("/review.js", get(review_js))
+        .route("/healthz", get(|| async { access::HEALTH_MARKER }))
+        .route("/api/workspace/status", get(welcome_status))
+        .route("/api/workspace/pick-folder", post(welcome_pick_folder))
+        .route("/api/workspace/open", post(welcome_open))
+        .route("/api/workspace/recent/remove", post(welcome_recent_remove))
+        .route("/api/control", get(welcome_control_status).post(welcome_control_post))
+        .layer(axum::extract::DefaultBodyLimit::max(64 * 1024))
+        .with_state(state)
+        .merge(session.layer(axum::extract::DefaultBodyLimit::max(1024)))
+        .layer(axum::middleware::from_fn_with_state(access, access::guard))
+}
+
+fn mint_pick_token(approved: &Mutex<Vec<(String, PathBuf)>>, path: PathBuf) -> Result<String> {
+    let mut entropy = [0u8; 16];
+    getrandom::fill(&mut entropy).map_err(|err| anyhow::anyhow!("{err}"))?;
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    let token = URL_SAFE_NO_PAD.encode(entropy);
+    let mut list = approved.lock().unwrap();
+    if list.len() >= APPROVED_EXPORT_CAP {
+        list.remove(0);
+    }
+    list.push((token.clone(), path));
+    Ok(token)
+}
+
+fn resolve_pick_token(approved: &Mutex<Vec<(String, PathBuf)>>, token: &str) -> Option<PathBuf> {
+    let list = approved.lock().unwrap();
+    list.iter()
+        .find(|(id, _)| id == token)
+        .map(|(_, path)| path.clone())
+}
+
+fn recent_json_list() -> Vec<serde_json::Value> {
+    let list = crate::workspace::load_recent_workspaces().unwrap_or_default();
+    list.into_iter()
+        .map(|entry| {
+            let available = entry.source.is_available();
+            let (mode, jpg_root, raw_root) = match &entry.source {
+                WorkspaceSource::Single { root } => ("single", root.display().to_string(), None),
+                WorkspaceSource::Dual { jpg_root, raw_root } => (
+                    "dual",
+                    jpg_root.display().to_string(),
+                    Some(raw_root.display().to_string()),
+                ),
+            };
+            serde_json::json!({
+                "id": entry.id,
+                "mode": mode,
+                "display_label": entry.source.display_label(),
+                "jpg_root": jpg_root,
+                "raw_root": raw_root,
+                "available": available,
+                "last_opened_unix_ms": entry.last_opened_unix_ms,
+                "last_export_dir": entry.last_export_dir.map(|p| p.display().to_string()),
+            })
+        })
+        .collect()
+}
+
+async fn welcome_status(State(state): State<Arc<WelcomeState>>) -> Response {
+    json_response(serde_json::json!({
+        "state": "welcome",
+        "local_desktop": state.local_desktop,
+        "recent": recent_json_list(),
+    }))
+}
+
+#[derive(Deserialize)]
+struct WelcomePickRequest {
+    #[serde(default)]
+    role: String,
+}
+
+async fn welcome_pick_folder(
+    State(state): State<Arc<WelcomeState>>,
+    axum::Json(req): axum::Json<WelcomePickRequest>,
+) -> Response {
+    if !state.local_desktop {
+        return (StatusCode::NOT_FOUND, "当前运行环境不支持系统文件夹选择器").into_response();
+    }
+    #[cfg(windows)]
+    {
+        let title = match req.role.as_str() {
+            "jpg" => "选择 JPG 照片文件夹（例如相机卡 1）",
+            "raw" => "选择 RAW 原片文件夹（例如相机卡 2）",
+            _ => "选择照片文件夹（支持子目录及 JPG+RAW 同目录）",
+        };
+        let picked = match tokio::task::spawn_blocking(move || {
+            rfd::FileDialog::new().set_title(title).pick_folder()
+        })
+        .await
+        {
+            Ok(p) => p,
+            Err(err) => return internal_error(err.into()),
+        };
+        let Some(path) = picked else {
+            return json_response(serde_json::json!({ "cancelled": true }));
+        };
+        let normalized = match normal_photo_root(&path) {
+            Ok(p) => p,
+            Err(err) => return (StatusCode::BAD_REQUEST, format!("{err:#}")).into_response(),
+        };
+        let token = match mint_pick_token(&state.approved_picks, normalized.clone()) {
+            Ok(t) => t,
+            Err(err) => return internal_error(err),
+        };
+        json_response(serde_json::json!({
+            "cancelled": false,
+            "pick_id": token,
+            "display_path": normalized.display().to_string(),
+        }))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = req;
+        (StatusCode::NOT_FOUND, "当前平台不支持系统文件夹选择器").into_response()
+    }
+}
+
+#[derive(Deserialize)]
+struct WelcomeOpenRequest {
+    #[serde(default)]
+    recent_id: Option<String>,
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    root_pick_id: Option<String>,
+    #[serde(default)]
+    jpg_pick_id: Option<String>,
+    #[serde(default)]
+    raw_pick_id: Option<String>,
+    #[serde(default)]
+    include_raw: Option<bool>,
+}
+
+async fn welcome_open(
+    State(state): State<Arc<WelcomeState>>,
+    axum::Json(req): axum::Json<WelcomeOpenRequest>,
+) -> Response {
+    if !state.local_desktop {
+        return (StatusCode::FORBIDDEN, "非本机桌面模式不允许通过网页切换目录").into_response();
+    }
+    let source = if let Some(recent_id) = req.recent_id.as_deref().filter(|s| !s.is_empty()) {
+        let list = crate::workspace::load_recent_workspaces().unwrap_or_default();
+        let Some(found) = list.into_iter().find(|e| e.id == recent_id) else {
+            return (StatusCode::NOT_FOUND, "该最近工作区记录不存在").into_response();
+        };
+        let verified = match &found.source {
+            WorkspaceSource::Single { root } => WorkspaceSource::single(root),
+            WorkspaceSource::Dual { jpg_root, raw_root } => WorkspaceSource::dual(jpg_root, raw_root),
+        };
+        match verified {
+            Ok(s) => s,
+            Err(err) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("工作区目录当前不可访问（请确认存储卡或磁盘已连接）: {err:#}"),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        match req.mode.as_deref() {
+            Some("single") => {
+                let Some(token) = req.root_pick_id.as_deref().filter(|s| !s.is_empty()) else {
+                    return (StatusCode::BAD_REQUEST, "请先选择照片文件夹").into_response();
+                };
+                let Some(path) = resolve_pick_token(&state.approved_picks, token) else {
+                    return (StatusCode::BAD_REQUEST, "目录授权已过期，请重新选择文件夹").into_response();
+                };
+                let s = match WorkspaceSource::single(&path) {
+                    Ok(s) => s,
+                    Err(err) => return (StatusCode::BAD_REQUEST, format!("{err:#}")).into_response(),
+                };
+                if let Some(inc_raw) = req.include_raw {
+                    if let Ok(paths) = WorkspacePaths::for_source(&s) {
+                        let mut prefs = load_ui_preferences_in(&paths.state_dir);
+                        prefs.include_raw = inc_raw;
+                        let _ = save_ui_preferences_in(&paths.state_dir, &prefs);
+                    }
+                }
+                s
+            }
+            Some("dual") => {
+                let Some(jpg_token) = req.jpg_pick_id.as_deref().filter(|s| !s.is_empty()) else {
+                    return (StatusCode::BAD_REQUEST, "请先选择 JPG 文件夹").into_response();
+                };
+                let Some(raw_token) = req.raw_pick_id.as_deref().filter(|s| !s.is_empty()) else {
+                    return (StatusCode::BAD_REQUEST, "请先选择 RAW 文件夹").into_response();
+                };
+                let Some(jpg_path) = resolve_pick_token(&state.approved_picks, jpg_token) else {
+                    return (StatusCode::BAD_REQUEST, "JPG 目录授权已过期，请重新选择").into_response();
+                };
+                let Some(raw_path) = resolve_pick_token(&state.approved_picks, raw_token) else {
+                    return (StatusCode::BAD_REQUEST, "RAW 目录授权已过期，请重新选择").into_response();
+                };
+                match WorkspaceSource::dual(&jpg_path, &raw_path) {
+                    Ok(s) => s,
+                    Err(err) => return (StatusCode::BAD_REQUEST, format!("{err:#}")).into_response(),
+                }
+            }
+            _ => return (StatusCode::BAD_REQUEST, "无效的工作区模式").into_response(),
+        }
+    };
+
+    *state.outcome.lock().unwrap() = Some(WelcomeOutcome::Open(source));
+    state.notify.notify_one();
+    json_response(serde_json::json!({ "ok": true }))
+}
+
+#[derive(Deserialize)]
+struct RecentRemoveRequest {
+    id: String,
+}
+
+async fn welcome_recent_remove(
+    State(state): State<Arc<WelcomeState>>,
+    axum::Json(req): axum::Json<RecentRemoveRequest>,
+) -> Response {
+    if !state.local_desktop {
+        return (StatusCode::FORBIDDEN, "非本机桌面模式").into_response();
+    }
+    if let Err(err) = crate::workspace::remove_recent_workspace(&req.id) {
+        return internal_error(err);
+    }
+    json_response(serde_json::json!({
+        "ok": true,
+        "recent": recent_json_list(),
+    }))
+}
+
+async fn welcome_control_status(State(state): State<Arc<WelcomeState>>) -> Response {
+    json_response(serde_json::json!({
+        "enabled": true,
+        "session": state.session_id,
+        "include_raw": true,
+        "local_desktop": state.local_desktop,
+    }))
+}
+
+async fn welcome_control_post(
+    State(state): State<Arc<WelcomeState>>,
+    axum::Json(request): axum::Json<ControlRequest>,
+) -> Response {
+    if request.action == UiAction::Exit {
+        *state.outcome.lock().unwrap() = Some(WelcomeOutcome::Exit);
+        state.notify.notify_one();
+        return json_response(serde_json::json!({ "ok": true }));
+    }
+    (StatusCode::BAD_REQUEST, "当前位于入口页，不支持此控制操作").into_response()
+}
+
+fn serve_once_workspace(
+    source: &WorkspaceSource,
+    paths: &WorkspacePaths,
     cfg: &ScoreConfig,
     cache_path: &Path,
     bind: IpAddr,
@@ -274,25 +664,56 @@ fn serve_once(
     skip_processed: bool,
     access: Arc<access::Access>,
 ) -> Result<Option<UiAction>> {
-    let scene_feedback_path = scene_feedback::store_path(root);
-    let feedback = scene_feedback::load_latest(root, &scene_feedback_path)?;
+    let root = source.jpg_root();
+    let scene_feedback_path = paths.scene_feedback.clone();
+    let feedback = scene_feedback::load_latest(&paths.state_dir, &scene_feedback_path)?;
     let initial_snapshot = if ui_control {
-        Snapshot::empty(root, cfg)
+        Snapshot::empty_for_source(source, cfg)
     } else {
-        build_review_snapshot(root, cfg, cache_path, &feedback,
-            include_raw, skip_processed, &|_, _, _| {})?
+        build_review_snapshot_for_workspace(
+            source,
+            paths,
+            cfg,
+            cache_path,
+            &feedback,
+            include_raw,
+            skip_processed,
+            &|_, _, _| {},
+        )?
     };
     let load_feedback = feedback.clone();
 
     let config_explicit = config_path.is_some();
-    let config_path = config_path.map(|p| p.to_path_buf())
-        .unwrap_or_else(|| root.join(".firstcut").join("config.toml"));
+    let config_path = config_path
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| paths.config.clone());
     let control = ui_control.then(|| Arc::new(UiControl {
         action: Mutex::new(None),
         notify: Notify::new(),
         session_id: NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed),
     }));
+    let local_desktop = cfg!(windows) && bind.is_loopback();
+    let mut approved_init: Vec<(String, PathBuf)> = Vec::new();
+    let last_export_target = if local_desktop {
+        crate::workspace::load_workspace_meta(paths)
+            .and_then(|m| m.last_export_dir)
+            .filter(|dir| dir.is_dir())
+            .and_then(|dir| {
+                let mut entropy = [0u8; 16];
+                getrandom::fill(&mut entropy).ok()?;
+                use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+                let token = URL_SAFE_NO_PAD.encode(entropy);
+                let display = dir.display().to_string();
+                approved_init.push((token.clone(), dir));
+                Some((token, display))
+            })
+    } else {
+        None
+    };
+
     let state = Arc::new(AppState {
+        source: source.clone(),
+        paths: paths.clone(),
         root: root.to_path_buf(),
         cache_path: cache_path.to_path_buf(),
         config_path,
@@ -308,14 +729,16 @@ fn serve_once(
             phase: "准备读取照片".into(), done: 0, total: 0,
         }),
         include_raw,
-        local_desktop: cfg!(windows) && bind.is_loopback(),
-        approved_export_dirs: Mutex::new(Vec::new()),
-        job: Arc::new(JobState::with_log_file(root, root.join(".firstcut").join("review.log"))),
+        local_desktop,
+        approved_export_dirs: Mutex::new(approved_init),
+        last_export_target,
+        job: Arc::new(JobState::with_log_file(&paths.state_dir, paths.review_log.clone())),
         write_lock: Arc::new(tokio::sync::Mutex::new(())),
         control: control.clone(),
     });
     let load_state = Arc::clone(&state);
-    let load_root = root.to_path_buf();
+    let load_source = source.clone();
+    let load_paths = paths.clone();
     let load_cfg = cfg.clone();
     let load_cache = cache_path.to_path_buf();
     let shutdown_control = control.clone();
@@ -331,8 +754,16 @@ fn serve_once(
                     };
                 };
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    build_review_snapshot(&load_root, &load_cfg, &load_cache,
-                        &load_feedback, include_raw, skip_processed, &on_progress)
+                    build_review_snapshot_for_workspace(
+                        &load_source,
+                        &load_paths,
+                        &load_cfg,
+                        &load_cache,
+                        &load_feedback,
+                        include_raw,
+                        skip_processed,
+                        &on_progress,
+                    )
                 }));
                 match result {
                     Ok(Ok(snapshot)) => *load_state.snapshot.write().unwrap() = snapshot,
@@ -377,6 +808,7 @@ fn router(state: Arc<AppState>, access: Arc<access::Access>) -> Router {
         .route("/", get(index))
         .route("/review.js", get(review_js))
         .route("/healthz", get(|| async { access::HEALTH_MARKER }))
+        .route("/api/workspace/status", get(workspace_status))
         .route("/api/photos", get(photos))
         .route("/api/load", get(load_status))
         .route("/thumb", get(thumb))
@@ -497,20 +929,54 @@ impl Drop for UiReopenListener {
     }
 }
 
-fn build_review_snapshot(
-    root: &Path, cfg: &ScoreConfig, cache_path: &Path,
+fn build_review_snapshot_for_workspace(
+    source: &WorkspaceSource,
+    paths: &WorkspacePaths,
+    cfg: &ScoreConfig,
+    cache_path: &Path,
     feedback: &HashMap<String, SceneFeedbackRecord>,
     include_raw: bool,
     skip_processed: bool,
     progress: &dyn Fn(&str, usize, usize),
 ) -> Result<Snapshot> {
     quiet_log("[review] 正在构建快照（扫描 + 缓存）……");
-    let snapshot = snapshot::build_snapshot_with_options(root, cfg, cache_path,
-        feedback, include_raw, skip_processed, progress)?;
+    let snapshot = snapshot::build_snapshot_for_workspace(
+        source,
+        paths,
+        cfg,
+        cache_path,
+        feedback,
+        include_raw,
+        skip_processed,
+        progress,
+    )?;
     let scored = snapshot.photos.iter().filter(|p| p.scores.is_some()).count();
     quiet_log(format!("[review] 快照就绪：{} 张照片（已评分 {}，未评分 {}）",
         snapshot.photos.len(), scored, snapshot.photos.len() - scored));
     Ok(snapshot)
+}
+
+async fn workspace_status(State(state): State<Arc<AppState>>) -> Response {
+    let raw_root = state
+        .source
+        .is_dual()
+        .then(|| state.source.raw_root().display().to_string());
+    let (last_export_target_id, last_export_display) = match &state.last_export_target {
+        Some((id, disp)) => (Some(id.as_str()), Some(disp.as_str())),
+        None => (None, None),
+    };
+    json_response(serde_json::json!({
+        "state": "active",
+        "workspace_id": state.source.workspace_id(),
+        "source_mode": state.source.mode_str(),
+        "jpg_root": state.source.jpg_root().display().to_string(),
+        "raw_root": raw_root,
+        "display_label": state.source.display_label(),
+        "include_raw": state.include_raw,
+        "local_desktop": state.local_desktop,
+        "last_export_target_id": last_export_target_id,
+        "last_export_display": last_export_display,
+    }))
 }
 
 fn quiet_log(message: impl AsRef<str>) {
@@ -564,7 +1030,7 @@ async fn thumb(State(state): State<Arc<AppState>>, Query(q): Query<PhotoParam>) 
     match tokio::task::spawn_blocking(move || {
         let _slot = slot;
         let file = resolve_jpeg(&state, &q.p)?;
-        thumb::get_or_create(&state.root, &q.p, file).map_err(internal_error)
+        thumb::get_or_create(&state.paths.state_dir, &q.p, file).map_err(internal_error)
     }).await {
         Ok(Ok(Some(bytes))) => ([(header::CONTENT_TYPE, "image/jpeg")], bytes).into_response(),
         Ok(Ok(None)) => StatusCode::NOT_FOUND.into_response(),
@@ -688,8 +1154,8 @@ struct UiSettingsRequest {
 }
 
 async fn ui_settings_get(State(state): State<Arc<AppState>>) -> Response {
-    let root = state.root.clone();
-    match tokio::task::spawn_blocking(move || load_ui_preferences(&root)).await {
+    let state_dir = state.paths.state_dir.clone();
+    match tokio::task::spawn_blocking(move || load_ui_preferences_in(&state_dir)).await {
         Ok(preferences) => json_response(serde_json::json!({
             "histogram_sample_percent": preferences.histogram_sample_percent,
         })),
@@ -738,9 +1204,9 @@ async fn ui_settings_save(
         state,
         "评分任务进行中或服务正在关闭，暂不能保存设置",
         move |state| {
-            let mut preferences = load_ui_preferences(&state.root);
+            let mut preferences = load_ui_preferences_in(&state.paths.state_dir);
             preferences.histogram_sample_percent = sample_percent;
-            match save_ui_preferences(&state.root, &preferences) {
+            match save_ui_preferences_in(&state.paths.state_dir, &preferences) {
                 Ok(()) => json_response(serde_json::json!({
                     "ok": true,
                     "histogram_sample_percent": preferences.histogram_sample_percent,
@@ -804,17 +1270,17 @@ async fn score_run(State(state): State<Arc<AppState>>,
 
     let st = Arc::clone(&state);
     let job = Arc::clone(&state.job);
-    let root = state.root.clone();
+    let source = state.source.clone();
+    let paths = state.paths.clone();
     let cache_path = state.cache_path.clone();
     let config_path = state.config_path.clone();
-    let xmp = params.xmp;
-    let xmp_exposure = params.xmp_exposure;
     let no_ai = params.no_ai;
+    let _ = (params.xmp, params.xmp_exposure);
     std::thread::spawn(move || {
         let started = std::time::Instant::now();
         job.log("[score] 任务开始");
         // 每次跑批都重新加载配置：UI 里的配置编辑保存后下一次跑批即生效
-        let (cfg, config_exists) = match load_review_config(&root,
+        let (cfg, config_exists) = match load_review_config_in(&paths.state_dir,
             st.config_explicit.then_some(config_path.as_path())) {
             Ok(result) => result,
             Err(err) => {
@@ -829,23 +1295,23 @@ async fn score_run(State(state): State<Arc<AppState>>,
         job.log(if config_exists {
             format!("[score] 配置已加载: {}", config_path.display())
         } else {
-            "[score] 使用内置默认配置（照片根目录尚无 UI 配置）".into()
+            "[score] 使用内置默认配置（工作区尚无 UI 配置）".into()
         });
 
         let opts = crate::score::ScoreJobOptions {
-            output_csv: photo_root_paths(&root).report,
+            output_csv: paths.report.clone(),
             raw_csv: false,
             cache_path: cache_path.clone(),
             no_cache: false,
             no_ai,
-            xmp,
-            xmp_exposure,
+            xmp: false,
+            xmp_exposure: false,
             gpu: false,
             keep_override: None,
             include_raw: st.include_raw,
             skip_processed: true,
         };
-        match crate::score::run_score_job(&root, &cfg, &opts, &|ev| match ev {
+        match crate::score::run_score_job_in_workspace(&source, &paths, &cfg, &opts, &|ev| match ev {
             crate::score::ScoreEvent::Info(s) => job.log(format!("[score] {s}")),
             crate::score::ScoreEvent::Progress { done, total } => job.progress(done, total),
             crate::score::ScoreEvent::Finished { total_jpg, hits, misses } => job.log(format!(
@@ -855,7 +1321,7 @@ async fn score_run(State(state): State<Arc<AppState>>,
             Ok(summary) => {
                 // 快照热替换：新分数立即可见，无需重启服务
                 let feedback = st.scene_feedback.read().unwrap().clone();
-                match snapshot::build_snapshot_with_options(&root, &cfg, &cache_path,
+                match snapshot::build_snapshot_for_workspace(&source, &paths, &cfg, &cache_path,
                     &feedback, st.include_raw, true, &|_, _, _| {}) {
                     Ok(snap) => {
                         *st.snapshot.write().unwrap() = snap;
@@ -866,7 +1332,7 @@ async fn score_run(State(state): State<Arc<AppState>>,
                     }
                 }
                 let summary = format!(
-                    "完成：{} 张 JPG（命中 {}，新分析 {}，失败 {}，ARW 无映射 {}）→ {}",
+                    "完成：{} 张 JPG（命中 {}，新分析 {}，失败 {}，RAW 无映射 {}）→ {}",
                     summary.total_jpg,
                     summary.hits,
                     summary.misses,
@@ -1136,11 +1602,15 @@ async fn export_pick_folder(
     }
     #[cfg(windows)]
     {
-        let root = state.root.clone();
+        let initial_dir = crate::workspace::load_workspace_meta(&state.paths)
+            .and_then(|m| m.last_export_dir)
+            .map(PathBuf::from)
+            .filter(|p| p.is_dir())
+            .unwrap_or_else(|| state.root.clone());
         let picked = match tokio::task::spawn_blocking(move || {
             rfd::FileDialog::new()
                 .set_title("选择导出目标文件夹")
-                .set_directory(&root)
+                .set_directory(&initial_dir)
                 .pick_folder()
         })
         .await
@@ -1155,25 +1625,27 @@ async fn export_pick_folder(
             Ok(p) => p,
             Err(err) => return (StatusCode::BAD_REQUEST, format!("{err:#}")).into_response(),
         };
-        match crate::storage::relative_under_album(&state.root, &normalized) {
-            Ok(Some(rel)) if !rel.as_os_str().is_empty() => {
-                let subdir = rel.to_string_lossy().replace('\\', "/");
-                return json_response(serde_json::json!({
-                    "cancelled": false,
-                    "in_album": true,
-                    "subdir": subdir,
-                    "display_path": normalized.display().to_string(),
-                }));
+        if !state.source.is_dual() {
+            match crate::storage::relative_under_album(&state.root, &normalized) {
+                Ok(Some(rel)) if !rel.as_os_str().is_empty() => {
+                    let subdir = rel.to_string_lossy().replace('\\', "/");
+                    return json_response(serde_json::json!({
+                        "cancelled": false,
+                        "in_album": true,
+                        "subdir": subdir,
+                        "display_path": normalized.display().to_string(),
+                    }));
+                }
+                Ok(Some(_)) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        "导出目录不能是照片根目录本身，请选择其他目录或使用子目录（如 Selected）",
+                    )
+                        .into_response();
+                }
+                Ok(None) => {}
+                Err(err) => return (StatusCode::BAD_REQUEST, format!("{err:#}")).into_response(),
             }
-            Ok(Some(_)) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    "导出目录不能是照片根目录本身，请选择其他目录或使用子目录（如 Selected）",
-                )
-                    .into_response();
-            }
-            Ok(None) => {}
-            Err(err) => return (StatusCode::BAD_REQUEST, format!("{err:#}")).into_response(),
         }
         let mut entropy = [0u8; 16];
         if let Err(err) = getrandom::fill(&mut entropy) {
@@ -1217,9 +1689,10 @@ async fn export_preview(
         let guard = state.snapshot.read().unwrap();
         build_export_items_from_snapshot(&state.root, &guard, &req.filter)
     };
-    let root = state.root.clone();
+    let source = state.source.clone();
     match tokio::task::spawn_blocking(move || {
-        crate::export::plan_export(&root, &items, &all_sources, &opts).map(|plan| plan.preview)
+        crate::export::plan_export_workspace(&source, &items, &all_sources, &opts)
+            .map(|plan| plan.preview)
     })
     .await
     {
@@ -1255,11 +1728,12 @@ async fn export_run(
     }
 
     let job = Arc::clone(&state.job);
-    let root = state.root.clone();
+    let source = state.source.clone();
+    let paths = state.paths.clone();
     std::thread::spawn(move || {
         let started = std::time::Instant::now();
         job.log("[export] 正在规划导出清单…");
-        let plan = match crate::export::plan_export(&root, &items, &all_sources, &opts) {
+        let plan = match crate::export::plan_export_workspace(&source, &items, &all_sources, &opts) {
             Ok(p) => p,
             Err(err) => {
                 job.log(format!("[export] 规划失败: {err:#}"));
@@ -1279,6 +1753,13 @@ async fn export_run(
         }) {
             Ok(summary) => {
                 job.set_last_export_dir(summary.target_path.clone());
+                if !summary.in_album {
+                    let _ = crate::workspace::update_last_export_dir(
+                        &paths,
+                        &source,
+                        &summary.target_path,
+                    );
+                }
                 let mb = summary.bytes_written as f64 / (1024.0 * 1024.0);
                 let prefix = if summary.cancelled { "已取消" } else { "导出完成" };
                 let conflict_note = if summary.conflicts.is_empty() {
@@ -1416,7 +1897,9 @@ async fn burst_keep(State(state): State<Arc<AppState>>,
                 (photo.pair_id.clone(), state.root.join(&photo.path))
             };
 
-            if let Err(err) = crate::decision::set_burst_keep(&state.root, &jpg_path, p.keep) {
+            if let Err(err) =
+                crate::decision::set_burst_keep_in(&state.paths.state_dir, &state.root, &jpg_path, p.keep)
+            {
                 return internal_error(err);
             }
 
@@ -1471,7 +1954,9 @@ async fn scene_feedback_save(State(state): State<Arc<AppState>>,
                     scores: photo.scores.clone(),
                 }
             };
-            if let Err(err) = scene_feedback::append(&state.root, &state.scene_feedback_path, &record) {
+            if let Err(err) =
+                scene_feedback::append(&state.paths.state_dir, &state.scene_feedback_path, &record)
+            {
                 return internal_error(err);
             }
             state.scene_feedback.write().unwrap().insert(record.photo_path.clone(), record.clone());
@@ -1485,8 +1970,7 @@ async fn scene_feedback_save(State(state): State<Arc<AppState>>,
     .await
 }
 
-/// POST /api/rate：UI 内改星——已有 firstcut 侧车时只更新 `xmp:Rating`，不触碰
-/// `firstcut:suggestedEV` 或 Adobe `crs:*` 人工曝光；他人侧车（无 firstcut 命名空间）不覆盖。
+/// POST /api/rate：UI 内改星——持久化到本机工作区 `decisions.sqlite`（源目录零写入；导出时合并进目标 XMP）。
 async fn rate(State(state): State<Arc<AppState>>,
     axum::Json(p): axum::Json<RateParams>) -> Response {
     if !(1..=5).contains(&p.stars) {
@@ -1496,104 +1980,29 @@ async fn rate(State(state): State<Arc<AppState>>,
         state,
         "评分任务进行中或服务正在关闭，暂不能改星",
         move |state| {
-            // 从当前快照取该照片的分数（未评分照片没有可写子分，拒绝）
-            let (scores, total, suggested_ev, pair_id, jpg_path, sidecar_entries) = {
+            let (pair_id, jpg_path) = {
                 let guard = state.snapshot.read().unwrap();
                 let Some(photo) = guard.photos.iter().find(|x| x.path == p.p && !x.is_raw) else {
                     return (StatusCode::NOT_FOUND, "照片不在快照中").into_response();
                 };
-                let Some(s) = &photo.scores else {
+                if photo.scores.is_none() {
                     return (StatusCode::BAD_REQUEST, "该照片未评分，先跑一次评分再改星").into_response();
-                };
-                let px = crate::score::PixelScores {
-                    sharpness: s.sharpness,
-                    exposure: s.exposure,
-                    noise: s.noise,
-                    composition: s.composition,
-                    aesthetic: s.aesthetic,
-                };
-                // 新建侧车时需要完整 PhotoEntry 字段；从快照视图重建
-                let entry = crate::scan::PhotoEntry {
-                    path: state.root.join(&photo.path).display().to_string(),
-                    filename: photo.filename.clone(),
-                    extension: photo.ext.clone(),
-                    is_raw: false,
-                    has_pair: photo.has_pair,
-                    pair_id: photo.pair_id.clone(),
-                    date_time_original: photo.datetime.clone(),
-                    camera_make: String::new(),
-                    camera_model: String::new(),
-                    lens_model: String::new(),
-                    iso: photo.iso.clone(),
-                    f_number: photo.f_number.clone(),
-                    shutter_speed: photo.shutter.clone(),
-                    focal_length: photo.focal.clone(),
-                    sharpness_score: format!("{:.1}", s.sharpness),
-                    exposure_score: format!("{:.1}", s.exposure),
-                    noise_score: format!("{:.1}", s.noise),
-                    composition_score: format!("{:.1}", s.composition),
-                    aesthetic_score: format!("{:.1}", s.aesthetic),
-                    total_score: format!("{:.1}", s.total),
-                    suggested_ev: String::new(),
-                    stars: String::new(),
-                    rating_source: "manual".into(),
-                    faces: photo.faces.to_string(),
-                    analysis_ok: "true".into(),
-                    analysis_mode: photo.analysis_mode.clone().unwrap_or_default(),
-                    burst_group: photo.burst.as_ref().map(|b| b.group.to_string()).unwrap_or_default(),
-                    burst_size: photo.burst.as_ref().map(|b| b.size.to_string()).unwrap_or_default(),
-                    burst_rank: photo.burst.as_ref().map(|b| b.rank.to_string()).unwrap_or_default(),
-                    burst_keep: photo
-                        .burst
-                        .as_ref()
-                        .map(|b| b.keep.to_string())
-                        .unwrap_or_default(),
-                    burst_pose: photo
-                        .burst
-                        .as_ref()
-                        .map(|b| b.pose_cluster.to_string())
-                        .unwrap_or_default(),
-                };
+                }
                 let jpg_path = match guard.photos.iter().find(|x| x.pair_id == photo.pair_id && !x.is_raw) {
                     Some(jpg) => state.root.join(&jpg.path),
                     None => return (StatusCode::BAD_REQUEST, "该照片没有可评分 JPG").into_response(),
                 };
-                let sidecar_entries = guard.photos.iter().filter(|x| x.pair_id == photo.pair_id)
-                    .map(|x| crate::scan::PhotoEntry {
-                        path: state.root.join(&x.path).display().to_string(),
-                        filename: x.filename.clone(),
-                        ..entry.clone()
-                    }).collect::<Vec<_>>();
-                (px, s.total, s.suggested_ev, photo.pair_id.clone(), jpg_path, sidecar_entries)
+                (photo.pair_id.clone(), jpg_path)
             };
-            if let Err(err) = crate::decision::set(&state.root, &jpg_path, p.stars) {
+            if let Err(err) = crate::decision::set_in(&state.paths.state_dir, &state.root, &jpg_path, p.stars) {
                 return internal_error(err);
-            }
-            let mut warnings = Vec::new();
-            let mut seen = std::collections::HashSet::new();
-            for entry in &sidecar_entries {
-                let sidecar = Path::new(&entry.path)
-                    .with_file_name(format!("{}.xmp", crate::scan::stem_raw_of(&entry.filename)));
-                if !seen.insert(sidecar) { continue; }
-                match crate::output::xmp::write_sidecar_with_mode(
-                    &state.root,
-                    entry,
-                    &scores,
-                    total,
-                    p.stars,
-                    suggested_ev,
-                    crate::output::xmp::XmpWriteMode::RatingOnly,
-                ) {
-                    Ok(true) => {},
-                    Ok(false) => warnings.push(format!("{} 已有其他软件的侧车，未覆盖", entry.path)),
-                    Err(err) => warnings.push(format!("{} 侧车写入失败: {err:#}", entry.path)),
-                }
             }
             let mut guard = state.snapshot.write().unwrap();
             for photo in guard.photos.iter_mut().filter(|x| x.pair_id == pair_id) {
                 photo.stars = Some(p.stars);
                 photo.rating_source = Some("manual".into());
             }
+            let warnings: Vec<String> = Vec::new();
             json_response(serde_json::json!({ "ok": true, "stars": p.stars, "warnings": warnings }))
         },
     )
@@ -1602,11 +2011,11 @@ async fn rate(State(state): State<Arc<AppState>>,
 
 /// GET /api/config：当前可编辑配置值（文件不存在时为内置默认）
 async fn config_get(State(state): State<Arc<AppState>>) -> Response {
-    let root = state.root.clone();
+    let state_dir = state.paths.state_dir.clone();
     let config_path = state.config_path.clone();
     let explicit = state.config_explicit;
     match tokio::task::spawn_blocking(move || {
-        load_review_config(&root, explicit.then_some(config_path.as_path()))
+        load_review_config_in(&state_dir, explicit.then_some(config_path.as_path()))
             .map(|(cfg, exists)| (config_path, cfg, exists))
     }).await {
         Ok(Ok((path, cfg, exists))) => json_response(serde_json::json!({
@@ -1627,7 +2036,7 @@ async fn config_save(
     run_serialized_mutation(
         state,
         "评分任务进行中或服务正在关闭，暂不能保存配置",
-        move |state| match config_edit::save_in(&state.root, &state.config_path, &values) {
+        move |state| match config_edit::save_in(&state.paths.state_dir, &state.config_path, &values) {
             Ok(()) => {
                 let note = "已保存；下一次 UI 跑批生效";
                 json_response(serde_json::json!({ "ok": true, "note": note }))
@@ -1660,7 +2069,11 @@ fn resolve_jpeg(state: &AppState, p: &str) -> std::result::Result<std::fs::File,
     if !allowed {
         return Err(StatusCode::NOT_FOUND.into_response());
     }
-    match FileRef::inside(&state.root, &state.root.join(p)).and_then(|file| file.open_read()) {
+    match state
+        .source
+        .file_ref_for_photo(false, &state.source.photo_full(false, p))
+        .and_then(|file| file.open_read())
+    {
         Ok(Some(file)) => Ok(file),
         Ok(None) => Err(StatusCode::NOT_FOUND.into_response()),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound =>
@@ -1740,21 +2153,19 @@ mod tests {
             action: Mutex::new(None), notify: Notify::new(), session_id: 1,
         });
         let state = Arc::new(AppState {
+            source: WorkspaceSource::Single { root: PathBuf::new() },
+            paths: WorkspacePaths::in_state_dir(PathBuf::new()),
             root: PathBuf::new(), cache_path: PathBuf::new(), config_path: PathBuf::new(),
             config_explicit: false, scene_feedback: RwLock::new(HashMap::new()),
             scene_feedback_path: PathBuf::new(),
             image_slots: Arc::new(Semaphore::new(2)), thumb_slots: Arc::new(Semaphore::new(1)),
-            snapshot: RwLock::new(Snapshot {
-                root: String::new(), weights: snapshot::WeightsJson {
-                    sharpness: 0.3, exposure: 0.25, noise: 0.15,
-                    composition: 0.15, aesthetic: 0.15,
-                }, photos: vec![],
-            }),
+            snapshot: RwLock::new(Snapshot::empty(&PathBuf::new(), &ScoreConfig::default())),
             loading: AtomicBool::new(false), load_error: Mutex::new(None),
             load_progress: Mutex::new(LoadProgress { phase: String::new(), done: 0, total: 0 }),
             include_raw: true,
             local_desktop: false,
             approved_export_dirs: Mutex::new(Vec::new()),
+            last_export_target: None,
             job: Arc::new(JobState::new()),
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
             control: Some(Arc::clone(&control)),
@@ -1832,6 +2243,8 @@ mod tests {
         // A second file on disk must not be served until the catalogue is refreshed.
         std::fs::write(dir.join("d/unlisted.jpg"), b"unlisted").unwrap();
         let state = AppState {
+            source: WorkspaceSource::Single { root: dir.clone() },
+            paths: WorkspacePaths::in_state_dir(dir.join(".firstcut")),
             root: dir.clone(),
             cache_path: dir.join("c.sqlite"),
             config_path: dir.join("firstcut.toml"),
@@ -1846,6 +2259,7 @@ mod tests {
             include_raw: true,
             local_desktop: false,
             approved_export_dirs: Mutex::new(Vec::new()),
+            last_export_target: None,
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
             control: None,
         };
@@ -1874,19 +2288,28 @@ mod tests {
                 suggested_keep: true, manual_keep: None, pose_cluster: 1 }),
         };
         let state = Arc::new(AppState {
+            source: WorkspaceSource::Single { root: dir.clone() },
+            paths: WorkspacePaths::in_state_dir(dir.join(".firstcut")),
             root: dir.clone(), cache_path: dir.join("cache.sqlite"), config_path: dir.join("config.toml"),
             config_explicit: false,
             scene_feedback: RwLock::new(HashMap::new()), scene_feedback_path: scene_feedback::store_path(&dir),
             image_slots: Arc::new(Semaphore::new(2)), thumb_slots: Arc::new(Semaphore::new(1)),
-            snapshot: RwLock::new(Snapshot { root: dir.display().to_string(),
+            snapshot: RwLock::new(Snapshot {
+                root: dir.display().to_string(),
+                source_mode: "single".into(),
+                jpg_root: dir.display().to_string(),
+                raw_root: None,
                 weights: snapshot::WeightsJson { sharpness: 0.3, exposure: 0.25, noise: 0.15,
-                    composition: 0.15, aesthetic: 0.15 }, photos: vec![photo] }),
+                    composition: 0.15, aesthetic: 0.15 },
+                photos: vec![photo],
+            }),
             job: Arc::new(JobState::new()),
             loading: AtomicBool::new(false), load_error: Mutex::new(None),
             load_progress: Mutex::new(LoadProgress { phase: String::new(), done: 0, total: 0 }),
             include_raw: true,
             local_desktop: false,
             approved_export_dirs: Mutex::new(Vec::new()),
+            last_export_target: None,
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
             control: None,
         });
@@ -1933,19 +2356,28 @@ mod tests {
                 reason: "检测到 1 张人脸".into() }, scene_feedback: None,
         };
         let state = Arc::new(AppState {
+            source: WorkspaceSource::Single { root: dir.clone() },
+            paths: WorkspacePaths::in_state_dir(dir.join(".firstcut")),
             root: dir.clone(), cache_path: dir.join("cache.sqlite"), config_path: dir.join("config.toml"),
             config_explicit: false,
             scene_feedback: RwLock::new(HashMap::new()), scene_feedback_path: feedback_path.clone(),
             image_slots: Arc::new(Semaphore::new(2)), thumb_slots: Arc::new(Semaphore::new(1)),
-            snapshot: RwLock::new(Snapshot { root: dir.display().to_string(),
+            snapshot: RwLock::new(Snapshot {
+                root: dir.display().to_string(),
+                source_mode: "single".into(),
+                jpg_root: dir.display().to_string(),
+                raw_root: None,
                 weights: snapshot::WeightsJson { sharpness: 0.3, exposure: 0.25, noise: 0.15,
-                    composition: 0.15, aesthetic: 0.15 }, photos: vec![photo] }),
+                    composition: 0.15, aesthetic: 0.15 },
+                photos: vec![photo],
+            }),
             job: Arc::new(JobState::new()),
             loading: AtomicBool::new(false), load_error: Mutex::new(None),
             load_progress: Mutex::new(LoadProgress { phase: String::new(), done: 0, total: 0 }),
             include_raw: true,
             local_desktop: false,
             approved_export_dirs: Mutex::new(Vec::new()),
+            last_export_target: None,
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
             control: None,
         });
@@ -1984,14 +2416,22 @@ mod tests {
             scene_feedback: None,
         };
         let state = Arc::new(AppState {
+            source: WorkspaceSource::Single { root: dir.clone() },
+            paths: WorkspacePaths::in_state_dir(dir.join(".firstcut")),
             root: dir.clone(), cache_path: dir.join(".firstcut/cache.sqlite"),
             config_path: dir.join(".firstcut/config.toml"),
             config_explicit: false,
             scene_feedback: RwLock::new(HashMap::new()), scene_feedback_path: scene_feedback::store_path(&dir),
             image_slots: Arc::new(Semaphore::new(2)), thumb_slots: Arc::new(Semaphore::new(1)),
-            snapshot: RwLock::new(Snapshot { root: dir.display().to_string(),
+            snapshot: RwLock::new(Snapshot {
+                root: dir.display().to_string(),
+                source_mode: "single".into(),
+                jpg_root: dir.display().to_string(),
+                raw_root: None,
                 weights: snapshot::WeightsJson { sharpness: 0.3, exposure: 0.25, noise: 0.15,
-                    composition: 0.15, aesthetic: 0.15 }, photos: vec![photo] }),
+                    composition: 0.15, aesthetic: 0.15 },
+                photos: vec![photo],
+            }),
             job: Arc::new(JobState::new()),
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
             loading: AtomicBool::new(false), load_error: Mutex::new(None),
@@ -1999,6 +2439,7 @@ mod tests {
             include_raw: true,
             local_desktop: false,
             approved_export_dirs: Mutex::new(Vec::new()),
+            last_export_target: None,
             control: None,
         });
         let mut tasks = Vec::new();
@@ -2014,20 +2455,17 @@ mod tests {
         let final_star = state.snapshot.read().unwrap().photos[0].stars.unwrap();
         let saved = crate::decision::load(&dir).unwrap();
         assert_eq!(saved.get("a.jpg").copied(), Some(final_star), "快照与决定库星级必须一致");
-        let sidecar = std::fs::read_to_string(dir.join("a.xmp")).unwrap();
-        assert!(sidecar.contains(&format!("<xmp:Rating>{final_star}</xmp:Rating>")), "XMP 与快照星级必须一致");
-        assert!(sidecar.contains("<firstcut:suggestedEV>+0.33</firstcut:suggestedEV>"));
-        assert!(!sidecar.contains("crs:Exposure2012"), "改星新建侧车默认不应写入 Adobe crs:Exposure2012");
+        assert!(!dir.join("a.xmp").exists(), "Web 改星不得向源目录写入 XMP");
     }
 
     #[tokio::test]
     async fn rate_preserves_existing_lightroom_exposure_on_disk() {
         let temp = tempfile::tempdir().unwrap();
-        let dir = temp.path().to_path_buf();
+        let dir = temp.path().join("album");
+        let export_dir = temp.path().join("Exported");
+        std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("a.jpg"), b"jpg").unwrap();
-        std::fs::write(
-            dir.join("a.xmp"),
-            "<?xpacket begin=\"\u{feff}\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\n\
+        let original_xmp = "<?xpacket begin=\"\u{feff}\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\n\
              <x:xmpmeta xmlns:x=\"adobe:ns:meta/\">\n\
               <rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n\
                <rdf:Description rdf:about=\"\"\n\
@@ -2049,9 +2487,8 @@ mod tests {
                </rdf:Description>\n\
               </rdf:RDF>\n\
              </x:xmpmeta>\n\
-             <?xpacket end=\"w\"?>",
-        )
-        .unwrap();
+             <?xpacket end=\"w\"?>";
+        std::fs::write(dir.join("a.xmp"), original_xmp).unwrap();
         let photo = snapshot::PhotoJson {
             path: "a.jpg".into(), filename: "a.jpg".into(), ext: "jpg".into(),
             is_raw: false, has_pair: false, pair_id: "a".into(), datetime: String::new(),
@@ -2064,14 +2501,22 @@ mod tests {
             scene_feedback: None,
         };
         let state = Arc::new(AppState {
+            source: WorkspaceSource::Single { root: dir.clone() },
+            paths: WorkspacePaths::in_state_dir(dir.join(".firstcut")),
             root: dir.clone(), cache_path: dir.join(".firstcut/cache.sqlite"),
             config_path: dir.join(".firstcut/config.toml"),
             config_explicit: false,
             scene_feedback: RwLock::new(HashMap::new()), scene_feedback_path: scene_feedback::store_path(&dir),
             image_slots: Arc::new(Semaphore::new(2)), thumb_slots: Arc::new(Semaphore::new(1)),
-            snapshot: RwLock::new(Snapshot { root: dir.display().to_string(),
+            snapshot: RwLock::new(Snapshot {
+                root: dir.display().to_string(),
+                source_mode: "single".into(),
+                jpg_root: dir.display().to_string(),
+                raw_root: None,
                 weights: snapshot::WeightsJson { sharpness: 0.3, exposure: 0.25, noise: 0.15,
-                    composition: 0.15, aesthetic: 0.15 }, photos: vec![photo] }),
+                    composition: 0.15, aesthetic: 0.15 },
+                photos: vec![photo],
+            }),
             job: Arc::new(JobState::new()),
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
             loading: AtomicBool::new(false), load_error: Mutex::new(None),
@@ -2079,6 +2524,7 @@ mod tests {
             include_raw: true,
             local_desktop: false,
             approved_export_dirs: Mutex::new(Vec::new()),
+            last_export_target: None,
             control: None,
         });
 
@@ -2086,11 +2532,25 @@ mod tests {
             p: "a.jpg".into(), stars: 5,
         })).await;
         assert_eq!(response.status(), StatusCode::OK);
-        let sidecar = std::fs::read_to_string(dir.join("a.xmp")).unwrap();
-        assert!(sidecar.contains("<xmp:Rating>5</xmp:Rating>"));
-        assert!(sidecar.contains("crs:Exposure2012=\"+1.75\""), "改星不得覆盖已有 Lightroom 人工曝光");
-        assert!(sidecar.contains("crs:Shadows2012=\"+35\""));
-        assert!(!sidecar.contains("+0.33"), "改星不应把建议 EV 写入已有侧车");
+        // 源目录 XMP 保持只读零写入
+        assert_eq!(std::fs::read_to_string(dir.join("a.xmp")).unwrap(), original_xmp);
+
+        // 导出时在内存中合并最新 5★ 到目标 XMP，同时保留原有 Lightroom 曝光
+        let (items, all_sources) = {
+            let guard = state.snapshot.read().unwrap();
+            build_export_items_from_snapshot(&state.root, &guard, &ExportFilterPayload::default())
+        };
+        let opts = crate::export::ExportOptions {
+            target: crate::export::ExportTarget::ExternalDir(export_dir.clone()),
+            ..Default::default()
+        };
+        let plan = crate::export::plan_export_workspace(&state.source, &items, &all_sources, &opts).unwrap();
+        crate::export::run_export(&plan, &AtomicBool::new(false), &|_| {}).unwrap();
+        let exported_sidecar = std::fs::read_to_string(export_dir.join("JPG/a.xmp")).unwrap();
+        assert!(exported_sidecar.contains("<xmp:Rating>5</xmp:Rating>"));
+        assert!(exported_sidecar.contains("crs:Exposure2012=\"+1.75\""), "导出合并不得覆盖已有 Lightroom 人工曝光");
+        assert!(exported_sidecar.contains("crs:Shadows2012=\"+35\""));
+        assert!(!exported_sidecar.contains("crs:Exposure2012=\"+0.33\""), "导出合并已有 firstcut 侧车时不应把建议 EV 写入 crs:Exposure2012");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2108,6 +2568,8 @@ mod tests {
                 suggested_keep: true, manual_keep: None, pose_cluster: 1 }),
         };
         let state = Arc::new(AppState {
+            source: WorkspaceSource::Single { root: dir.clone() },
+            paths: WorkspacePaths::in_state_dir(dir.join(".firstcut")),
             root: dir.clone(), cache_path: dir.join(".firstcut/cache.sqlite"),
             config_path: dir.join(".firstcut/config.toml"),
             config_explicit: false,
@@ -2115,6 +2577,9 @@ mod tests {
             image_slots: Arc::new(Semaphore::new(2)), thumb_slots: Arc::new(Semaphore::new(1)),
             snapshot: RwLock::new(Snapshot {
                 root: dir.display().to_string(),
+                source_mode: "single".into(),
+                jpg_root: dir.display().to_string(),
+                raw_root: None,
                 weights: snapshot::WeightsJson { sharpness: 0.3, exposure: 0.25, noise: 0.15,
                     composition: 0.15, aesthetic: 0.15 },
                 photos: vec![make_photo("a.jpg", "a"), make_photo("b.jpg", "b")],
@@ -2126,6 +2591,7 @@ mod tests {
             include_raw: true,
             local_desktop: false,
             approved_export_dirs: Mutex::new(Vec::new()),
+            last_export_target: None,
             control: None,
         });
 
@@ -2237,12 +2703,17 @@ mod tests {
         ];
 
         let state = Arc::new(AppState {
+            source: WorkspaceSource::Single { root: dir.clone() },
+            paths: WorkspacePaths::in_state_dir(dir.join(".firstcut")),
             root: dir.clone(), cache_path: dir.join(".firstcut/cache.sqlite"),
             config_path: dir.join(".firstcut/config.toml"), config_explicit: false,
             scene_feedback: RwLock::new(HashMap::new()), scene_feedback_path: scene_feedback::store_path(&dir),
             image_slots: Arc::new(Semaphore::new(2)), thumb_slots: Arc::new(Semaphore::new(1)),
             snapshot: RwLock::new(Snapshot {
                 root: dir.display().to_string(),
+                source_mode: "single".into(),
+                jpg_root: dir.display().to_string(),
+                raw_root: None,
                 weights: snapshot::WeightsJson { sharpness: 0.3, exposure: 0.25, noise: 0.15, composition: 0.15, aesthetic: 0.15 },
                 photos,
             }),
@@ -2253,6 +2724,7 @@ mod tests {
             include_raw: true,
             local_desktop: false,
             approved_export_dirs: Mutex::new(Vec::new()),
+            last_export_target: None,
             control: None,
         });
 
@@ -2328,6 +2800,8 @@ mod tests {
         std::fs::write(dir.join("RAW/only.ARW"), b"raw").unwrap();
 
         let state = Arc::new(AppState {
+            source: WorkspaceSource::Single { root: dir.clone() },
+            paths: WorkspacePaths::in_state_dir(dir.join(".firstcut")),
             root: dir.clone(),
             cache_path: dir.join(".firstcut/cache.sqlite"),
             config_path: dir.join(".firstcut/config.toml"),
@@ -2338,6 +2812,9 @@ mod tests {
             thumb_slots: Arc::new(Semaphore::new(1)),
             snapshot: RwLock::new(Snapshot {
                 root: dir.display().to_string(),
+                source_mode: "single".into(),
+                jpg_root: dir.display().to_string(),
+                raw_root: None,
                 weights: snapshot::WeightsJson {
                     sharpness: 0.3,
                     exposure: 0.25,
@@ -2383,6 +2860,7 @@ mod tests {
             include_raw: false,
             local_desktop: false,
             approved_export_dirs: Mutex::new(Vec::new()),
+            last_export_target: None,
             control: None,
         });
 
@@ -2397,5 +2875,61 @@ mod tests {
         let resp = export_preview(State(state), axum::Json(req)).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         assert!(!dir.join("RAW").join(crate::scan::EXPORT_MARKER_NAME).exists());
+    }
+
+    #[tokio::test]
+    async fn welcome_router_picks_validates_and_opens_single_and_dual_workspaces() {
+        let temp = tempfile::tempdir().unwrap();
+        let jpg_dir = temp.path().join("jpg_card");
+        let raw_dir = temp.path().join("raw_card");
+        std::fs::create_dir_all(&jpg_dir).unwrap();
+        std::fs::create_dir_all(&raw_dir).unwrap();
+
+        let state = Arc::new(WelcomeState {
+            local_desktop: true,
+            approved_picks: Mutex::new(Vec::new()),
+            outcome: Mutex::new(None),
+            notify: Notify::new(),
+            session_id: 42,
+        });
+        let jpg_token = mint_pick_token(&state.approved_picks, jpg_dir.clone()).unwrap();
+        let raw_token = mint_pick_token(&state.approved_picks, raw_dir.clone()).unwrap();
+
+        // 1) 伪造 pick_id 必须被拒绝
+        let bad_resp = welcome_open(
+            State(Arc::clone(&state)),
+            axum::Json(serde_json::from_value(serde_json::json!({
+                "mode": "single",
+                "root_pick_id": "forged-token"
+            })).unwrap()),
+        )
+        .await;
+        assert_eq!(bad_resp.status(), StatusCode::BAD_REQUEST);
+
+        // 2) 双目录选同一个目录必须被拒绝
+        let same_resp = welcome_open(
+            State(Arc::clone(&state)),
+            axum::Json(serde_json::from_value(serde_json::json!({
+                "mode": "dual",
+                "jpg_pick_id": jpg_token,
+                "raw_pick_id": jpg_token
+            })).unwrap()),
+        )
+        .await;
+        assert_eq!(same_resp.status(), StatusCode::BAD_REQUEST);
+
+        // 3) 合法双目录打开成功并写入 outcome
+        let ok_resp = welcome_open(
+            State(Arc::clone(&state)),
+            axum::Json(serde_json::from_value(serde_json::json!({
+                "mode": "dual",
+                "jpg_pick_id": jpg_token,
+                "raw_pick_id": raw_token
+            })).unwrap()),
+        )
+        .await;
+        assert_eq!(ok_resp.status(), StatusCode::OK);
+        let outcome = state.outcome.lock().unwrap().take();
+        assert!(matches!(outcome, Some(WelcomeOutcome::Open(WorkspaceSource::Dual { .. }))));
     }
 }

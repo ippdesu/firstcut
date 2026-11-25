@@ -311,7 +311,8 @@ fn bounded_line(mut line: String) -> String {
 
 /// 追加一行并将单个日志文件限制在 256 KiB。超过上限时先保留末尾约 128 KiB。
 fn append_bounded(root: &Path, path: &Path, line: &str) -> io::Result<()> {
-    let target = crate::storage::FileRef::inside(root, path)?;
+    crate::storage::Folder::open_or_create_explicit(root, true)?;
+    let target = crate::storage::FileRef::at(root, path, true)?;
     let mut file = target.open_update()?;
     file.try_lock().map_err(std::io::Error::from)?;
     target.check_opened(&file)?;

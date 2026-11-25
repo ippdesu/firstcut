@@ -1,6 +1,6 @@
-# firstcut — 索尼照片本地初筛与复核工具
+# firstcut — 本地照片初筛与复核工具
 
-用 Rust 编写的本地照片初筛评分与复核工具：扫描索尼相机 `JPG + ARW` 目录，对 JPG 做**五维评分**（清晰度 / 曝光 / 噪点 / 构图 / 美学）与**连拍姿态去重**，提供本地 Web 复核界面，并输出 **CSV 报告** 与 **Lightroom XMP 星级侧车**。全程本地运行，照片不上传、不删改原片。
+用 Rust 编写的本地照片初筛评分与复核工具：支持单目录（`JPG + RAW` 同目录或子目录）与**双目录/双卡直连**（独立的 JPG 目录 + RAW 目录，兼容索尼 `.arw`、尼康 `.nef`/`.nrw`、佳能 `.cr2`/`.cr3`/`.crw`、松下 `.rw2`、富士 `.raf` 及 `.dng`/`.orf`/`.pef`），对 JPG 做**五维评分**（清晰度 / 曝光 / 噪点 / 构图 / 美学）与**连拍姿态去重**，提供本地 Web 复核界面，并输出 **CSV 报告** 与 **Lightroom XMP 星级侧车**。全程本地运行，照片不上传、不删改原片，Web UI 也不向源照片目录/存储卡写入任何状态文件。
 
 > **当前版本**：`v1.4.2`（提供 Windows 可执行程序与 Linux `amd64` / `arm64` 容器镜像）
 > **当前边界**：聚焦本地初筛、人工复核与 Lightroom 元数据交接；图像分析支持 SDR JPEG；darktable 批量 RAW 开发路线已停止（见 [历史研究档案](docs/history/DARKTABLE_PHASE2_RESEARCH.md)）。
@@ -31,8 +31,8 @@ JPEG 解码 + 像素指标 (decode / metrics) + ONNX AI 推理 (ai: SCRFD / YOLO
 CSV 报告 / XMP 侧车 (output)  &  本地 Web 复核台 (review: axum + 内嵌前端)
 ```
 
-- **四层数据分离**：原始照片（只读资产）→ 可重建分析缓存（`.firstcut/cache.sqlite`）→ 运行期算法建议（`selection` 共用逻辑）→ 持久化人工决定（`.firstcut/decisions.sqlite`，重评分不覆盖）。
-- **UI 与 CLI 统一**：同一照片根目录共用 `.firstcut/` 下的缓存、配置、报告与 RAW 关联偏好，避免切换入口导致数据不一致。
+- **四层数据分离与零写入源目录**：原始照片/存储卡（只读资产）→ 可重建分析缓存（`cache.sqlite`）→ 运行期算法建议（`selection` 共用逻辑）→ 持久化人工决定（`decisions.sqlite`，重评分不覆盖）。所有运行态数据统一存放在本机应用数据目录（Windows 默认 `%LOCALAPPDATA%\firstcut\workspaces\<工作区ID>\`，Linux 默认 `${XDG_DATA_HOME:-$HOME/.local/share}/firstcut/workspaces/<工作区ID>/`，可通过 `FIRSTCUT_DATA_DIR` 覆盖）；单目录模式下首次打开会自动只读导入旧版 `<照片目录>/.firstcut/` 历史数据。
+- **UI 与 CLI 统一**：同一工作区（单目录或 `--raw-dir` 双目录）共用本地数据目录下的缓存、配置、报告与 RAW 关联偏好，避免切换入口导致数据不一致。
 - 详细架构约定、算法细节与安全设计见 [`docs/DESIGN.md`](docs/DESIGN.md)。
 
 ---
@@ -43,33 +43,37 @@ CSV 报告 / XMP 侧车 (output)  &  本地 Web 复核台 (review: axum + 内嵌
 
 从 [GitHub Releases](https://github.com/ippdesu/firstcut/releases) 下载发行包，双击 `firstcut-ui.exe`：
 
-1. **选择照片根目录**：
-   - 若 JPG 与 RAW 分放在 `JPG/`、`RAW/` 子目录，请选择同时包含两者的**活动根目录**；仅有 JPG 时可直接选 JPG 目录。
-   - 默认递归扫描所选目录，并跳过名为 `Processed/` 的输出子目录（要浏览成片可直接选择 `Processed/` 本身；建议不要把成片散放在活动根目录顶层）。
+1. **Web 欢迎入口与工作区选择**：
+   - 双击 `firstcut-ui.exe` 直接在浏览器打开本地 Web 欢迎页（不再前置阻塞弹窗），支持**单目录模式**与**双卡/双目录模式**（分别选择 JPG 目录与 RAW 目录），并展示最多 10 个**最近工作区**及可用性状态。
+   - 默认递归扫描所选目录，并跳过名为 `Processed/` 的输出子目录及含 `.firstcut-export` 标记的导出目录（要浏览成片可直接选择 `Processed/` 本身；建议不要把成片散放在活动根目录顶层）。
 2. **模型目录**：发行包不含 AI 模型（见下方[模型准备](#模型准备一次性)）。请将模型放到 `firstcut-ui.exe` 同级的 `models/` 目录（开发环境下启动器也会自动向上查找仓库根目录的 `models/`）。
-3. **浏览与操作**：
-   - 浏览器自动打开并登录，立即展示扫描阶段与进度；未找到已有评分时，可重选目录或先以未评分状态浏览，再通过侧栏**“重新评分”**触发跑批。
-   - 侧栏支持切换照片目录与**“关联同名 RAW 照片”**开关（偏好保存在 `.firstcut/ui-preferences.json`，UI 与 CLI 共用）。
+3. **浏览、复核与导出**：
+   - 浏览器自动打开并登录，立即展示扫描阶段与进度；未找到已有评分时，可切回欢迎页重选或先以未评分状态浏览，再通过侧栏**“重新评分”**触发跑批。
+   - 侧栏支持**“切换工作区 / 返回入口”**与**“关联同名 RAW 照片”**开关（偏好保存在本机工作区状态目录，UI 与 CLI 共用，不写入源照片目录）。
+   - 双目录模式下导出默认指向本机独立目标目录（记住上次导出路径，阻止写入源卡根目录/上级目录），并在内存中将最新人工星级合并进导出的 XMP 侧车。
    - 页面右上角提供**“重启服务”**（重载配置与快照）和**“退出程序”**（释放 `8787` 端口）；评分运行中会拒绝这两项操作。仅关闭浏览器标签页不会退出服务，再次双击 `firstcut-ui.exe` 可重新打开运行中的页面。
 
 ### 方式二：命令行（CLI）
 
 ```bash
-# 1. 仅扫描建索引（EXIF + JPG/ARW 配对，不评分）
-pic_process scan <照片目录>                  # 默认写入 <照片目录>/.firstcut/scan-report.csv
+# 1. 仅扫描建索引（EXIF + JPG/RAW 配对，不评分；支持 --raw-dir 双目录）
+pic_process scan <照片目录>
+pic_process scan <JPG目录> --raw-dir <RAW目录>
 
-# 2. 五维评分 + 连拍去重（增量缓存，第二次运行几乎秒级）
-pic_process score <照片目录>                 # 默认写入 <照片目录>/.firstcut/report.csv 与 cache.sqlite
+# 2. 五维评分 + 连拍去重（增量缓存，状态写入本机数据目录）
+pic_process score <照片目录>
+pic_process score <JPG目录> --raw-dir <RAW目录>
 
-# 3. 评分并导出 Lightroom XMP 星级侧车
+# 3. 单目录 CLI 评分并导出 Lightroom XMP 星级侧车（双目录模式请通过 export 导出 XMP）
 pic_process score <照片目录> --xmp
 
 # 4. 启动本地 Web 复核界面（默认监听 http://127.0.0.1:8787，终端 Ctrl+C 退出）
 pic_process review <照片目录>
-pic_process review <照片目录> --port 9000 --config stage.toml
+pic_process review <JPG目录> --raw-dir <RAW目录> --port 9000 --config stage.toml
 
-# 5. 将筛选命中的 JPG/RAW/XMP 非破坏性复制到子目录（默认按 JPG/ + RAW/ 分开）
+# 5. 将筛选命中的 JPG/RAW/XMP 非破坏性复制到目标目录（默认按 JPG/ + RAW/ 分开；双目录需指定绝对路径）
 pic_process export <照片目录> --min-stars 4 --keep-only --to Selected
+pic_process export <JPG目录> --raw-dir <RAW目录> --min-stars 4 --to D:\Export\Selected
 pic_process export <照片目录> --stars 4,5 --keep-only --layout flat --dry-run
 
 # 6. 生成评分配置模板或场景预设（portrait / stage / highkey / sports / lowlight）

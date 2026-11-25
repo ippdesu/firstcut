@@ -111,7 +111,11 @@ fn load_legacy_burst_json(state: &Folder) -> Result<HashMap<String, bool>> {
 }
 
 pub fn load(root: &Path) -> Result<HashMap<String, u8>> {
-    let state = match Folder::open(root)?.state(false) {
+    load_in(&root.join(".firstcut"))
+}
+
+pub fn load_in(state_dir: &Path) -> Result<HashMap<String, u8>> {
+    let state = match Folder::open_or_create_explicit(state_dir, false) {
         Ok(dir) => dir,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
         Err(err) => return Err(err.into()),
@@ -129,9 +133,13 @@ pub fn load(root: &Path) -> Result<HashMap<String, u8>> {
 }
 
 pub fn set(root: &Path, jpg: &Path, stars: u8) -> Result<()> {
+    set_in(&root.join(".firstcut"), root, jpg, stars)
+}
+
+pub fn set_in(state_dir: &Path, jpg_root: &Path, jpg: &Path, stars: u8) -> Result<()> {
     anyhow::ensure!((1..=5).contains(&stars), "星级必须在 1~5");
-    let key = relative_key(root, jpg)?;
-    let state = Folder::open(root)?.state(true)?;
+    let key = relative_key(jpg_root, jpg)?;
+    let state = Folder::open_or_create_explicit(state_dir, true)?;
     let mut db = Database::open(state.file(DECISIONS_DB)?, true)?
         .context("人工评分数据库不可用")?;
     ensure_schema(&db.conn)?;
@@ -145,10 +153,14 @@ pub fn set(root: &Path, jpg: &Path, stars: u8) -> Result<()> {
 
 /// 读取人工连拍保留覆盖（照片相对路径 → 是否保留）。
 ///
-/// 优先读取 `.firstcut/decisions.sqlite` 中的 `manual_burst_keep`；若尚未完成旧版
-/// `.firstcut/burst-overrides.json` 迁移，则以只读方式合并旧 JSON 条目（SQLite 优先）。
+/// 优先读取 `decisions.sqlite` 中的 `manual_burst_keep`；若尚未完成旧版
+/// `burst-overrides.json` 迁移，则以只读方式合并旧 JSON 条目（SQLite 优先）。
 pub fn load_burst_overrides(root: &Path) -> Result<HashMap<String, bool>> {
-    let state = match Folder::open(root)?.state(false) {
+    load_burst_overrides_in(&root.join(".firstcut"))
+}
+
+pub fn load_burst_overrides_in(state_dir: &Path) -> Result<HashMap<String, bool>> {
+    let state = match Folder::open_or_create_explicit(state_dir, false) {
         Ok(dir) => dir,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
         Err(err) => return Err(err.into()),
@@ -176,11 +188,20 @@ pub fn load_burst_overrides(root: &Path) -> Result<HashMap<String, bool>> {
 
 /// 设置或清除单张照片的人工连拍保留覆盖（`None` 表示恢复算法建议）。
 ///
-/// 首次写入时在事务内自动把旧版 `.firstcut/burst-overrides.json` 导入 SQLite 并记录
+/// 首次写入时在事务内自动把旧版 `burst-overrides.json` 导入 SQLite 并记录
 /// 迁移标记，保证删除某条覆盖后不会被旧 JSON 复活，且不破坏原 JSON 文件。
 pub fn set_burst_keep(root: &Path, jpg: &Path, keep: Option<bool>) -> Result<()> {
-    let key = relative_key(root, jpg)?;
-    let state = Folder::open(root)?.state(true)?;
+    set_burst_keep_in(&root.join(".firstcut"), root, jpg, keep)
+}
+
+pub fn set_burst_keep_in(
+    state_dir: &Path,
+    jpg_root: &Path,
+    jpg: &Path,
+    keep: Option<bool>,
+) -> Result<()> {
+    let key = relative_key(jpg_root, jpg)?;
+    let state = Folder::open_or_create_explicit(state_dir, true)?;
     let mut db = Database::open(state.file(DECISIONS_DB)?, true)?
         .context("人工评分数据库不可用")?;
     ensure_schema(&db.conn)?;

@@ -22,6 +22,7 @@ use crate::config::ScoreConfig;
 use crate::scan::{self, PhotoEntry, EXPORT_MARKER_NAME};
 use crate::score::{self, AnalysisResult, PixelScores};
 use crate::storage::{self, ExportWriteOutcome, FileRef, Folder};
+use crate::workspace::{WorkspacePaths, WorkspaceSource};
 
 /// 预留磁盘安全余量（64 MiB），低于此余量在预览阶段发出空间警告。
 const DISK_HEADROOM_BYTES: u64 = 64 * 1024 * 1024;
@@ -295,9 +296,9 @@ struct PlannedFile {
     action: FileAction,
 }
 
-/// 完整的导出执行计划（由 `plan_export` 产出，可供预览并直接交给 `run_export` 执行）
+/// 完整的导出执行计划（由 `plan_export_workspace` / `plan_export` 产出，可供预览并直接交给 `run_export` 执行）
 pub struct ExportPlan {
-    root: PathBuf,
+    source: WorkspaceSource,
     album_id: String,
     target: ResolvedTarget,
     photo_slots: Vec<PhotoSlotSpec>,
@@ -312,9 +313,24 @@ impl ExportPlan {
     }
 }
 
-/// 供 CLI `export` 使用：扫描目录、读缓存与统一决定库、按筛选条件构建导出列表。
+/// 供 CLI `export` 使用（单目录兼容封装）。
 pub fn collect_items_for_cli(
     root: &Path,
+    cfg: &ScoreConfig,
+    cache_path: &Path,
+    filter: &ExportFilter,
+) -> Result<(Vec<ExportPhotoItem>, Vec<String>)> {
+    let source = WorkspaceSource::Single {
+        root: root.to_path_buf(),
+    };
+    let paths = WorkspacePaths::in_state_dir(root.join(".firstcut"));
+    collect_items_for_cli_in_workspace(&source, &paths, cfg, cache_path, filter)
+}
+
+/// 供 CLI `export` 使用：支持单目录与双目录工作区，从本机 `paths.state_dir` 读取缓存与统一决定库。
+pub fn collect_items_for_cli_in_workspace(
+    source: &WorkspaceSource,
+    paths: &WorkspacePaths,
     cfg: &ScoreConfig,
     cache_path: &Path,
     filter: &ExportFilter,
@@ -332,10 +348,17 @@ pub fn collect_items_for_cli(
         }
     }
 
-    let entries = scan::scan_directory_with_options(root, true, true)?;
+    let entries = scan::scan_workspace(
+        source,
+        Some(&paths.state_dir),
+        Some(&paths.report),
+        true,
+        true,
+        &|_, _, _| {},
+    )?;
     let all_source_rels: Vec<String> = entries
         .iter()
-        .map(|e| normalize_rel(root, Path::new(&e.path)))
+        .map(|e| source.photo_rel(e.is_raw, Path::new(&e.path)))
         .collect();
 
     let pixel_hash = crate::config::analysis_fingerprint(cfg, false);
@@ -344,11 +367,13 @@ pub fn collect_items_for_cli(
         .ok()
         .map(|_| crate::config::legacy_ai_fingerprint(cfg));
 
+    let jpg_root = source.jpg_root();
     let mut analyzed: HashMap<String, AnalysisResult> = HashMap::new();
-    if let Some(cache) = ScoreCache::open_in(root, cache_path, pixel_hash, false)? {
+    if let Some(cache) = ScoreCache::open_in(&paths.state_dir, cache_path, pixel_hash, false)? {
         for e in entries.iter().filter(|e| !e.is_raw) {
             let full = Path::new(&e.path);
-            let Some((size, mtime)) = FileRef::inside(root, full)
+            let Some((size, mtime)) = source
+                .file_ref_for_photo(false, full)
                 .ok()
                 .and_then(|file| file.open_read().ok().flatten())
                 .and_then(|file| file.metadata().ok())
@@ -362,13 +387,15 @@ pub fn collect_items_for_cli(
                         .is_some_and(|h| row.matches(size, mtime, cache::CACHE_VERSION, h))
                     || row.matches(size, mtime, cache::CACHE_VERSION, pixel_hash)
             };
-            if let Some((row, _)) = cache::find_matching(cache.rows(), root, &e.path, matches_any) {
+            if let Some((row, _)) =
+                cache::find_matching(cache.rows(), jpg_root, &e.path, matches_any)
+            {
                 analyzed.insert(e.pair_id().to_string(), row.result);
             }
         }
     }
 
-    let selection = crate::selection::build(root, &entries, &analyzed, cfg, None)?;
+    let selection = crate::selection::build_in(&paths.state_dir, jpg_root, &entries, &analyzed, cfg, None)?;
 
     let mut raw_by_pair: HashMap<&str, &PhotoEntry> = HashMap::new();
     for e in entries.iter().filter(|e| e.is_raw) {
@@ -418,10 +445,10 @@ pub fn collect_items_for_cli(
             continue;
         }
 
-        let jpg_rel = normalize_rel(root, Path::new(&e.path));
+        let jpg_rel = source.photo_rel(false, Path::new(&e.path));
         let raw_rel = raw_by_pair
             .get(pair_id)
-            .map(|r| normalize_rel(root, Path::new(&r.path)));
+            .map(|r| source.photo_rel(true, Path::new(&r.path)));
         let xmp_meta = analysis.map(|r| {
             let total = score::total_score(&r.scores, &cfg.weights);
             let mut xmp_entry = e.clone();
@@ -451,9 +478,22 @@ pub fn collect_items_for_cli(
     Ok((items, all_source_rels))
 }
 
-/// 生成导出计划与预览摘要（只读，绝不在磁盘创建或修改任何目录/文件）。
+/// 生成导出计划与预览摘要（单目录兼容封装）。
 pub fn plan_export(
     root: &Path,
+    items: &[ExportPhotoItem],
+    all_source_rels: &[String],
+    opts: &ExportOptions,
+) -> Result<ExportPlan> {
+    let source = WorkspaceSource::Single {
+        root: root.to_path_buf(),
+    };
+    plan_export_workspace(&source, items, all_source_rels, opts)
+}
+
+/// 生成导出计划与预览摘要（只读，支持单目录与双目录工作区，绝不在磁盘创建或修改任何目录/文件）。
+pub fn plan_export_workspace(
+    source: &WorkspaceSource,
     items: &[ExportPhotoItem],
     all_source_rels: &[String],
     opts: &ExportOptions,
@@ -463,9 +503,17 @@ pub fn plan_export(
         "请至少勾选一种要导出的文件类型（JPG、RAW 或 XMP）"
     );
 
-    let resolved_target = resolve_target(root, &opts.target, all_source_rels)?;
-
     let mut warnings = Vec::new();
+    let (resolved_target, inside_source_warning) =
+        resolve_target_for_workspace(source, &opts.target, all_source_rels)?;
+    if inside_source_warning {
+        warnings.push(
+            "所选导出目录位于源目录/存储卡内，写入文件可能会破坏相机存储卡文件结构，建议改选本机硬盘上的独立处理目录。"
+                .into(),
+        );
+    }
+
+    let root = source.jpg_root();
     let target_folder = match resolved_target.open_folder(root, false) {
         Ok(folder) => Some(folder),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
@@ -476,7 +524,7 @@ pub fn plan_export(
         }
     };
 
-    let album_id = canonical_album_id(root);
+    let album_id = workspace_album_id(source);
     let manifest = match &target_folder {
         Some(folder) => match read_manifest(folder) {
             Ok(m) => m,
@@ -522,7 +570,7 @@ pub fn plan_export(
         let mut xmp_hashes: Vec<String> = Vec::new();
         if target_folder.is_some() {
             for prefer_raw in [false, true] {
-                if let Some((bytes, _)) = resolve_xmp_bytes(root, item, prefer_raw, opts.xmp_exposure)? {
+                if let Some((bytes, _)) = resolve_xmp_bytes(source, item, prefer_raw, opts.xmp_exposure)? {
                     let h = sha256_hex(&bytes);
                     if !xmp_hashes.contains(&h) {
                         xmp_hashes.push(h);
@@ -531,7 +579,7 @@ pub fn plan_export(
             }
         }
         let photo_conflict = find_photo_slot_conflict(
-            root,
+            source,
             target_folder.as_ref(),
             &manifest,
             &album_id,
@@ -551,7 +599,7 @@ pub fn plan_export(
             if let Some(jpg_rel) = &item.jpg_rel {
                 let dst_rel = photo_dst_rel(opts.layout, ExportFileKind::Jpg, jpg_rel, out_stem);
                 if seen_dst.insert(dst_rel.to_ascii_lowercase()) {
-                    let (src_size, src_mtime, src_mtime_nanos) = read_source_meta(root, jpg_rel)?;
+                    let (src_size, src_mtime, src_mtime_nanos) = read_source_meta(source, false, jpg_rel)?;
                     let action = if photo_conflict.is_some() {
                         FileAction::ProtectExisting
                     } else {
@@ -587,7 +635,7 @@ pub fn plan_export(
             if let Some(raw_rel) = &item.raw_rel {
                 let dst_rel = photo_dst_rel(opts.layout, ExportFileKind::Raw, raw_rel, out_stem);
                 if seen_dst.insert(dst_rel.to_ascii_lowercase()) {
-                    let (src_size, src_mtime, src_mtime_nanos) = read_source_meta(root, raw_rel)?;
+                    let (src_size, src_mtime, src_mtime_nanos) = read_source_meta(source, true, raw_rel)?;
                     let action = if photo_conflict.is_some() {
                         FileAction::ProtectExisting
                     } else {
@@ -628,7 +676,7 @@ pub fn plan_export(
                         continue;
                     }
                     let desired = resolve_xmp_bytes(
-                        root,
+                        source,
                         item,
                         prefer_raw_side,
                         opts.xmp_exposure,
@@ -750,7 +798,7 @@ pub fn plan_export(
     };
 
     Ok(ExportPlan {
-        root: root.to_path_buf(),
+        source: source.clone(),
         album_id,
         target: resolved_target,
         photo_slots,
@@ -766,14 +814,15 @@ pub fn run_export(
     cancel: &AtomicBool,
     on_event: &(dyn Fn(ExportEvent) + Sync),
 ) -> Result<ExportSummary> {
+    let jpg_root = plan.source.jpg_root();
     if plan.target.is_in_album() {
-        if let Ok(existing_dir) = plan.target.open_folder(&plan.root, false) {
+        if let Ok(existing_dir) = plan.target.open_folder(jpg_root, false) {
             if existing_dir
                 .contains_unmarked_photos(EXPORT_MARKER_NAME, scan::is_supported_file)
                 .with_context(|| format!("检查导出目录内容失败: {}", plan.target.display_path().display()))?
             {
                 bail!(
-                    "导出目录「{}」内已包含原始照片，不能将其作为导出目录；请改用独立子目录（如 Selected）",
+                    "导出目录「{}」内已包含原始照片，可能会破坏源目录/存储卡文件结构；请改选独立目录",
                     plan.target.display_path().display()
                 );
             }
@@ -782,7 +831,7 @@ pub fn run_export(
 
     let target_folder = plan
         .target
-        .open_folder(&plan.root, true)
+        .open_folder(jpg_root, true)
         .with_context(|| format!("创建或打开导出目录失败: {}", plan.target.display_path().display()))?;
 
     let mut manifest = read_manifest(&target_folder).unwrap_or_default();
@@ -863,7 +912,7 @@ pub fn run_export(
                 })
                 .collect();
             match find_photo_slot_conflict(
-                &plan.root,
+                &plan.source,
                 Some(&target_folder),
                 &manifest,
                 &plan.album_id,
@@ -956,8 +1005,11 @@ pub fn run_export(
                     src_mtime,
                     ..
                 } => {
-                    let src_full = plan.root.join(src_rel);
-                    let mut src_file = FileRef::inside(&plan.root, &src_full)?
+                    let is_raw = planned.kind == ExportFileKind::Raw;
+                    let src_full = plan.source.photo_full(is_raw, src_rel);
+                    let mut src_file = plan
+                        .source
+                        .file_ref_for_photo(is_raw, &src_full)?
                         .open_read()?
                         .ok_or_else(|| anyhow!("源文件不存在: {src_rel}"))?;
                     let expected_fp = recorded.map(|r| (r.size, r.mtime_nanos));
@@ -1063,28 +1115,84 @@ pub fn run_export(
 }
 
 /// 校验并归一化导出目标路径；同时防止导出目标覆盖原片目录或 `.firstcut/`。
+#[cfg(test)]
 fn resolve_target(
     root: &Path,
     target: &ExportTarget,
     all_source_rels: &[String],
 ) -> Result<ResolvedTarget> {
-    match target {
-        ExportTarget::AlbumSubdir(rel) => validate_album_subdir(root, rel, all_source_rels),
-        ExportTarget::ExternalDir(path) => {
+    let source = WorkspaceSource::Single {
+        root: root.to_path_buf(),
+    };
+    resolve_target_for_workspace(&source, target, all_source_rels).map(|(resolved, _)| resolved)
+}
+
+fn resolve_target_for_workspace(
+    source: &WorkspaceSource,
+    target: &ExportTarget,
+    all_source_rels: &[String],
+) -> Result<(ResolvedTarget, bool)> {
+    match (source, target) {
+        (WorkspaceSource::Single { root }, ExportTarget::AlbumSubdir(rel)) => {
+            Ok((validate_album_subdir(root, rel, all_source_rels)?, false))
+        }
+        (WorkspaceSource::Dual { .. }, ExportTarget::AlbumSubdir(_)) => {
+            bail!("双目录模式请指定独立本机导出目录，避免默认写入相机存储卡");
+        }
+        (WorkspaceSource::Single { root }, ExportTarget::ExternalDir(path)) => {
             let trimmed = path.to_string_lossy().trim().to_string();
             anyhow::ensure!(!trimmed.is_empty(), "导出目录不能为空");
             let abs = std::path::absolute(Path::new(&trimmed))
                 .with_context(|| format!("无法解析导出路径: {}", path.display()))?;
             if let Some(rel_under_album) = storage::relative_under_album(root, &abs)? {
                 if rel_under_album.as_os_str().is_empty() {
-                    bail!("导出目录不能是照片根目录本身，请选择或输入独立子目录（如 Selected）");
+                    bail!("导出目录不能是照片根目录本身（可能会破坏源目录/存储卡文件结构），请选择独立子目录（如 Selected）");
                 }
-                return validate_album_subdir(root, &rel_under_album, all_source_rels);
+                return Ok((validate_album_subdir(root, &rel_under_album, all_source_rels)?, false));
             }
             if storage::relative_under_album(&abs, root)?.is_some() {
-                bail!("导出目录不能是当前照片根目录的上级目录");
+                bail!("导出目录不能是当前照片根目录的上级目录（可能会破坏源目录/存储卡文件结构）");
             }
-            Ok(ResolvedTarget::ExternalDir { path: abs })
+            Ok((ResolvedTarget::ExternalDir { path: abs }, false))
+        }
+        (WorkspaceSource::Dual { jpg_root, raw_root }, ExportTarget::ExternalDir(path)) => {
+            let trimmed = path.to_string_lossy().trim().to_string();
+            anyhow::ensure!(!trimmed.is_empty(), "导出目录不能为空");
+            let abs = std::path::absolute(Path::new(&trimmed))
+                .with_context(|| format!("无法解析导出路径: {}", path.display()))?;
+            let mut inside_source_warning = false;
+
+            for (label, src_root) in [("JPG 源目录", jpg_root), ("RAW 源目录", raw_root)] {
+                if let Some(rel) = storage::relative_under_album(src_root, &abs)? {
+                    if rel.as_os_str().is_empty() {
+                        bail!("导出目录不能是 {label} 本身（可能会破坏源目录/存储卡文件结构），请选择独立的处理目录");
+                    }
+                    let existing = match Folder::open_album_subdir(src_root, &rel, false) {
+                        Ok(d) => Some(d),
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+                        Err(err) => {
+                            return Err(err).with_context(|| format!("导出目录不可用: {}", abs.display()));
+                        }
+                    };
+                    if let Some(dir) = existing {
+                        if dir
+                            .contains_unmarked_photos(EXPORT_MARKER_NAME, scan::is_supported_file)
+                            .with_context(|| format!("检查导出目录内容失败: {}", abs.display()))?
+                        {
+                            bail!(
+                                "导出目录「{}」内已包含原始照片，可能会破坏源目录/存储卡文件结构，请选择独立的处理目录",
+                                abs.display()
+                            );
+                        }
+                    }
+                    inside_source_warning = true;
+                }
+                if storage::relative_under_album(&abs, src_root)?.is_some() {
+                    bail!("导出目录不能是 {label} 的上级目录（可能会破坏源目录/存储卡文件结构），请选择独立的处理目录");
+                }
+            }
+
+            Ok((ResolvedTarget::ExternalDir { path: abs }, inside_source_warning))
         }
     }
 }
@@ -1342,30 +1450,50 @@ fn sibling_xmp_rel(photo_rel: &str) -> String {
         .replace('\\', "/")
 }
 
-/// 决定待写出的 XMP 字节内容：优先原样复制已有侧车；若尚无侧车且已评分，则按方案 A 生成新侧车。
+/// 决定待写出的 XMP 字节内容：若源目录已有侧车则在内存中按方案 A 合并最新评分/星级后写出（绝不修改源侧车）；
+/// 若尚无侧车且已评分，则按方案 A 直接在目标目录生成新侧车。
 fn resolve_xmp_bytes(
-    root: &Path,
+    source: &WorkspaceSource,
     item: &ExportPhotoItem,
     prefer_raw_side: bool,
     write_crs: bool,
 ) -> Result<Option<(Vec<u8>, bool)>> {
-    let candidates: Vec<String> = if prefer_raw_side {
-        [item.raw_rel.as_deref(), item.jpg_rel.as_deref()]
-            .into_iter()
-            .flatten()
-            .map(sibling_xmp_rel)
-            .collect()
+    let candidates: Vec<(bool, String)> = if prefer_raw_side {
+        [
+            item.raw_rel.as_deref().map(|r| (true, sibling_xmp_rel(r))),
+            item.jpg_rel.as_deref().map(|r| (false, sibling_xmp_rel(r))),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
     } else {
-        [item.jpg_rel.as_deref(), item.raw_rel.as_deref()]
-            .into_iter()
-            .flatten()
-            .map(sibling_xmp_rel)
-            .collect()
+        [
+            item.jpg_rel.as_deref().map(|r| (false, sibling_xmp_rel(r))),
+            item.raw_rel.as_deref().map(|r| (true, sibling_xmp_rel(r))),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
     };
 
-    for xmp_rel in candidates {
-        let full = root.join(&xmp_rel);
-        if let Some(bytes) = FileRef::inside(root, &full)?.read(MAX_XMP_BYTES)? {
+    for (is_raw, xmp_rel) in candidates {
+        let full = source.photo_full(is_raw, &xmp_rel);
+        if let Some(bytes) = source.file_ref_for_photo(is_raw, &full)?.read(MAX_XMP_BYTES)? {
+            if let Some(meta) = &item.xmp_meta {
+                if let Ok(content) = std::str::from_utf8(&bytes) {
+                    if let Ok(merged) = crate::output::xmp::merge_xmp_for_export(
+                        content,
+                        &meta.entry,
+                        &meta.scores,
+                        meta.total,
+                        meta.rating,
+                        meta.suggested_ev,
+                        write_crs,
+                    ) {
+                        return Ok(Some((merged.into_bytes(), false)));
+                    }
+                }
+            }
             return Ok(Some((bytes, false)));
         }
     }
@@ -1384,9 +1512,14 @@ fn resolve_xmp_bytes(
     Ok(Some((xml.into_bytes(), true)))
 }
 
-fn read_source_meta(root: &Path, src_rel: &str) -> Result<(u64, Option<SystemTime>, i64)> {
-    let full = root.join(src_rel);
-    let file = FileRef::inside(root, &full)?
+fn read_source_meta(
+    source: &WorkspaceSource,
+    is_raw: bool,
+    src_rel: &str,
+) -> Result<(u64, Option<SystemTime>, i64)> {
+    let full = source.photo_full(is_raw, src_rel);
+    let file = source
+        .file_ref_for_photo(is_raw, &full)?
         .open_read()?
         .ok_or_else(|| anyhow!("源照片不存在: {src_rel}"))?;
     let meta = file.metadata()?;
@@ -1394,6 +1527,17 @@ fn read_source_meta(root: &Path, src_rel: &str) -> Result<(u64, Option<SystemTim
     let (size, mtime_nanos) = cache::metadata_fingerprint(&meta)
         .ok_or_else(|| anyhow!("无法读取源照片时间信息: {src_rel}"))?;
     Ok((size, mtime, mtime_nanos))
+}
+
+fn workspace_album_id(source: &WorkspaceSource) -> String {
+    match source {
+        WorkspaceSource::Single { root } => canonical_album_id(root),
+        WorkspaceSource::Dual { jpg_root, raw_root } => format!(
+            "dual:{}|{}",
+            canonical_album_id(jpg_root),
+            canonical_album_id(raw_root)
+        ),
+    }
 }
 
 fn open_target_file_ref(target_root: &Folder, dst_rel: &str, create_parent: bool) -> std::io::Result<FileRef> {
@@ -1657,7 +1801,7 @@ impl SlotIndex {
 }
 
 fn find_photo_slot_conflict(
-    root: &Path,
+    source: &WorkspaceSource,
     target_folder: Option<&Folder>,
     manifest: &ExportManifest,
     album_id: &str,
@@ -1695,7 +1839,7 @@ fn find_photo_slot_conflict(
                 let Some(jpg_rel) = slot.jpg_rel.as_deref() else {
                     return Ok(Some(existing_rel));
                 };
-                let (src_size, _, src_mtime_nanos) = read_source_meta(root, jpg_rel)?;
+                let (src_size, _, src_mtime_nanos) = read_source_meta(source, false, jpg_rel)?;
                 let Some((dst_size, dst_mtime)) =
                     open_target_file_ref(folder, &existing_rel, false)?.fingerprint()?
                 else {
@@ -1705,11 +1849,11 @@ fn find_photo_slot_conflict(
                     return Ok(Some(existing_rel));
                 }
             }
-            "arw" => {
+            raw_ext if scan::is_raw_extension(raw_ext) => {
                 let Some(raw_rel) = slot.raw_rel.as_deref() else {
                     return Ok(Some(existing_rel));
                 };
-                let (src_size, _, src_mtime_nanos) = read_source_meta(root, raw_rel)?;
+                let (src_size, _, src_mtime_nanos) = read_source_meta(source, true, raw_rel)?;
                 let Some((dst_size, dst_mtime)) =
                     open_target_file_ref(folder, &existing_rel, false)?.fingerprint()?
                 else {
@@ -1828,18 +1972,6 @@ fn save_manifest(target_folder: &Folder, manifest: &ExportManifest) -> Result<()
     let bytes = serde_json::to_vec_pretty(manifest)?;
     target_folder.file(EXPORT_MARKER_NAME)?.write(&bytes)?;
     Ok(())
-}
-
-fn normalize_rel(root: &Path, path: &Path) -> String {
-    let rel = path.strip_prefix(root).unwrap_or(path).to_string_lossy();
-    #[cfg(windows)]
-    {
-        rel.replace('\\', "/")
-    }
-    #[cfg(not(windows))]
-    {
-        rel.into_owned()
-    }
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -2481,5 +2613,117 @@ mod tests {
         let rescanned_split = scan::scan_directory(&shared_split).unwrap();
         assert_eq!(rescanned_split.len(), 2);
         assert!(rescanned_split.iter().all(|e| e.has_pair));
+    }
+
+    #[test]
+    fn dual_folder_multi_brand_raw_export_and_target_protection() {
+        let temp = tempfile::tempdir().unwrap();
+        let jpg_card = temp.path().join("jpg_card");
+        let raw_card = temp.path().join("raw_card");
+        let out_dir = temp.path().join("ProcessedOut");
+        std::fs::create_dir_all(jpg_card.join("100MSDCF")).unwrap();
+        std::fs::create_dir_all(raw_card.join("104MSDCF")).unwrap();
+        std::fs::write(jpg_card.join("100MSDCF/IMG_0001.JPG"), b"nikon-jpg").unwrap();
+        std::fs::write(raw_card.join("104MSDCF/IMG_0001.NEF"), b"nikon-nef").unwrap();
+        std::fs::write(jpg_card.join("100MSDCF/IMG_0002.JPG"), b"canon-jpg").unwrap();
+        std::fs::write(raw_card.join("104MSDCF/IMG_0002.CR3"), b"canon-cr3").unwrap();
+
+        let source = WorkspaceSource::dual(&jpg_card, &raw_card).unwrap();
+        let items = vec![
+            ExportPhotoItem {
+                pair_id: "p1".into(),
+                jpg_rel: Some("100MSDCF/IMG_0001.JPG".into()),
+                raw_rel: Some("104MSDCF/IMG_0001.NEF".into()),
+                xmp_meta: Some(sample_meta(&jpg_card, "100MSDCF/IMG_0001.JPG", 5)),
+            },
+            ExportPhotoItem {
+                pair_id: "p2".into(),
+                jpg_rel: Some("100MSDCF/IMG_0002.JPG".into()),
+                raw_rel: Some("104MSDCF/IMG_0002.CR3".into()),
+                xmp_meta: Some(sample_meta(&jpg_card, "100MSDCF/IMG_0002.JPG", 4)),
+            },
+        ];
+
+        // 1) 硬拦截：卡根目录、上级目录、含原片子目录均必须拒绝
+        for bad in [
+            jpg_card.clone(),
+            raw_card.clone(),
+            temp.path().to_path_buf(),
+            raw_card.join("104MSDCF"),
+        ] {
+            let bad_opts = ExportOptions {
+                target: ExportTarget::ExternalDir(bad),
+                ..Default::default()
+            };
+            assert!(plan_export_workspace(&source, &items, &[], &bad_opts).is_err());
+        }
+
+        // 2) 允许在源目录内选干净空子目录，但必须发出「可能会破坏相机存储卡文件结构」警告
+        let inner_clean = jpg_card.join("ExportTmp");
+        let warn_opts = ExportOptions {
+            target: ExportTarget::ExternalDir(inner_clean),
+            ..Default::default()
+        };
+        let warn_plan = plan_export_workspace(&source, &items, &[], &warn_opts).unwrap();
+        assert!(warn_plan
+            .preview
+            .warnings
+            .iter()
+            .any(|w| w.contains("破坏相机存储卡文件结构")));
+
+        // 3) 正常导出到本机独立目录：保留 NEF / CR3 原扩展名，且两张源卡零写入
+        let good_opts = ExportOptions {
+            target: ExportTarget::ExternalDir(out_dir.clone()),
+            ..Default::default()
+        };
+        let plan = plan_export_workspace(&source, &items, &[], &good_opts).unwrap();
+        let summary = run_export(&plan, &AtomicBool::new(false), &|_| {}).unwrap();
+        assert_eq!(summary.jpg_copied, 2);
+        assert_eq!(summary.raw_copied, 2);
+        assert_eq!(summary.xmp_written, 4);
+        assert_eq!(std::fs::read(out_dir.join("RAW/IMG_0001.NEF")).unwrap(), b"nikon-nef");
+        assert_eq!(std::fs::read(out_dir.join("RAW/IMG_0002.CR3")).unwrap(), b"canon-cr3");
+        assert!(!jpg_card.join(".firstcut").exists());
+        assert!(!raw_card.join(".firstcut").exists());
+    }
+
+    #[test]
+    fn export_xmp_merges_latest_rating_in_memory_without_touching_source() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("album");
+        let out_dir = temp.path().join("Exported");
+        std::fs::create_dir_all(root.join("RAW")).unwrap();
+        std::fs::create_dir_all(root.join("JPG")).unwrap();
+        std::fs::write(root.join("JPG/DSC0001.JPG"), b"jpg").unwrap();
+        std::fs::write(root.join("RAW/DSC0001.RAF"), b"fuji-raf").unwrap();
+        let source_xmp_path = root.join("RAW/DSC0001.xmp");
+        let source_xmp = "<?xpacket begin=\"\u{feff}\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\n\
+            <x:xmpmeta xmlns:x=\"adobe:ns:meta/\">\n\
+             <rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n\
+              <rdf:Description rdf:about=\"\" xmlns:xmp=\"http://ns.adobe.com/xap/1.0/\" xmlns:crs=\"http://ns.adobe.com/camera-raw-settings/1.0/\" xmp:Rating=\"3\" crs:Exposure2012=\"+1.25\"/>\n\
+             </rdf:RDF>\n\
+            </x:xmpmeta>\n\
+            <?xpacket end=\"w\"?>";
+        std::fs::write(&source_xmp_path, source_xmp).unwrap();
+
+        let source = WorkspaceSource::single(&root).unwrap();
+        let items = vec![ExportPhotoItem {
+            pair_id: "p1".into(),
+            jpg_rel: Some("JPG/DSC0001.JPG".into()),
+            raw_rel: Some("RAW/DSC0001.RAF".into()),
+            xmp_meta: Some(sample_meta(&root, "JPG/DSC0001.JPG", 5)),
+        }];
+        let opts = ExportOptions {
+            target: ExportTarget::ExternalDir(out_dir.clone()),
+            ..Default::default()
+        };
+        let plan = plan_export_workspace(&source, &items, &[], &opts).unwrap();
+        run_export(&plan, &AtomicBool::new(false), &|_| {}).unwrap();
+
+        let exported_xmp = std::fs::read_to_string(out_dir.join("RAW/DSC0001.xmp")).unwrap();
+        assert!(exported_xmp.contains("xmp:Rating=\"5\""));
+        assert!(exported_xmp.contains("crs:Exposure2012=\"+1.25\""));
+        // 源目录 XMP 必须保持原样未修改
+        assert_eq!(std::fs::read_to_string(&source_xmp_path).unwrap(), source_xmp);
     }
 }

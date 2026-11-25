@@ -20,7 +20,7 @@ fn cache_key(photo: &str, size: u64, mtime: i64) -> (String, String) {
     )
 }
 
-pub fn get_or_create(root: &Path, rel: &str, photo: File) -> anyhow::Result<Option<Vec<u8>>> {
+pub fn get_or_create(state_dir: &Path, rel: &str, photo: File) -> anyhow::Result<Option<Vec<u8>>> {
     let meta = photo.metadata()?;
     if meta.len() > decode::MAX_PHOTO_BYTES {
         return Ok(None);
@@ -30,10 +30,9 @@ pub fn get_or_create(root: &Path, rel: &str, photo: File) -> anyhow::Result<Opti
         .duration_since(std::time::UNIX_EPOCH)?
         .as_nanos() as i64;
     let (key, identity) = cache_key(rel, meta.len(), mtime);
-    // Generated files are optional. If this album contains an unsafe or
-    // read-only cache directory, don't touch it and render from the photo.
-    let cache = Folder::open(root)
-        .and_then(|dir| dir.state(true))
+    // Generated files are optional. If the cache directory is unsafe or
+    // read-only, don't touch it and render from the photo.
+    let cache = Folder::open_or_create_explicit(state_dir, true)
         .and_then(|dir| dir.child("thumbs", true))
         .and_then(|dir| dir.child("v2", true))
         .and_then(|dir| dir.file(&key))

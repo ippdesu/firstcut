@@ -14,3 +14,4 @@ pub mod scan;
 pub mod selection;
 pub mod score;
 pub mod storage;
+pub mod workspace;

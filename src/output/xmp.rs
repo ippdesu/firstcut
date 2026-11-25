@@ -246,6 +246,88 @@ pub fn write_sidecar_with_mode(
     Ok(true)
 }
 
+/// 导出专用：在内存中把最新评分与星级合并进已有 XMP 文本（绝不修改源文件）。
+/// - 若已有 `firstcut:` 命名空间，沿用 `merge_xmp`（遵守方案 A，绝不覆盖已有 `crs:Exposure2012`）；
+/// - 若为外部 Lightroom/ACR 侧车，仅在内存中更新（或补充）`xmp:Rating`，其余字段与 `crs:*` 保持原样。
+pub fn merge_xmp_for_export(
+    existing_content: &str,
+    e: &PhotoEntry,
+    s: &PixelScores,
+    total: f64,
+    rating: u8,
+    suggested_ev: Option<f64>,
+    write_crs: bool,
+) -> anyhow::Result<String> {
+    if existing_content.contains(NS_FIRSTCUT) {
+        let mode = if write_crs {
+            XmpWriteMode::ApplySuggestedExposure
+        } else {
+            XmpWriteMode::MetadataOnly
+        };
+        return merge_xmp(existing_content, e, s, total, rating, suggested_ev, mode);
+    }
+
+    use anyhow::{anyhow, Context};
+    use roxmltree::{Document, NodeType};
+    let doc = Document::parse(existing_content).context("现有 XMP 无法解析")?;
+    let mut output = existing_content.to_string();
+
+    if let Some(desc) = doc
+        .descendants()
+        .find(|n| n.has_tag_name((NS_RDF, "Description"))
+            && (n.attributes().any(|a| a.namespace() == Some(NS_XMP) && a.name() == "Rating")
+                || n.children().any(|c| c.has_tag_name((NS_XMP, "Rating")))))
+    {
+        let mut edits: Vec<(std::ops::Range<usize>, String)> = Vec::new();
+        if let Some(attr) = desc
+            .attributes()
+            .find(|a| a.namespace() == Some(NS_XMP) && a.name() == "Rating")
+        {
+            edits.push((attr.range_value(), rating.to_string()));
+        }
+        if let Some(child) = desc.children().find(|c| c.has_tag_name((NS_XMP, "Rating"))) {
+            if let Some(text) = child.children().find(|n| n.node_type() == NodeType::Text) {
+                edits.push((text.range(), rating.to_string()));
+            } else if child.children().next().is_none() {
+                let raw = &existing_content[child.range()];
+                let close = raw
+                    .rfind("</")
+                    .ok_or_else(|| anyhow!("XMP Rating 是空标签"))?;
+                let at = child.range().start + close;
+                edits.push((at..at, rating.to_string()));
+            } else {
+                return Err(anyhow!("XMP Rating 不是纯文本字段"));
+            }
+        }
+        edits.sort_by(|a, b| b.0.start.cmp(&a.0.start).then_with(|| b.0.end.cmp(&a.0.end)));
+        for (range, replacement) in edits {
+            output.replace_range(range, &replacement);
+        }
+        return Ok(output);
+    }
+
+    let primary = doc
+        .descendants()
+        .find(|n| n.has_tag_name((NS_RDF, "Description")))
+        .ok_or_else(|| anyhow!("未找到 rdf:Description"))?;
+    let raw = &existing_content[primary.range()];
+    let close = raw
+        .rfind("</rdf:Description>")
+        .ok_or_else(|| anyhow!("无法定位 rdf:Description 结束标签"))?;
+    let has_xmp_ns = primary.lookup_prefix(NS_XMP).is_some();
+    let ns_attr = if has_xmp_ns {
+        ""
+    } else {
+        " xmlns:xmp=\"http://ns.adobe.com/xap/1.0/\""
+    };
+    let at = primary.range().start + close;
+    output.insert_str(
+        at,
+        &format!("    <xmp:Rating{ns_attr}>{rating}</xmp:Rating>\n  "),
+    );
+    Ok(output)
+}
+
 /// 仅替换 firstcut 拥有的字段，其他软件增加的元素、属性、处理指令均原样保留。
 /// 同时兼容元素写法与 Adobe XMP SDK 规范化后的 RDF 属性 / 自闭合标签写法。
 /// 绝不覆盖或删除已有的 Adobe `crs:Exposure2012` / `crs:Exposure` 人工曝光字段。

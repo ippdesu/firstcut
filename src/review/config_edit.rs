@@ -91,6 +91,7 @@ pub fn save(path: &Path, values: &ConfigValues) -> Result<()> {
 }
 
 pub fn save_in(root: &Path, path: &Path, values: &ConfigValues) -> Result<()> {
+    crate::storage::Folder::open_or_create_explicit(root, true)?;
     save_to(crate::storage::FileRef::at(root, path, true)?, path, values)
 }
 

@@ -429,3 +429,88 @@ fn unified_burst_override_and_cli_export_end_to_end() {
     assert_eq!(rescanned.len(), 6);
     assert!(rescanned.iter().all(|e| e.has_pair));
 }
+
+/// 端到端验证双目录（双卡直连）+ 多品牌 RAW（NEF/CR3/RAF/RW2/ARW）+ 本机状态目录 + 源目录零写入 + 导出合并。
+#[test]
+fn dual_folder_multi_brand_raw_and_zero_source_write_end_to_end() {
+    let temp = tempfile::tempdir().unwrap();
+    let jpg_card = temp.path().join("Card_JPG");
+    let raw_card = temp.path().join("Card_RAW");
+    let state_dir = temp.path().join("LocalState");
+    let out_dir = temp.path().join("LocalExport");
+    std::fs::create_dir_all(jpg_card.join("100MSDCF")).unwrap();
+    std::fs::create_dir_all(raw_card.join("104MSDCF")).unwrap();
+
+    let j1 = jpg_card.join("100MSDCF/IMG_0001.JPG");
+    let j2 = jpg_card.join("100MSDCF/IMG_0002.JPG");
+    let j3 = jpg_card.join("100MSDCF/IMG_0003.JPG");
+    save_jpeg_with_exif_datetime(&j1, [120, 120, 120], "2026:11:25 10:00:00");
+    save_jpeg_with_exif_datetime(&j2, [130, 130, 130], "2026:11:25 10:01:00");
+    save_jpeg_with_exif_datetime(&j3, [140, 140, 140], "2026:11:25 10:02:00");
+    std::fs::write(raw_card.join("104MSDCF/IMG_0001.NEF"), b"nikon-nef").unwrap();
+    std::fs::write(raw_card.join("104MSDCF/IMG_0002.CR3"), b"canon-cr3").unwrap();
+    std::fs::write(raw_card.join("104MSDCF/IMG_0003.RAF"), b"fuji-raf").unwrap();
+
+    let source = pic_process::workspace::WorkspaceSource::dual(&jpg_card, &raw_card).unwrap();
+    let paths = pic_process::workspace::WorkspacePaths::in_state_dir(state_dir.clone());
+    paths.ensure_state_dir().unwrap();
+    let cfg = ScoreConfig::default();
+    let opts = score::ScoreJobOptions {
+        output_csv: paths.report.clone(),
+        raw_csv: false,
+        cache_path: paths.cache.clone(),
+        no_cache: false,
+        no_ai: true,
+        xmp: false,
+        xmp_exposure: false,
+        gpu: false,
+        keep_override: None,
+        include_raw: true,
+        skip_processed: true,
+    };
+    score::run_score_job_in_workspace(&source, &paths, &cfg, &opts, &|_| {}).unwrap();
+    pic_process::decision::set_in(&paths.state_dir, source.jpg_root(), &j1, 5).unwrap();
+    pic_process::decision::set_in(&paths.state_dir, source.jpg_root(), &j2, 2).unwrap();
+    pic_process::decision::set_in(&paths.state_dir, source.jpg_root(), &j3, 4).unwrap();
+
+    // 源卡绝对零写入
+    assert!(!jpg_card.join(".firstcut").exists());
+    assert!(!raw_card.join(".firstcut").exists());
+    assert!(!raw_card.join("104MSDCF/IMG_0001.xmp").exists());
+
+    let filter = pic_process::export::ExportFilter {
+        min_stars: Some(4),
+        ..Default::default()
+    };
+    let (items, all_sources) = pic_process::export::collect_items_for_cli_in_workspace(
+        &source,
+        &paths,
+        &cfg,
+        &paths.cache,
+        &filter,
+    )
+    .unwrap();
+    assert_eq!(items.len(), 2);
+    let exp_opts = pic_process::export::ExportOptions {
+        target: pic_process::export::ExportTarget::ExternalDir(out_dir.clone()),
+        ..Default::default()
+    };
+    let plan =
+        pic_process::export::plan_export_workspace(&source, &items, &all_sources, &exp_opts)
+            .unwrap();
+    let summary = pic_process::export::run_export(
+        &plan,
+        &std::sync::atomic::AtomicBool::new(false),
+        &|_| {},
+    )
+    .unwrap();
+    assert_eq!(summary.jpg_copied, 2);
+    assert_eq!(summary.raw_copied, 2);
+    assert_eq!(summary.xmp_written, 4);
+    assert!(out_dir.join("RAW/IMG_0001.NEF").is_file());
+    assert!(out_dir.join("RAW/IMG_0003.RAF").is_file());
+    assert!(!out_dir.join("RAW/IMG_0002.CR3").exists());
+    assert!(std::fs::read_to_string(out_dir.join("RAW/IMG_0001.xmp"))
+        .unwrap()
+        .contains("<xmp:Rating>5</xmp:Rating>"));
+}

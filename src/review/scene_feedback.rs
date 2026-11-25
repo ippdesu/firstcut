@@ -30,6 +30,10 @@ pub fn store_path(root: &Path) -> PathBuf {
     root.join(".firstcut").join("scene-feedback.jsonl")
 }
 
+pub fn store_path_in(state_dir: &Path) -> PathBuf {
+    state_dir.join("scene-feedback.jsonl")
+}
+
 pub fn valid_scene(scene: &str) -> bool {
     matches!(scene, "portrait" | "stage" | "highkey" | "sports" | "lowlight"
         | "landscape" | "still_life" | "documentary" | "other")
@@ -39,9 +43,15 @@ pub fn now_unix_ms() -> u128 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis()
 }
 
-pub fn load_latest(root: &Path, path: &Path) -> Result<HashMap<String, SceneFeedbackRecord>> {
-    let Some(file) = FileRef::inside(root, path)?.open_read()
-        .with_context(|| format!("读取场景反馈失败：{}", path.display()))? else {
+pub fn load_latest(state_dir: &Path, path: &Path) -> Result<HashMap<String, SceneFeedbackRecord>> {
+    let opened = match FileRef::at(state_dir, path, false) {
+        Ok(file) => file.open_read(),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(err) => {
+            return Err(err).with_context(|| format!("读取场景反馈失败：{}", path.display()));
+        }
+    };
+    let Some(file) = opened.with_context(|| format!("读取场景反馈失败：{}", path.display()))? else {
         return Ok(HashMap::new());
     };
     // Preserve oversized legacy files for export. Only the bounded prefix
@@ -65,6 +75,7 @@ pub fn load_latest(root: &Path, path: &Path) -> Result<HashMap<String, SceneFeed
 pub fn append(root: &Path, path: &Path, record: &SceneFeedbackRecord) -> Result<()> {
     let mut line = serde_json::to_vec(record)?;
     line.push(b'\n');
+    crate::storage::Folder::open_or_create_explicit(root, true)?;
     let target = FileRef::at(root, path, true)?;
     let mut file = target.open_update()
         .with_context(|| format!("打开场景反馈失败：{}", path.display()))?;
