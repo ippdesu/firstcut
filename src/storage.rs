@@ -62,26 +62,42 @@ impl Folder {
         Ok(Self(dir))
     }
 
+    /// 打开已存在的显式目录，并拒绝最后一段路径本身为符号链接或重解析点。
+    fn open_explicit_nofollow(path: &Path) -> io::Result<Self> {
+        if let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {
+            if !parent.as_os_str().is_empty() {
+                return Self::open_explicit(parent)?.child(name, false);
+            }
+        }
+        Self::open_explicit(path)
+    }
+
     /// 打开或安全创建显式目标目录（用于导出到相册外的已授权目录）：
     /// 从已存在的最近祖先起逐级无链接创建并校验每一层不是符号链接或重解析点。
     pub fn open_or_create_explicit(path: &Path, create: bool) -> io::Result<Self> {
         let absolute = std::path::absolute(path)?;
         if !create {
-            return Self::open_explicit(&absolute);
+            return Self::open_explicit_nofollow(&absolute);
         }
-        // 找到已存在的最近祖先目录，避免 create_dir_all 盲目穿越符号链接
+        // 找到已存在的最近祖先目录（含悬空符号链接），避免 create_dir_all 盲目穿越符号链接
         let mut existing = absolute.as_path();
         let mut missing: Vec<OsString> = Vec::new();
-        while !existing.exists() {
-            let name = existing
-                .file_name()
-                .ok_or_else(|| denied("目标路径缺少有效祖先目录"))?;
-            missing.push(name.to_os_string());
-            existing = existing
-                .parent()
-                .ok_or_else(|| denied("目标路径缺少有效祖先目录"))?;
+        loop {
+            match existing.symlink_metadata() {
+                Ok(_) => break,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                    let name = existing
+                        .file_name()
+                        .ok_or_else(|| denied("目标路径缺少有效祖先目录"))?;
+                    missing.push(name.to_os_string());
+                    existing = existing
+                        .parent()
+                        .ok_or_else(|| denied("目标路径缺少有效祖先目录"))?;
+                }
+                Err(err) => return Err(err),
+            }
         }
-        let mut dir = Self::open_explicit(existing)?;
+        let mut dir = Self::open_explicit_nofollow(existing)?;
         for name in missing.into_iter().rev() {
             dir = dir.child(&name, true)?;
         }
@@ -516,11 +532,46 @@ impl FileRef {
     }
 }
 
-/// 若 `path` 位于 `root` 之下（经 `std::path::absolute` 归一化，Windows 大小写不敏感），
+fn canonicalize_existing_prefix(abs: &Path) -> PathBuf {
+    let mut existing = abs;
+    let mut tail: Vec<OsString> = Vec::new();
+    while !existing.exists() {
+        let Some(name) = existing.file_name() else {
+            return abs.to_path_buf();
+        };
+        let Some(parent) = existing.parent() else {
+            return abs.to_path_buf();
+        };
+        tail.push(name.to_os_string());
+        existing = parent;
+    }
+    let Ok(canon) = std::fs::canonicalize(existing) else {
+        return abs.to_path_buf();
+    };
+    #[cfg(windows)]
+    let mut base = {
+        let text = canon.to_string_lossy();
+        if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+            PathBuf::from(format!(r"\\{rest}"))
+        } else if let Some(rest) = text.strip_prefix(r"\\?\") {
+            PathBuf::from(rest)
+        } else {
+            canon
+        }
+    };
+    #[cfg(not(windows))]
+    let mut base = canon;
+    for part in tail.into_iter().rev() {
+        base.push(part);
+    }
+    base
+}
+
+/// 若 `path` 位于 `root` 之下（经 `std::path::absolute` 与已存在前缀规范化，消除 Windows 8.3 短路径差异，Windows 大小写不敏感），
 /// 返回相对 `root` 的路径。
 pub fn relative_under_album(root: &Path, path: &Path) -> io::Result<Option<PathBuf>> {
-    let abs_root = std::path::absolute(root)?;
-    let abs_path = std::path::absolute(path)?;
+    let abs_root = canonicalize_existing_prefix(&std::path::absolute(root)?);
+    let abs_path = canonicalize_existing_prefix(&std::path::absolute(path)?);
     Ok(strip_album_prefix(&abs_root, &abs_path))
 }
 

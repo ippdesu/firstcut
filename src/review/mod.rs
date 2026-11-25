@@ -410,6 +410,7 @@ fn welcome_router(state: Arc<WelcomeState>, access: Arc<access::Access>) -> Rout
         .layer(axum::middleware::from_fn_with_state(access, access::guard))
 }
 
+#[cfg(any(windows, test))]
 fn mint_pick_token(approved: &Mutex<Vec<(String, PathBuf)>>, path: PathBuf) -> Result<String> {
     let mut entropy = [0u8; 16];
     getrandom::fill(&mut entropy).map_err(|err| anyhow::anyhow!("{err}"))?;
@@ -512,7 +513,7 @@ async fn welcome_pick_folder(
     }
     #[cfg(not(windows))]
     {
-        let _ = req;
+        let _ = &req.role;
         (StatusCode::NOT_FOUND, "当前平台不支持系统文件夹选择器").into_response()
     }
 }
@@ -1418,6 +1419,7 @@ struct ExportRequest {
     xmp_exposure: bool,
 }
 
+#[cfg(any(windows, test))]
 const APPROVED_EXPORT_CAP: usize = 32;
 
 fn resolve_export_options(
