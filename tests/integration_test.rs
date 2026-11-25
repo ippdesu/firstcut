@@ -872,3 +872,77 @@ fn card_a_orphan_burst_row_does_not_block_card_b_legacy_burst_json() {
     assert_eq!(bursts_after_clear["p1"].manual_keep, None);
     assert!(!bursts_after_clear["p1"].keep);
 }
+
+#[test]
+fn removing_another_photo_does_not_resurrect_cleared_legacy_burst_override() {
+    let temp = tempfile::tempdir().unwrap();
+    let mount = temp.path().join("mount");
+    let state = temp.path().join("state");
+    std::fs::create_dir_all(mount.join(".firstcut")).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+
+    let p1 = mount.join("DSC00001.JPG");
+    let p3 = mount.join("DSC00003.JPG");
+    save_jpeg_with_exif_datetime(&p1, [100, 110, 120], "2026:11:25 17:00:00");
+    save_jpeg_with_exif_datetime(&p3, [140, 150, 160], "2026:11:25 17:00:01");
+    std::fs::write(
+        mount.join(".firstcut/burst-overrides.json"),
+        r#"{"DSC00001.JPG": true, "DSC00003.JPG": false}"#,
+    )
+    .unwrap();
+
+    let source = pic_process::workspace::WorkspaceSource::single(&mount).unwrap();
+    let paths = pic_process::workspace::WorkspacePaths::in_state_dir(state);
+    pic_process::workspace::import_legacy_state_if_needed(&source, &paths).unwrap();
+
+    let entries1 = vec![pic_process::scan::PhotoEntry {
+        path: p1.display().to_string(),
+        pair_id: "p1".into(),
+        ..Default::default()
+    }];
+    let algo1 = std::collections::HashMap::from([(
+        "p1".into(),
+        pic_process::dedup::BurstInfo {
+            group: 1,
+            size: 2,
+            rank: 2,
+            keep: false,
+            pose_cluster: 1,
+        },
+    )]);
+    let initial = pic_process::decision::effective_bursts_checked(
+        &mount,
+        &entries1,
+        &algo1,
+        &pic_process::decision::load_bursts_in(&paths.state_dir).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(initial["p1"].manual_keep, Some(true));
+
+    // 清除 DSC00001.JPG 的连拍覆盖
+    pic_process::decision::set_burst_keep_in(&paths.state_dir, &mount, &p1, None).unwrap();
+    let cleared = pic_process::decision::effective_bursts_checked(
+        &mount,
+        &entries1,
+        &algo1,
+        &pic_process::decision::load_bursts_in(&paths.state_dir).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(cleared["p1"].manual_keep, None);
+
+    // 只把另一张照片 DSC00003.JPG 移出相册，再重开同一相册
+    std::fs::remove_file(&p3).unwrap();
+    pic_process::workspace::import_legacy_state_if_needed(&source, &paths).unwrap();
+
+    let reopened = pic_process::decision::effective_bursts_checked(
+        &mount,
+        &entries1,
+        &algo1,
+        &pic_process::decision::load_bursts_in(&paths.state_dir).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        reopened["p1"].manual_keep, None,
+        "移走另一张照片后重开同一相册，已清除的旧连拍覆盖绝不得复活"
+    );
+}

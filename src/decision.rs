@@ -146,6 +146,12 @@ fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
         CREATE TABLE IF NOT EXISTS decision_meta (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS imported_legacy_decision (
+            kind TEXT NOT NULL CHECK(kind IN ('rating', 'burst')),
+            photo_path TEXT NOT NULL,
+            photo_fp TEXT NOT NULL,
+            PRIMARY KEY (kind, photo_path, photo_fp)
         );",
     )?;
     if !has_column(conn, "manual_rating", "photo_fp")? {
@@ -272,6 +278,10 @@ pub fn set_in(state_dir: &Path, jpg_root: &Path, jpg: &Path, stars: u8) -> Resul
         "INSERT INTO manual_rating(photo_path, photo_fp, stars) VALUES (?1, ?2, ?3)
         ON CONFLICT(photo_path, photo_fp) DO UPDATE SET stars=excluded.stars",
         rusqlite::params![key, fp, stars],
+    )?;
+    tx.execute(
+        "INSERT OR IGNORE INTO imported_legacy_decision(kind, photo_path, photo_fp) VALUES ('rating', ?1, ?2)",
+        rusqlite::params![key, fp],
     )?;
     if !fp.is_empty() {
         tx.execute(
@@ -416,6 +426,10 @@ pub fn set_burst_keep_in(
             }
         }
     }
+    tx.execute(
+        "INSERT OR IGNORE INTO imported_legacy_decision(kind, photo_path, photo_fp) VALUES ('burst', ?1, ?2)",
+        rusqlite::params![key, fp],
+    )?;
     tx.commit()?;
     db.save()
 }
@@ -533,45 +547,10 @@ pub fn backfill_imported_decisions_in(
     Ok(())
 }
 
-fn source_migration_key(prefix: &str, raw_bytes: &[u8], resolved: &[(String, String)]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(prefix.as_bytes());
-    hasher.update(b"\0");
-    hasher.update(raw_bytes);
-    hasher.update(b"\0");
-    let mut sorted = resolved.to_vec();
-    sorted.sort();
-    for (path, fp) in sorted {
-        hasher.update(path.as_bytes());
-        hasher.update(b"\0");
-        hasher.update(fp.as_bytes());
-        hasher.update(b"\0");
-    }
-    let digest = hasher.finalize();
-    let mut hex = String::with_capacity(prefix.len() + 1 + 16);
-    use std::fmt::Write;
-    let _ = write!(&mut hex, "{prefix}:");
-    for b in &digest[..8] {
-        let _ = write!(&mut hex, "{b:02x}");
-    }
-    hex
-}
-
-fn is_meta_recorded(conn: &Connection, key: &str) -> rusqlite::Result<bool> {
-    if !table_exists(conn, "decision_meta")? {
-        return Ok(false);
-    }
-    let mut stmt = conn.prepare("SELECT value FROM decision_meta WHERE key = ?1")?;
-    let mut rows = stmt.query([key])?;
-    Ok(rows
-        .next()?
-        .and_then(|row| row.get::<_, String>(0).ok())
-        .is_some_and(|v| v == "1"))
-}
-
-/// 按来源幂等合并旧版 `<相册>/.firstcut/` 中的 `decisions.sqlite` 与 `burst-overrides.json`：
+/// 按单条 `(kind, photo_path, photo_fp)` 幂等合并旧版 `<相册>/.firstcut/` 中的
+/// `decisions.sqlite` 与 `burst-overrides.json`：
 /// - 同一挂载点复用不同旧卡时，每张卡的旧 SQLite/JSON 都能独立迁移并按照片内容指纹隔离；
-/// - 重复打开同一张卡不会重复写入或复活已清除/修改的人工决定；
+/// - 即使后续向相册增删其他照片，已导入或已清除的 `(kind, path, fp)` 仍记录在 `imported_legacy_decision`，绝不复活旧决定；
 /// - 同照片冲突时严格保持 SQLite 优先于旧 JSON，且绝不被旧卡遗留的空指纹记录阻挡。
 pub fn import_legacy_decisions_in(
     state_dir: &Path,
@@ -580,172 +559,151 @@ pub fn import_legacy_decisions_in(
 ) -> Result<()> {
     let mut db_ratings: Vec<(String, String, u8)> = Vec::new();
     let mut db_bursts: Vec<(String, String, i64)> = Vec::new();
-    let mut db_meta_key: Option<String> = None;
     let mut legacy_db_burst_migrated = false;
 
     if let Ok(src_ref) = legacy_folder.file(DECISIONS_DB) {
         if let Ok(Some(legacy_db)) = Database::open(src_ref, false) {
-            if let Ok(Some(db_bytes)) = legacy_folder
-                .file(DECISIONS_DB)
-                .and_then(|f| f.read(128 * 1024 * 1024))
-            {
-                legacy_db_burst_migrated = is_burst_json_migrated(&legacy_db.conn).unwrap_or(false);
-                let mut resolved_pairs: Vec<(String, String)> = Vec::new();
+            legacy_db_burst_migrated = is_burst_json_migrated(&legacy_db.conn).unwrap_or(false);
 
-                if table_exists(&legacy_db.conn, "manual_rating")? {
-                    let has_fp = has_column(&legacy_db.conn, "manual_rating", "photo_fp")?;
-                    if has_fp {
-                        let mut stmt = legacy_db
-                            .conn
-                            .prepare("SELECT photo_path, photo_fp, stars FROM manual_rating")?;
-                        let rows = stmt.query_map([], |r| {
-                            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, u8>(2)?))
-                        })?;
-                        for row in rows {
-                            let (path, stored_fp, stars) = row?;
-                            let fp = if stored_fp.is_empty() {
-                                photo_fingerprint(jpg_root, &path).unwrap_or_default()
-                            } else {
-                                stored_fp
-                            };
-                            resolved_pairs.push((format!("r:{path}"), fp.clone()));
-                            db_ratings.push((path, fp, stars));
-                        }
-                    } else {
-                        let mut stmt = legacy_db
-                            .conn
-                            .prepare("SELECT photo_path, stars FROM manual_rating")?;
-                        let rows = stmt
-                            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, u8>(1)?)))?;
-                        for row in rows {
-                            let (path, stars) = row?;
-                            let fp = photo_fingerprint(jpg_root, &path).unwrap_or_default();
-                            resolved_pairs.push((format!("r:{path}"), fp.clone()));
-                            db_ratings.push((path, fp, stars));
-                        }
+            if table_exists(&legacy_db.conn, "manual_rating")? {
+                if has_column(&legacy_db.conn, "manual_rating", "photo_fp")? {
+                    let mut stmt = legacy_db
+                        .conn
+                        .prepare("SELECT photo_path, photo_fp, stars FROM manual_rating")?;
+                    let rows = stmt.query_map([], |r| {
+                        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, u8>(2)?))
+                    })?;
+                    for row in rows {
+                        let (path, stored_fp, stars) = row?;
+                        let fp = if stored_fp.is_empty() {
+                            photo_fingerprint(jpg_root, &path).unwrap_or_default()
+                        } else {
+                            stored_fp
+                        };
+                        db_ratings.push((path, fp, stars));
+                    }
+                } else {
+                    let mut stmt = legacy_db
+                        .conn
+                        .prepare("SELECT photo_path, stars FROM manual_rating")?;
+                    let rows = stmt
+                        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, u8>(1)?)))?;
+                    for row in rows {
+                        let (path, stars) = row?;
+                        let fp = photo_fingerprint(jpg_root, &path).unwrap_or_default();
+                        db_ratings.push((path, fp, stars));
                     }
                 }
+            }
 
-                if table_exists(&legacy_db.conn, "manual_burst_keep")? {
-                    let has_fp = has_column(&legacy_db.conn, "manual_burst_keep", "photo_fp")?;
-                    if has_fp {
-                        let mut stmt = legacy_db
-                            .conn
-                            .prepare("SELECT photo_path, photo_fp, keep FROM manual_burst_keep")?;
-                        let rows = stmt.query_map([], |r| {
-                            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
-                        })?;
-                        for row in rows {
-                            let (path, stored_fp, keep) = row?;
-                            let fp = if stored_fp.is_empty() {
-                                photo_fingerprint(jpg_root, &path).unwrap_or_default()
-                            } else {
-                                stored_fp
-                            };
-                            resolved_pairs.push((format!("b:{path}"), fp.clone()));
-                            db_bursts.push((path, fp, keep));
-                        }
-                    } else {
-                        let mut stmt = legacy_db
-                            .conn
-                            .prepare("SELECT photo_path, keep FROM manual_burst_keep")?;
-                        let rows = stmt
-                            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
-                        for row in rows {
-                            let (path, keep) = row?;
-                            let fp = photo_fingerprint(jpg_root, &path).unwrap_or_default();
-                            resolved_pairs.push((format!("b:{path}"), fp.clone()));
-                            db_bursts.push((path, fp, keep));
-                        }
+            if table_exists(&legacy_db.conn, "manual_burst_keep")? {
+                if has_column(&legacy_db.conn, "manual_burst_keep", "photo_fp")? {
+                    let mut stmt = legacy_db
+                        .conn
+                        .prepare("SELECT photo_path, photo_fp, keep FROM manual_burst_keep")?;
+                    let rows = stmt.query_map([], |r| {
+                        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+                    })?;
+                    for row in rows {
+                        let (path, stored_fp, keep) = row?;
+                        let fp = if stored_fp.is_empty() {
+                            photo_fingerprint(jpg_root, &path).unwrap_or_default()
+                        } else {
+                            stored_fp
+                        };
+                        db_bursts.push((path, fp, keep));
+                    }
+                } else {
+                    let mut stmt = legacy_db
+                        .conn
+                        .prepare("SELECT photo_path, keep FROM manual_burst_keep")?;
+                    let rows = stmt
+                        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+                    for row in rows {
+                        let (path, keep) = row?;
+                        let fp = photo_fingerprint(jpg_root, &path).unwrap_or_default();
+                        db_bursts.push((path, fp, keep));
                     }
                 }
-
-                db_meta_key = Some(source_migration_key("legacy_db", &db_bytes, &resolved_pairs));
             }
         }
     }
 
     let mut json_bursts: Vec<(String, String, i64)> = Vec::new();
-    let mut json_meta_key: Option<String> = None;
     if !legacy_db_burst_migrated {
         if let Ok(Some(json_bytes)) = legacy_folder
             .file(LEGACY_BURST_JSON)
             .and_then(|f| f.read(4 * 1024 * 1024))
         {
             if let Ok(map) = serde_json::from_slice::<HashMap<String, bool>>(&json_bytes) {
-                let mut resolved_pairs: Vec<(String, String)> = Vec::new();
                 for (path, keep) in map {
                     let fp = photo_fingerprint(jpg_root, &path).unwrap_or_default();
-                    resolved_pairs.push((format!("j:{path}"), fp.clone()));
                     json_bursts.push((path, fp, i64::from(keep)));
                 }
-                json_meta_key = Some(source_migration_key(
-                    "legacy_json",
-                    &json_bytes,
-                    &resolved_pairs,
-                ));
             }
         }
     }
 
-    if db_meta_key.is_none() && json_meta_key.is_none() {
+    if db_ratings.is_empty() && db_bursts.is_empty() && json_bursts.is_empty() {
         return Ok(());
     }
 
     let state = Folder::open_or_create_explicit(state_dir, true)?;
     let mut db = Database::open(state.file(DECISIONS_DB)?, true)?
         .context("人工评分数据库不可用")?;
+    let upgraded_schema = !table_exists(&db.conn, "manual_rating")?
+        || !has_column(&db.conn, "manual_rating", "photo_fp")?
+        || !table_exists(&db.conn, "manual_burst_keep")?
+        || !has_column(&db.conn, "manual_burst_keep", "photo_fp")?
+        || !table_exists(&db.conn, "imported_legacy_decision")?;
     ensure_schema(&db.conn)?;
 
-    let need_db = match db_meta_key.as_deref() {
-        Some(k) => !is_meta_recorded(&db.conn, k)?,
-        None => false,
-    };
-    let need_json = match json_meta_key.as_deref() {
-        Some(k) => !is_meta_recorded(&db.conn, k)?,
-        None => false,
-    };
-    if !need_db && !need_json {
-        return Ok(());
-    }
-
+    let mut changed = upgraded_schema;
     let tx = db.conn.transaction()?;
-    if need_db {
-        for (path, fp, stars) in db_ratings {
+    for (path, fp, stars) in db_ratings {
+        if tx.execute(
+            "INSERT OR IGNORE INTO imported_legacy_decision(kind, photo_path, photo_fp) VALUES ('rating', ?1, ?2)",
+            rusqlite::params![&path, &fp],
+        )? > 0
+        {
             tx.execute(
                 "INSERT OR IGNORE INTO manual_rating(photo_path, photo_fp, stars) VALUES (?1, ?2, ?3)",
-                rusqlite::params![path, fp, stars],
+                rusqlite::params![&path, &fp, stars],
             )?;
-        }
-        for (path, fp, keep) in db_bursts {
-            tx.execute(
-                "INSERT OR IGNORE INTO manual_burst_keep(photo_path, photo_fp, keep) VALUES (?1, ?2, ?3)",
-                rusqlite::params![path, fp, keep],
-            )?;
-        }
-        if let Some(k) = db_meta_key {
-            tx.execute(
-                "INSERT OR REPLACE INTO decision_meta(key, value) VALUES (?1, '1')",
-                [k],
-            )?;
+            changed = true;
         }
     }
-    if need_json {
-        for (path, fp, keep) in json_bursts {
+    for (path, fp, keep) in db_bursts {
+        if tx.execute(
+            "INSERT OR IGNORE INTO imported_legacy_decision(kind, photo_path, photo_fp) VALUES ('burst', ?1, ?2)",
+            rusqlite::params![&path, &fp],
+        )? > 0
+        {
             tx.execute(
                 "INSERT OR IGNORE INTO manual_burst_keep(photo_path, photo_fp, keep) VALUES (?1, ?2, ?3)",
-                rusqlite::params![path, fp, keep],
+                rusqlite::params![&path, &fp, keep],
             )?;
+            changed = true;
         }
-        if let Some(k) = json_meta_key {
+    }
+    for (path, fp, keep) in json_bursts {
+        if tx.execute(
+            "INSERT OR IGNORE INTO imported_legacy_decision(kind, photo_path, photo_fp) VALUES ('burst', ?1, ?2)",
+            rusqlite::params![&path, &fp],
+        )? > 0
+        {
             tx.execute(
-                "INSERT OR REPLACE INTO decision_meta(key, value) VALUES (?1, '1')",
-                [k],
+                "INSERT OR IGNORE INTO manual_burst_keep(photo_path, photo_fp, keep) VALUES (?1, ?2, ?3)",
+                rusqlite::params![&path, &fp, keep],
             )?;
+            changed = true;
         }
     }
     tx.commit()?;
-    db.save()
+    if changed {
+        db.save()?;
+    }
+    Ok(())
 }
 
 fn match_decision<T: Copy>(root: &Path, key: &str, candidates: &[(String, T)]) -> Option<T> {
