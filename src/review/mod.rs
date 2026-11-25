@@ -1284,7 +1284,7 @@ async fn export_run(
                 let conflict_note = if summary.conflicts.is_empty() {
                     String::new()
                 } else {
-                    format!("，写入前冲突 {}", summary.conflicts.len())
+                    format!("，冲突 {}", summary.conflicts.len())
                 };
                 let text = format!(
                     "{prefix}：JPG {} / RAW {} / XMP {}（{:.1} MB，跳过未变 {}，保留既有 {}，失败 {}{conflict_note}）→ {}",

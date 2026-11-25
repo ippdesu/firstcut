@@ -159,6 +159,9 @@ pub struct ManifestEntry {
     /// 记录导出该目标文件的来源相册规范根路径，防止不同相册共用导出目录时同名互相覆盖。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_root: Option<String>,
+    /// 同一张照片（JPG/RAW/XMP 共享）的规范相对路径标识，用于整张照片级的跨文件槽位归属判定。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_photo: Option<String>,
     /// 记录导出该目标文件的源照片相对路径，防止不同批次把另一张同名照片误覆盖已有副本。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_rel: Option<String>,
@@ -274,7 +277,17 @@ enum PlannedSource {
 }
 
 #[derive(Debug, Clone)]
+struct PhotoSlotSpec {
+    photo_id: String,
+    jpg_rel: Option<String>,
+    raw_rel: Option<String>,
+    out_stem: String,
+    slot_dirs: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
 struct PlannedFile {
+    photo_index: usize,
     dst_rel: String,
     source_identity: String,
     kind: ExportFileKind,
@@ -287,6 +300,8 @@ pub struct ExportPlan {
     root: PathBuf,
     album_id: String,
     target: ResolvedTarget,
+    photo_slots: Vec<PhotoSlotSpec>,
+    planned_conflicts: Vec<String>,
     files: Vec<PlannedFile>,
     pub preview: ExportPreview,
 }
@@ -476,6 +491,10 @@ pub fn plan_export(
     let (stems, renamed_all) = assign_output_stems(items, opts.layout);
 
     let mut planned: Vec<PlannedFile> = Vec::new();
+    let mut photo_slots: Vec<PhotoSlotSpec> = Vec::new();
+    let mut planned_conflicts: Vec<String> = Vec::new();
+    let mut photo_conflict_count = 0usize;
+    let mut slot_index = SlotIndex::new();
     let mut seen_dst: HashSet<String> = HashSet::new();
     let mut missing_raw_all: Vec<String> = Vec::new();
     let mut missing_xmp_unscored = 0usize;
@@ -491,22 +510,63 @@ pub fn plan_export(
             missing_raw_all.push(label.to_string());
         }
 
+        let photo_index = photo_slots.len();
+        photo_slots.push(PhotoSlotSpec {
+            photo_id: label.to_string(),
+            jpg_rel: item.jpg_rel.clone(),
+            raw_rel: item.raw_rel.clone(),
+            out_stem: out_stem.clone(),
+            slot_dirs: photo_slot_dirs(opts.layout, item.jpg_rel.as_deref(), item.raw_rel.as_deref()),
+        });
+
+        let mut xmp_hashes: Vec<String> = Vec::new();
+        if target_folder.is_some() {
+            for prefer_raw in [false, true] {
+                if let Some((bytes, _)) = resolve_xmp_bytes(root, item, prefer_raw, opts.xmp_exposure)? {
+                    let h = sha256_hex(&bytes);
+                    if !xmp_hashes.contains(&h) {
+                        xmp_hashes.push(h);
+                    }
+                }
+            }
+        }
+        let photo_conflict = find_photo_slot_conflict(
+            root,
+            target_folder.as_ref(),
+            &manifest,
+            &album_id,
+            &photo_slots[photo_index],
+            &xmp_hashes,
+            &mut slot_index,
+        )?;
+        if let Some(conflict_rel) = &photo_conflict {
+            photo_conflict_count += 1;
+            planned_conflicts.push(format!(
+                "照片 {label} 与目标目录中另一来源的既有文件 {conflict_rel} 同名冲突，已整套跳过（防 JPG/RAW/XMP 错配）"
+            ));
+        }
+
         // 1) JPG
         if opts.include_jpg {
             if let Some(jpg_rel) = &item.jpg_rel {
                 let dst_rel = photo_dst_rel(opts.layout, ExportFileKind::Jpg, jpg_rel, out_stem);
                 if seen_dst.insert(dst_rel.to_ascii_lowercase()) {
                     let (src_size, src_mtime, src_mtime_nanos) = read_source_meta(root, jpg_rel)?;
-                    let action = classify_photo_target(
-                        target_folder.as_ref(),
-                        &manifest,
-                        &album_id,
-                        &dst_rel,
-                        jpg_rel,
-                        src_size,
-                        src_mtime_nanos,
-                    )?;
+                    let action = if photo_conflict.is_some() {
+                        FileAction::ProtectExisting
+                    } else {
+                        classify_photo_target(
+                            target_folder.as_ref(),
+                            &manifest,
+                            &album_id,
+                            &dst_rel,
+                            jpg_rel,
+                            src_size,
+                            src_mtime_nanos,
+                        )?
+                    };
                     planned.push(PlannedFile {
+                        photo_index,
                         dst_rel,
                         source_identity: jpg_rel.clone(),
                         kind: ExportFileKind::Jpg,
@@ -528,16 +588,21 @@ pub fn plan_export(
                 let dst_rel = photo_dst_rel(opts.layout, ExportFileKind::Raw, raw_rel, out_stem);
                 if seen_dst.insert(dst_rel.to_ascii_lowercase()) {
                     let (src_size, src_mtime, src_mtime_nanos) = read_source_meta(root, raw_rel)?;
-                    let action = classify_photo_target(
-                        target_folder.as_ref(),
-                        &manifest,
-                        &album_id,
-                        &dst_rel,
-                        raw_rel,
-                        src_size,
-                        src_mtime_nanos,
-                    )?;
+                    let action = if photo_conflict.is_some() {
+                        FileAction::ProtectExisting
+                    } else {
+                        classify_photo_target(
+                            target_folder.as_ref(),
+                            &manifest,
+                            &album_id,
+                            &dst_rel,
+                            raw_rel,
+                            src_size,
+                            src_mtime_nanos,
+                        )?
+                    };
                     planned.push(PlannedFile {
+                        photo_index,
                         dst_rel,
                         source_identity: raw_rel.clone(),
                         kind: ExportFileKind::Raw,
@@ -577,15 +642,20 @@ pub fn plan_export(
                     };
                     let sha256 = sha256_hex(&bytes);
                     let source_identity = label.to_string();
-                    let action = classify_xmp_target(
-                        target_folder.as_ref(),
-                        &manifest,
-                        &album_id,
-                        &dst_rel,
-                        &source_identity,
-                        &sha256,
-                    )?;
+                    let action = if photo_conflict.is_some() {
+                        FileAction::ProtectExisting
+                    } else {
+                        classify_xmp_target(
+                            target_folder.as_ref(),
+                            &manifest,
+                            &album_id,
+                            &dst_rel,
+                            &source_identity,
+                            &sha256,
+                        )?
+                    };
                     planned.push(PlannedFile {
+                        photo_index,
                         dst_rel,
                         source_identity,
                         kind: ExportFileKind::Xmp,
@@ -651,6 +721,11 @@ pub fn plan_export(
             "目标目录中有 {protected_existing} 个既有文件（可能已在 PS/ACR 修改）将被保留，不会覆盖。"
         ));
     }
+    if photo_conflict_count > 0 {
+        warnings.push(format!(
+            "有 {photo_conflict_count} 张照片与目标目录中另一来源的同名文件冲突，已整套跳过以防 JPG/RAW/XMP 错配。"
+        ));
+    }
 
     let preview = ExportPreview {
         target_display: resolved_target.display_path().display().to_string(),
@@ -678,6 +753,8 @@ pub fn plan_export(
         root: root.to_path_buf(),
         album_id,
         target: resolved_target,
+        photo_slots,
+        planned_conflicts,
         files: planned,
         preview,
     })
@@ -748,7 +825,13 @@ pub fn run_export(
     let mut done_files = 0usize;
     let mut cancelled = false;
     let mut errors = Vec::new();
-    let mut conflicts = Vec::new();
+    let mut conflicts = plan.planned_conflicts.clone();
+    for msg in &conflicts {
+        on_event(ExportEvent::Info(format!("[conflict] {msg}")));
+    }
+    let mut slot_index = SlotIndex::new();
+    let mut checked_photos: HashSet<usize> = HashSet::new();
+    let mut blocked_photos: HashSet<usize> = HashSet::new();
 
     for planned in to_write {
         if cancel.load(Ordering::Acquire) {
@@ -763,6 +846,52 @@ pub fn run_export(
             bytes_total: total_bytes,
             current_file: planned.dst_rel.clone(),
         });
+
+        if blocked_photos.contains(&planned.photo_index) {
+            done_files += 1;
+            protected_existing += 1;
+            continue;
+        }
+        if checked_photos.insert(planned.photo_index) {
+            let xmp_hashes: Vec<String> = plan
+                .files
+                .iter()
+                .filter(|f| f.photo_index == planned.photo_index)
+                .filter_map(|f| match &f.source {
+                    PlannedSource::WriteXmp { sha256, .. } => Some(sha256.clone()),
+                    _ => None,
+                })
+                .collect();
+            match find_photo_slot_conflict(
+                &plan.root,
+                Some(&target_folder),
+                &manifest,
+                &plan.album_id,
+                &plan.photo_slots[planned.photo_index],
+                &xmp_hashes,
+                &mut slot_index,
+            ) {
+                Ok(Some(conflict_rel)) => {
+                    blocked_photos.insert(planned.photo_index);
+                    done_files += 1;
+                    protected_existing += 1;
+                    let msg = format!(
+                        "照片 {} 与目标目录中另一来源的既有文件 {} 同名冲突，已整套跳过（防 JPG/RAW/XMP 错配）",
+                        plan.photo_slots[planned.photo_index].photo_id, conflict_rel
+                    );
+                    on_event(ExportEvent::Info(format!("[conflict] {msg}")));
+                    conflicts.push(msg);
+                    continue;
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    let msg = format!("{} 写入前槽位校验失败: {err:#}", planned.dst_rel);
+                    on_event(ExportEvent::Info(format!("[export] {msg}")));
+                    errors.push(msg);
+                    continue;
+                }
+            }
+        }
 
         let live_action = match (&planned.kind, &planned.source) {
             (
@@ -881,6 +1010,7 @@ pub fn run_export(
                         kind: planned.kind.as_str().to_string(),
                         sha256,
                         source_root: Some(plan.album_id.clone()),
+                        source_photo: Some(plan.photo_slots[planned.photo_index].photo_id.clone()),
                         source_rel: Some(planned.source_identity.clone()),
                     },
                 );
@@ -1394,6 +1524,218 @@ fn entry_matches_source(
         .is_some_and(|r| same_rel_path(r, source_rel))
 }
 
+fn entry_matches_photo(
+    manifest: &ExportManifest,
+    recorded: &ManifestEntry,
+    album_id: &str,
+    photo_id: &str,
+    jpg_rel: Option<&str>,
+    raw_rel: Option<&str>,
+) -> bool {
+    let recorded_root = recorded
+        .source_root
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .or_else(|| (!manifest.source_root.is_empty()).then_some(manifest.source_root.as_str()));
+    let Some(recorded_root) = recorded_root else {
+        return false;
+    };
+    if !same_album_root(recorded_root, album_id) {
+        return false;
+    }
+    let candidate = recorded
+        .source_photo
+        .as_deref()
+        .or(recorded.source_rel.as_deref());
+    let Some(candidate) = candidate else {
+        return false;
+    };
+    same_rel_path(candidate, photo_id)
+        || jpg_rel.is_some_and(|j| same_rel_path(candidate, j))
+        || raw_rel.is_some_and(|r| same_rel_path(candidate, r))
+}
+
+fn is_slot_file(name: &str) -> bool {
+    scan::is_supported_file(name) || scan::extension_of(name) == "xmp"
+}
+
+fn photo_slot_dirs(
+    layout: ExportLayout,
+    item_jpg: Option<&str>,
+    item_raw: Option<&str>,
+) -> Vec<String> {
+    match layout {
+        ExportLayout::SplitByType | ExportLayout::Flat => {
+            vec![String::new(), "JPG".to_string(), "RAW".to_string()]
+        }
+        ExportLayout::PreserveTree => {
+            let mut dirs: Vec<String> = Vec::new();
+            for rel in [item_jpg, item_raw].into_iter().flatten() {
+                let parent = Path::new(rel)
+                    .parent()
+                    .map(|p| p.to_string_lossy().replace('\\', "/"))
+                    .unwrap_or_default();
+                let clean = parent.trim_matches('/').to_string();
+                if !dirs.iter().any(|d| same_rel_path(d, &clean)) {
+                    dirs.push(clean);
+                }
+            }
+            if dirs.is_empty() {
+                dirs.push(String::new());
+            }
+            dirs
+        }
+    }
+}
+
+struct SlotIndex {
+    loaded_dirs: HashSet<String>,
+    by_dir_stem: HashMap<(String, String), Vec<String>>,
+}
+
+impl SlotIndex {
+    fn new() -> Self {
+        Self {
+            loaded_dirs: HashSet::new(),
+            by_dir_stem: HashMap::new(),
+        }
+    }
+
+    fn dir_key(dir_rel: &str) -> String {
+        let norm = dir_rel.replace('\\', "/").trim_matches('/').to_string();
+        #[cfg(windows)]
+        {
+            norm.to_ascii_lowercase()
+        }
+        #[cfg(not(windows))]
+        {
+            norm
+        }
+    }
+
+    fn existing_in_dir(
+        &mut self,
+        target_folder: &Folder,
+        dir_rel: &str,
+        stem_lower: &str,
+    ) -> Result<&[String]> {
+        let dir_key = Self::dir_key(dir_rel);
+        if self.loaded_dirs.insert(dir_key.clone()) {
+            let sub = if dir_rel.is_empty() {
+                Ok(target_folder.try_clone()?)
+            } else {
+                target_folder.descend_cloned(Path::new(dir_rel), false)
+            };
+            match sub {
+                Ok(folder) => {
+                    for name in folder.list_regular_filenames()? {
+                        if !is_slot_file(&name) {
+                            continue;
+                        }
+                        let st = scan::stem_of(&name);
+                        let rel = if dir_rel.is_empty() {
+                            name
+                        } else {
+                            format!("{dir_rel}/{name}")
+                        };
+                        self.by_dir_stem
+                            .entry((dir_key.clone(), st))
+                            .or_default()
+                            .push(rel);
+                    }
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err.into()),
+            }
+        }
+        Ok(self
+            .by_dir_stem
+            .get(&(dir_key, stem_lower.to_string()))
+            .map(Vec::as_slice)
+            .unwrap_or(&[]))
+    }
+}
+
+fn find_photo_slot_conflict(
+    root: &Path,
+    target_folder: Option<&Folder>,
+    manifest: &ExportManifest,
+    album_id: &str,
+    slot: &PhotoSlotSpec,
+    xmp_hashes: &[String],
+    slot_index: &mut SlotIndex,
+) -> Result<Option<String>> {
+    let Some(folder) = target_folder else {
+        return Ok(None);
+    };
+    let stem_lower = slot.out_stem.to_ascii_lowercase();
+    let mut candidates: Vec<String> = Vec::new();
+    for dir_rel in &slot.slot_dirs {
+        let list = slot_index.existing_in_dir(folder, dir_rel, &stem_lower)?;
+        candidates.extend(list.iter().cloned());
+    }
+
+    for existing_rel in candidates {
+        if let Some(recorded) = find_manifest_entry(manifest, &existing_rel) {
+            if !entry_matches_photo(
+                manifest,
+                recorded,
+                album_id,
+                &slot.photo_id,
+                slot.jpg_rel.as_deref(),
+                slot.raw_rel.as_deref(),
+            ) {
+                return Ok(Some(existing_rel));
+            }
+            continue;
+        }
+        let ext = scan::extension_of(&existing_rel);
+        match ext.as_str() {
+            "jpg" | "jpeg" => {
+                let Some(jpg_rel) = slot.jpg_rel.as_deref() else {
+                    return Ok(Some(existing_rel));
+                };
+                let (src_size, _, src_mtime_nanos) = read_source_meta(root, jpg_rel)?;
+                let Some((dst_size, dst_mtime)) =
+                    open_target_file_ref(folder, &existing_rel, false)?.fingerprint()?
+                else {
+                    continue;
+                };
+                if !(dst_size == src_size && (dst_mtime - src_mtime_nanos).abs() <= 1_000_000) {
+                    return Ok(Some(existing_rel));
+                }
+            }
+            "arw" => {
+                let Some(raw_rel) = slot.raw_rel.as_deref() else {
+                    return Ok(Some(existing_rel));
+                };
+                let (src_size, _, src_mtime_nanos) = read_source_meta(root, raw_rel)?;
+                let Some((dst_size, dst_mtime)) =
+                    open_target_file_ref(folder, &existing_rel, false)?.fingerprint()?
+                else {
+                    continue;
+                };
+                if !(dst_size == src_size && (dst_mtime - src_mtime_nanos).abs() <= 1_000_000) {
+                    return Ok(Some(existing_rel));
+                }
+            }
+            "xmp" => {
+                let Some(existing_bytes) =
+                    open_target_file_ref(folder, &existing_rel, false)?.read(MAX_XMP_BYTES)?
+                else {
+                    continue;
+                };
+                let existing_sha = sha256_hex(&existing_bytes);
+                if !xmp_hashes.iter().any(|h| h == &existing_sha) {
+                    return Ok(Some(existing_rel));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(None)
+}
+
 fn classify_photo_target(
     target_folder: Option<&Folder>,
     manifest: &ExportManifest,
@@ -1866,6 +2208,7 @@ mod tests {
         assert_eq!(summary_b.jpg_copied, 1);
         assert_eq!(summary_b.xmp_written, 1);
         assert_eq!(summary_b.protected_existing, 2);
+        assert!(!summary_b.conflicts.is_empty());
         assert_eq!(std::fs::read(shared.join("JPG/DSC0001.JPG")).unwrap(), b"album-a-jpg");
         assert!(std::fs::read_to_string(shared.join("JPG/DSC0001.xmp"))
             .unwrap()
@@ -1980,5 +2323,163 @@ mod tests {
         let full_scan = scan::scan_directory(&root).unwrap();
         assert_eq!(full_scan.len(), 2);
         assert!(full_scan.iter().any(|e| e.is_raw));
+    }
+
+    #[test]
+    fn cross_album_conflict_skips_entire_photo_set_in_split_and_flat_layouts() {
+        let temp = tempfile::tempdir().unwrap();
+        let album_a = temp.path().join("album_a");
+        let album_b = temp.path().join("album_b");
+        std::fs::create_dir_all(album_a.join("JPG")).unwrap();
+        std::fs::create_dir_all(album_a.join("RAW")).unwrap();
+        std::fs::create_dir_all(album_b.join("JPG")).unwrap();
+        std::fs::create_dir_all(album_b.join("RAW")).unwrap();
+        std::fs::write(album_a.join("JPG/DSC0001.JPG"), b"a-jpg").unwrap();
+        std::fs::write(album_a.join("RAW/DSC0001.ARW"), b"a-raw").unwrap();
+        std::fs::write(album_b.join("JPG/DSC0001.JPG"), b"b-jpg").unwrap();
+        std::fs::write(album_b.join("RAW/DSC0001.ARW"), b"b-raw").unwrap();
+
+        let shared_split = temp.path().join("SharedSplit");
+        let items_a_jpg = vec![ExportPhotoItem {
+            pair_id: "a1".into(),
+            jpg_rel: Some("JPG/DSC0001.JPG".into()),
+            raw_rel: None,
+            xmp_meta: Some(sample_meta(&album_a, "JPG/DSC0001.JPG", 5)),
+        }];
+        let opts_split_jpg = ExportOptions {
+            target: ExportTarget::ExternalDir(shared_split.clone()),
+            layout: ExportLayout::SplitByType,
+            include_jpg: true,
+            include_raw: false,
+            include_xmp: true,
+            xmp_exposure: false,
+        };
+        let plan_a = plan_export(&album_a, &items_a_jpg, &["JPG/DSC0001.JPG".into()], &opts_split_jpg).unwrap();
+        run_export(&plan_a, &AtomicBool::new(false), &|_| {}).unwrap();
+
+        // 1) SplitByType：相册 B 导整套 JPG + RAW + XMP，不能把 B 的 RAW/XMP 写入，避免 A 的 JPG 与 B 的 RAW 错配
+        let items_b = vec![ExportPhotoItem {
+            pair_id: "b1".into(),
+            jpg_rel: Some("JPG/DSC0001.JPG".into()),
+            raw_rel: Some("RAW/DSC0001.ARW".into()),
+            xmp_meta: Some(sample_meta(&album_b, "JPG/DSC0001.JPG", 4)),
+        }];
+        let sources_b = vec!["JPG/DSC0001.JPG".into(), "RAW/DSC0001.ARW".into()];
+        let opts_split_full = ExportOptions {
+            target: ExportTarget::ExternalDir(shared_split.clone()),
+            layout: ExportLayout::SplitByType,
+            include_jpg: true,
+            include_raw: true,
+            include_xmp: true,
+            xmp_exposure: false,
+        };
+        let plan_b = plan_export(&album_b, &items_b, &sources_b, &opts_split_full).unwrap();
+        assert_eq!(plan_b.preview.jpg_to_copy, 0);
+        assert_eq!(plan_b.preview.raw_to_copy, 0);
+        assert_eq!(plan_b.preview.xmp_to_write, 0);
+        assert_eq!(plan_b.preview.protected_existing, 4);
+        let summary_b = run_export(&plan_b, &AtomicBool::new(false), &|_| {}).unwrap();
+        assert_eq!(summary_b.raw_copied, 0);
+        assert!(!summary_b.conflicts.is_empty());
+        assert!(!shared_split.join("RAW/DSC0001.ARW").exists());
+        assert!(!shared_split.join("RAW/DSC0001.xmp").exists());
+        let scanned_split = scan::scan_directory(&shared_split).unwrap();
+        assert_eq!(scanned_split.len(), 1);
+        assert!(!scanned_split[0].has_pair);
+
+        // 2) SplitByType 仅导 RAW：相册 B 只导 RAW 也必须整套跳过
+        let opts_split_raw_only = ExportOptions {
+            target: ExportTarget::ExternalDir(shared_split.clone()),
+            layout: ExportLayout::SplitByType,
+            include_jpg: false,
+            include_raw: true,
+            include_xmp: false,
+            xmp_exposure: false,
+        };
+        let plan_b_raw = plan_export(&album_b, &items_b, &sources_b, &opts_split_raw_only).unwrap();
+        assert_eq!(plan_b_raw.preview.raw_to_copy, 0);
+        let summary_b_raw = run_export(&plan_b_raw, &AtomicBool::new(false), &|_| {}).unwrap();
+        assert_eq!(summary_b_raw.raw_copied, 0);
+        assert!(!summary_b_raw.conflicts.is_empty());
+        assert!(!shared_split.join("RAW/DSC0001.ARW").exists());
+
+        // 3) Flat 布局：相册 A 导 JPG+XMP 后，相册 B 导整套或仅导 RAW 均不得写入 DSC0001.ARW
+        let shared_flat = temp.path().join("SharedFlat");
+        let opts_flat_jpg = ExportOptions {
+            target: ExportTarget::ExternalDir(shared_flat.clone()),
+            layout: ExportLayout::Flat,
+            include_jpg: true,
+            include_raw: false,
+            include_xmp: true,
+            xmp_exposure: false,
+        };
+        let plan_flat_a = plan_export(&album_a, &items_a_jpg, &["JPG/DSC0001.JPG".into()], &opts_flat_jpg).unwrap();
+        run_export(&plan_flat_a, &AtomicBool::new(false), &|_| {}).unwrap();
+
+        let opts_flat_full = ExportOptions {
+            target: ExportTarget::ExternalDir(shared_flat.clone()),
+            layout: ExportLayout::Flat,
+            include_jpg: true,
+            include_raw: true,
+            include_xmp: true,
+            xmp_exposure: false,
+        };
+        let plan_flat_b = plan_export(&album_b, &items_b, &sources_b, &opts_flat_full).unwrap();
+        assert_eq!(plan_flat_b.preview.raw_to_copy, 0);
+        let summary_flat_b = run_export(&plan_flat_b, &AtomicBool::new(false), &|_| {}).unwrap();
+        assert_eq!(summary_flat_b.raw_copied, 0);
+        assert!(!summary_flat_b.conflicts.is_empty());
+        assert!(!shared_flat.join("DSC0001.ARW").exists());
+
+        let opts_flat_raw_only = ExportOptions {
+            target: ExportTarget::ExternalDir(shared_flat.clone()),
+            layout: ExportLayout::Flat,
+            include_jpg: false,
+            include_raw: true,
+            include_xmp: false,
+            xmp_exposure: false,
+        };
+        let plan_flat_b_raw = plan_export(&album_b, &items_b, &sources_b, &opts_flat_raw_only).unwrap();
+        let summary_flat_b_raw = run_export(&plan_flat_b_raw, &AtomicBool::new(false), &|_| {}).unwrap();
+        assert_eq!(summary_flat_b_raw.raw_copied, 0);
+        assert!(!summary_flat_b_raw.conflicts.is_empty());
+        assert!(!shared_flat.join("DSC0001.ARW").exists());
+        assert_eq!(std::fs::read(shared_flat.join("DSC0001.JPG")).unwrap(), b"a-jpg");
+        assert!(std::fs::read_to_string(shared_flat.join("DSC0001.xmp"))
+            .unwrap()
+            .contains("<xmp:Rating>5</xmp:Rating>"));
+        let scanned_flat = scan::scan_directory(&shared_flat).unwrap();
+        assert_eq!(scanned_flat.len(), 1);
+        assert!(!scanned_flat[0].has_pair);
+
+        // 4) 同相册增量补导 RAW：相册 A 自己后续补导自己的 RAW/DSC0001.ARW + XMP，应正常放行并配对
+        let items_a_full = vec![ExportPhotoItem {
+            pair_id: "a1".into(),
+            jpg_rel: Some("JPG/DSC0001.JPG".into()),
+            raw_rel: Some("RAW/DSC0001.ARW".into()),
+            xmp_meta: Some(sample_meta(&album_a, "JPG/DSC0001.JPG", 5)),
+        }];
+        let opts_split_a_raw = ExportOptions {
+            target: ExportTarget::ExternalDir(shared_split.clone()),
+            layout: ExportLayout::SplitByType,
+            include_jpg: false,
+            include_raw: true,
+            include_xmp: true,
+            xmp_exposure: false,
+        };
+        let plan_a_raw = plan_export(
+            &album_a,
+            &items_a_full,
+            &["JPG/DSC0001.JPG".into(), "RAW/DSC0001.ARW".into()],
+            &opts_split_a_raw,
+        )
+        .unwrap();
+        let summary_a_raw = run_export(&plan_a_raw, &AtomicBool::new(false), &|_| {}).unwrap();
+        assert_eq!(summary_a_raw.raw_copied, 1);
+        assert_eq!(summary_a_raw.xmp_written, 1);
+        assert!(summary_a_raw.conflicts.is_empty());
+        let rescanned_split = scan::scan_directory(&shared_split).unwrap();
+        assert_eq!(rescanned_split.len(), 2);
+        assert!(rescanned_split.iter().all(|e| e.has_pair));
     }
 }

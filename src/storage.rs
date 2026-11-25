@@ -209,6 +209,24 @@ impl Folder {
         }
         Ok(false)
     }
+
+    /// 非递归列出当前目录下所有普通文件的文件名（跳过符号链接与重解析点）。
+    pub fn list_regular_filenames(&self) -> io::Result<Vec<String>> {
+        let mut names = Vec::new();
+        for entry in self.0.entries()? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let meta = match self.0.symlink_metadata(&name) {
+                Ok(m) => m,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(err),
+            };
+            if meta.is_file() && !is_reparse(&meta) {
+                names.push(name.to_string_lossy().into_owned());
+            }
+        }
+        Ok(names)
+    }
 }
 
 fn check_directory(metadata: cap_std::fs::Metadata) -> io::Result<()> {
