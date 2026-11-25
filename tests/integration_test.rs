@@ -702,3 +702,173 @@ fn swapped_card_importing_burst_json_does_not_bind_previous_card_orphan_rating()
         "卡 A 无法确认来源的空指纹人工 1 星应保持未绑定状态: {stored:?}"
     );
 }
+
+#[test]
+fn two_legacy_cards_sharing_mount_both_migrate_their_own_sqlite_ratings() {
+    let temp = tempfile::tempdir().unwrap();
+    let mount = temp.path().join("mount");
+    let state = temp.path().join("state");
+    let card_a_backup = temp.path().join("card_a_backup");
+    std::fs::create_dir_all(mount.join(".firstcut")).unwrap();
+    std::fs::create_dir_all(&card_a_backup).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+
+    // 卡 A：DSC00001.JPG + 旧版 decisions.sqlite（人工 1 星）
+    save_jpeg_with_exif_datetime(&mount.join("DSC00001.JPG"), [20, 40, 60], "2026:11:25 10:00:00");
+    {
+        let conn = rusqlite::Connection::open(mount.join(".firstcut/decisions.sqlite")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE manual_rating (
+                photo_path TEXT PRIMARY KEY,
+                stars INTEGER NOT NULL CHECK(stars BETWEEN 1 AND 5)
+            );
+            INSERT INTO manual_rating (photo_path, stars) VALUES ('DSC00001.JPG', 1);",
+        )
+        .unwrap();
+    }
+    std::fs::copy(mount.join("DSC00001.JPG"), card_a_backup.join("DSC00001.JPG")).unwrap();
+    std::fs::copy(
+        mount.join(".firstcut/decisions.sqlite"),
+        card_a_backup.join("decisions.sqlite"),
+    )
+    .unwrap();
+
+    let source = pic_process::workspace::WorkspaceSource::single(&mount).unwrap();
+    let paths = pic_process::workspace::WorkspacePaths::in_state_dir(state);
+    let cfg = ScoreConfig::default();
+    let opts = score::ScoreJobOptions {
+        output_csv: paths.report.clone(),
+        raw_csv: false,
+        cache_path: paths.cache.clone(),
+        no_cache: false,
+        no_ai: true,
+        xmp: false,
+        xmp_exposure: false,
+        gpu: false,
+        keep_override: None,
+        include_raw: false,
+        skip_processed: true,
+    };
+
+    pic_process::workspace::import_legacy_state_if_needed(&source, &paths).unwrap();
+    score::run_score_job_in_workspace(&source, &paths, &cfg, &opts, &|_| {}).unwrap();
+    assert!(std::fs::read_to_string(&paths.report).unwrap().contains(",\"1\",\"manual\","));
+
+    // 换卡 B 到同一挂载点：不同 JPEG + 卡 B 自己的旧 decisions.sqlite（人工 3 星）
+    save_jpeg_with_exif_datetime(&mount.join("DSC00001.JPG"), [230, 220, 210], "2026:11:25 14:30:00");
+    std::fs::remove_file(mount.join(".firstcut/decisions.sqlite")).unwrap();
+    {
+        let conn = rusqlite::Connection::open(mount.join(".firstcut/decisions.sqlite")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE manual_rating (
+                photo_path TEXT PRIMARY KEY,
+                stars INTEGER NOT NULL CHECK(stars BETWEEN 1 AND 5)
+            );
+            INSERT INTO manual_rating (photo_path, stars) VALUES ('DSC00001.JPG', 3);",
+        )
+        .unwrap();
+    }
+
+    pic_process::workspace::import_legacy_state_if_needed(&source, &paths).unwrap();
+    score::run_score_job_in_workspace(&source, &paths, &cfg, &opts, &|_| {}).unwrap();
+    let report_b = std::fs::read_to_string(&paths.report).unwrap();
+    assert!(
+        report_b.contains(",\"3\",\"manual\","),
+        "同一挂载点换用卡 B 时，卡 B 自己的旧 SQLite 人工 3 星必须迁移生效: {report_b}"
+    );
+
+    // 换回卡 A 并把星级改为 4 星后再次触发导入：幂等迁移不得复活旧 1 星
+    std::fs::copy(card_a_backup.join("DSC00001.JPG"), mount.join("DSC00001.JPG")).unwrap();
+    std::fs::copy(
+        card_a_backup.join("decisions.sqlite"),
+        mount.join(".firstcut/decisions.sqlite"),
+    )
+    .unwrap();
+    pic_process::workspace::import_legacy_state_if_needed(&source, &paths).unwrap();
+    pic_process::decision::set_in(&paths.state_dir, source.jpg_root(), &mount.join("DSC00001.JPG"), 4)
+        .unwrap();
+    pic_process::workspace::import_legacy_state_if_needed(&source, &paths).unwrap();
+    score::run_score_job_in_workspace(&source, &paths, &cfg, &opts, &|_| {}).unwrap();
+    let report_a_updated = std::fs::read_to_string(&paths.report).unwrap();
+    assert!(
+        report_a_updated.contains(",\"4\",\"manual\","),
+        "重复打开同一旧卡不得覆盖/复活已修改的人工星级: {report_a_updated}"
+    );
+}
+
+#[test]
+fn card_a_orphan_burst_row_does_not_block_card_b_legacy_burst_json() {
+    let temp = tempfile::tempdir().unwrap();
+    let mount = temp.path().join("mount");
+    let state = temp.path().join("state");
+    std::fs::create_dir_all(mount.join(".firstcut")).unwrap();
+    std::fs::create_dir_all(mount.join("JPG")).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+
+    // 卡 A：只有一条找不到原照片的「舍弃」记录
+    {
+        let conn = rusqlite::Connection::open(mount.join(".firstcut/decisions.sqlite")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE manual_burst_keep (
+                photo_path TEXT PRIMARY KEY,
+                keep INTEGER NOT NULL CHECK(keep IN (0, 1))
+            );
+            INSERT INTO manual_burst_keep (photo_path, keep) VALUES ('JPG/a.jpg', 0);",
+        )
+        .unwrap();
+    }
+    let source = pic_process::workspace::WorkspaceSource::single(&mount).unwrap();
+    let paths = pic_process::workspace::WorkspacePaths::in_state_dir(state);
+    pic_process::workspace::import_legacy_state_if_needed(&source, &paths).unwrap();
+
+    // 换卡 B 到同一挂载点：存在真实 JPG/a.jpg，且卡 B 的旧 burst-overrides.json 标为「保留」
+    std::fs::remove_file(mount.join(".firstcut/decisions.sqlite")).unwrap();
+    let jpg_a = mount.join("JPG/a.jpg");
+    save_jpeg_with_exif_datetime(&jpg_a, [120, 120, 120], "2026:11:25 16:00:00");
+    std::fs::write(
+        mount.join(".firstcut/burst-overrides.json"),
+        r#"{"JPG/a.jpg": true}"#,
+    )
+    .unwrap();
+    pic_process::workspace::import_legacy_state_if_needed(&source, &paths).unwrap();
+
+    let entries = vec![pic_process::scan::PhotoEntry {
+        path: jpg_a.display().to_string(),
+        pair_id: "p1".into(),
+        ..Default::default()
+    }];
+    let algo = std::collections::HashMap::from([(
+        "p1".into(),
+        pic_process::dedup::BurstInfo {
+            group: 1,
+            size: 2,
+            rank: 2,
+            keep: false,
+            pose_cluster: 1,
+        },
+    )]);
+    let bursts = pic_process::decision::effective_bursts_checked(
+        &mount,
+        &entries,
+        &algo,
+        &pic_process::decision::load_bursts_in(&paths.state_dir).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        bursts["p1"].keep && bursts["p1"].manual_keep == Some(true),
+        "卡 A 遗留的空指纹孤立记录不得阻挡卡 B 有效的旧 JSON 连拍保留决定"
+    );
+
+    // 清除卡 B 的覆盖后再次打开卡 B，不得复活 JSON 覆盖
+    pic_process::decision::set_burst_keep_in(&paths.state_dir, &mount, &jpg_a, None).unwrap();
+    pic_process::workspace::import_legacy_state_if_needed(&source, &paths).unwrap();
+    let bursts_after_clear = pic_process::decision::effective_bursts_checked(
+        &mount,
+        &entries,
+        &algo,
+        &pic_process::decision::load_bursts_in(&paths.state_dir).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(bursts_after_clear["p1"].manual_keep, None);
+    assert!(!bursts_after_clear["p1"].keep);
+}

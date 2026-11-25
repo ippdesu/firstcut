@@ -300,41 +300,26 @@ pub fn import_legacy_state_if_needed(
     };
     let state_folder = paths.ensure_state_dir()?;
 
-    let mut imported_decisions_db = false;
-    let mut imported_burst_json = false;
-    for db_name in ["cache.sqlite", "decisions.sqlite"] {
-        if state_folder
-            .file(db_name)
-            .and_then(|f| f.open_read())
-            .ok()
-            .flatten()
-            .is_some()
-        {
-            continue;
-        }
-        let Ok(src_ref) = legacy_folder.file(db_name) else {
-            continue;
-        };
-        if Database::open(src_ref, false).ok().flatten().is_none() {
-            continue;
-        }
-        if let Ok(Some(bytes)) = legacy_folder
-            .file(db_name)
-            .and_then(|f| f.read(MAX_STATE_IMPORT_BYTES))
-        {
-            let _ = state_folder.file(db_name)?.write(&bytes);
-            if db_name == "decisions.sqlite" {
-                imported_decisions_db = true;
+    if state_folder
+        .file("cache.sqlite")
+        .and_then(|f| f.open_read())
+        .ok()
+        .flatten()
+        .is_none()
+    {
+        if let Ok(src_ref) = legacy_folder.file("cache.sqlite") {
+            if Database::open(src_ref, false).ok().flatten().is_some() {
+                if let Ok(Some(bytes)) = legacy_folder
+                    .file("cache.sqlite")
+                    .and_then(|f| f.read(MAX_STATE_IMPORT_BYTES))
+                {
+                    let _ = state_folder.file("cache.sqlite")?.write(&bytes);
+                }
             }
         }
     }
 
-    for small_name in [
-        "burst-overrides.json",
-        "config.toml",
-        "ui-preferences.json",
-        "scene-feedback.jsonl",
-    ] {
+    for small_name in ["config.toml", "ui-preferences.json", "scene-feedback.jsonl"] {
         if state_folder
             .file(small_name)
             .and_then(|f| f.open_read())
@@ -349,20 +334,10 @@ pub fn import_legacy_state_if_needed(
             .and_then(|f| f.read(MAX_SMALL_CONFIG_BYTES))
         {
             let _ = state_folder.file(small_name)?.write(&bytes);
-            if small_name == "burst-overrides.json" {
-                imported_burst_json = true;
-            }
         }
     }
 
-    if imported_decisions_db || imported_burst_json {
-        crate::decision::backfill_imported_decisions_in(
-            &paths.state_dir,
-            root,
-            imported_decisions_db,
-            imported_burst_json,
-        )?;
-    }
+    crate::decision::import_legacy_decisions_in(&paths.state_dir, root, &legacy_folder)?;
 
     Ok(())
 }
