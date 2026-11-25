@@ -124,6 +124,9 @@ impl PhotoEntry {
 /// review 缩略图缓存目录名（整个子树跳过，防止 320px 缩略图被当照片评分）
 const CACHE_DIR_NAME: &str = ".firstcut";
 
+/// 导出目录标记与增量清单文件名（上级扫描遇到含该文件的子目录自动跳过）
+pub const EXPORT_MARKER_NAME: &str = ".firstcut-export";
+
 /// 递归扫描目录，返回排序后的照片索引
 pub fn scan_directory(dir: &Path) -> Result<Vec<PhotoEntry>> {
     scan_directory_inner(dir, None, true, false, &|_, _, _| {})
@@ -206,6 +209,13 @@ fn scan_directory_inner(
         }
         if skip_processed && entry.depth() > 0 && entry.file_type().is_dir()
             && entry.file_name().to_string_lossy().eq_ignore_ascii_case("Processed") {
+            walker.skip_current_dir();
+            continue;
+        }
+        if entry.depth() > 0 && entry.file_type().is_dir()
+            && std::fs::symlink_metadata(entry.path().join(EXPORT_MARKER_NAME))
+                .is_ok_and(|meta| meta.is_file())
+        {
             walker.skip_current_dir();
             continue;
         }
@@ -503,5 +513,31 @@ mod tests {
         let with_outputs = scan_review_directory(&dir, &dir.join("none.csv"), true, false, &progress).unwrap();
         assert_eq!(with_outputs.len(), 3);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn export_marker_skips_nested_export_dir_but_allows_direct_open() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("album");
+        let selected = root.join("Selected");
+        std::fs::create_dir_all(root.join("JPG")).unwrap();
+        std::fs::create_dir_all(root.join("RAW")).unwrap();
+        std::fs::create_dir_all(selected.join("JPG")).unwrap();
+        std::fs::create_dir_all(selected.join("RAW")).unwrap();
+        std::fs::write(root.join("JPG/DSC00001.JPG"), b"jpg").unwrap();
+        std::fs::write(root.join("RAW/DSC00001.ARW"), b"raw").unwrap();
+        std::fs::write(selected.join(EXPORT_MARKER_NAME), b"{}").unwrap();
+        std::fs::write(selected.join("JPG/DSC00001.JPG"), b"jpg").unwrap();
+        std::fs::write(selected.join("RAW/DSC00001.ARW"), b"raw").unwrap();
+
+        // 扫描上级相册时跳过 Selected/，不会翻倍也不破坏原有配对
+        let parent_entries = scan_directory(&root).unwrap();
+        assert_eq!(parent_entries.len(), 2);
+        assert!(parent_entries.iter().all(|e| e.has_pair));
+
+        // 直接把 Selected/ 当作根目录打开时仍可正常浏览
+        let direct_entries = scan_directory(&selected).unwrap();
+        assert_eq!(direct_entries.len(), 2);
+        assert!(direct_entries.iter().all(|e| e.has_pair));
     }
 }

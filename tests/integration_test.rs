@@ -243,7 +243,7 @@ fn manual_rating_survives_rescore_and_export() {
     let sidecar = std::fs::read_to_string(jpg.with_extension("xmp")).unwrap();
     assert!(sidecar.contains("<xmp:Rating>1</xmp:Rating>"));
     let snap = pic_process::review::snapshot::build_snapshot(
-        &root, &cfg, &cache_path, &std::collections::HashMap::new(),
+        &root, &cfg, &cache_path,
         &std::collections::HashMap::new()).unwrap();
     assert_eq!(snap.photos[0].stars, Some(1));
     assert_eq!(snap.photos[0].rating_source.as_deref(), Some("manual"));
@@ -308,4 +308,124 @@ fn xmp_exposure_opt_in_and_manual_exposure_protection() {
     assert!(xmp_b2.contains("crs:Exposure2012=\"+1.75\""), "已有 Lightroom 人工曝光绝不得被覆盖");
 
     let _ = std::fs::remove_dir_all(root);
+}
+
+/// 构造带 EXIF DateTimeOriginal 的合法 JPEG 字节，便于端到端验证连拍分组 + 手动覆盖 + 导出。
+fn save_jpeg_with_exif_datetime(path: &std::path::Path, rgb: [u8; 3], datetime: &str) {
+    let mut jpg_bytes = Vec::new();
+    let img = image::RgbImage::from_pixel(64, 64, image::Rgb(rgb));
+    let mut cursor = std::io::Cursor::new(&mut jpg_bytes);
+    img.write_to(&mut cursor, image::ImageFormat::Jpeg).unwrap();
+    assert_eq!(&jpg_bytes[0..2], &[0xFF, 0xD8]);
+
+    // 最小小端 TIFF EXIF：IFD0 包含 ExifIFDPointer (0x8769) -> ExifIFD 包含 DateTimeOriginal (0x9003)
+    let dt_bytes = format!("{datetime}\0");
+    assert_eq!(dt_bytes.len(), 20);
+    let mut tiff = Vec::new();
+    tiff.extend_from_slice(b"II"); // little-endian
+    tiff.extend_from_slice(&42u16.to_le_bytes());
+    tiff.extend_from_slice(&8u32.to_le_bytes()); // IFD0 offset = 8
+    // IFD0 at offset 8: 1 entry (12 bytes) + next IFD (4 bytes) => ends at 26
+    tiff.extend_from_slice(&1u16.to_le_bytes());
+    tiff.extend_from_slice(&0x8769u16.to_le_bytes()); // ExifIFDPointer
+    tiff.extend_from_slice(&4u16.to_le_bytes()); // LONG
+    tiff.extend_from_slice(&1u32.to_le_bytes()); // count = 1
+    tiff.extend_from_slice(&26u32.to_le_bytes()); // ExifIFD offset = 26
+    tiff.extend_from_slice(&0u32.to_le_bytes()); // next IFD = 0
+    // ExifIFD at offset 26: 1 entry (12 bytes) + next IFD (4 bytes) => ends at 44
+    tiff.extend_from_slice(&1u16.to_le_bytes());
+    tiff.extend_from_slice(&0x9003u16.to_le_bytes()); // DateTimeOriginal
+    tiff.extend_from_slice(&2u16.to_le_bytes()); // ASCII
+    tiff.extend_from_slice(&20u32.to_le_bytes()); // count = 20
+    tiff.extend_from_slice(&44u32.to_le_bytes()); // value offset = 44
+    tiff.extend_from_slice(&0u32.to_le_bytes()); // next IFD = 0
+    tiff.extend_from_slice(dt_bytes.as_bytes());
+
+    let mut app1 = Vec::new();
+    app1.extend_from_slice(&[0xFF, 0xE1]);
+    let payload_len = (2 + 6 + tiff.len()) as u16;
+    app1.extend_from_slice(&payload_len.to_be_bytes());
+    app1.extend_from_slice(b"Exif\0\0");
+    app1.extend_from_slice(&tiff);
+
+    let mut out = Vec::with_capacity(jpg_bytes.len() + app1.len());
+    out.extend_from_slice(&jpg_bytes[0..2]);
+    out.extend_from_slice(&app1);
+    out.extend_from_slice(&jpg_bytes[2..]);
+    std::fs::write(path, out).unwrap();
+}
+
+/// 端到端验证：统一人工连拍覆盖（decisions.sqlite）贯穿 score CSV/XMP 与 CLI export，
+/// 且导出子目录写入 `.firstcut-export` 后再次扫描相册不重复计数。
+#[test]
+fn unified_burst_override_and_cli_export_end_to_end() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("album");
+    std::fs::create_dir_all(root.join("JPG")).unwrap();
+    std::fs::create_dir_all(root.join("RAW")).unwrap();
+
+    // 连拍组（间隔 1 秒）：b1、b2；非连拍单张（间隔 60 秒）：single
+    let b1 = root.join("JPG").join("DSC00001.JPG");
+    let b2 = root.join("JPG").join("DSC00002.JPG");
+    let single = root.join("JPG").join("DSC00003.JPG");
+    save_jpeg_with_exif_datetime(&b1, [120, 120, 120], "2026:09:27 12:00:00");
+    save_jpeg_with_exif_datetime(&b2, [120, 120, 120], "2026:09:27 12:00:01");
+    save_jpeg_with_exif_datetime(&single, [125, 125, 125], "2026:09:27 12:01:00");
+    std::fs::write(root.join("RAW").join("DSC00001.ARW"), b"arw-1").unwrap();
+    std::fs::write(root.join("RAW").join("DSC00002.ARW"), b"arw-2").unwrap();
+    std::fs::write(root.join("RAW").join("DSC00003.ARW"), b"arw-3").unwrap();
+
+    let csv_path = root.join(".firstcut").join("report.csv");
+    let cache_path = root.join(".firstcut").join("cache.sqlite");
+    let cfg = ScoreConfig::default();
+    let opts = score::ScoreJobOptions {
+        output_csv: csv_path.clone(), raw_csv: false, cache_path: cache_path.clone(), no_cache: false,
+        no_ai: true, xmp: true, xmp_exposure: false, gpu: false, keep_override: Some(1),
+        include_raw: true, skip_processed: true,
+    };
+    score::run_score_job(&root, &cfg, &opts, &|_| {}).unwrap();
+
+    // 人工给三张都设 5★，并显式强制舍弃 DSC00001、强制保留 DSC00002
+    pic_process::decision::set(&root, &b1, 5).unwrap();
+    pic_process::decision::set(&root, &b2, 5).unwrap();
+    pic_process::decision::set(&root, &single, 5).unwrap();
+    pic_process::decision::set_burst_keep(&root, &b1, Some(false)).unwrap();
+    pic_process::decision::set_burst_keep(&root, &b2, Some(true)).unwrap();
+
+    // 重跑 score：CSV 与 XMP 中的 burst_keep 必须反映人工连拍决定
+    score::run_score_job(&root, &cfg, &opts, &|_| {}).unwrap();
+    let xmp1 = std::fs::read_to_string(root.join("RAW").join("DSC00001.xmp")).unwrap();
+    let xmp2 = std::fs::read_to_string(root.join("RAW").join("DSC00002.xmp")).unwrap();
+    assert!(xmp1.contains("<firstcut:burstKeep>false</firstcut:burstKeep>"));
+    assert!(xmp2.contains("<firstcut:burstKeep>true</firstcut:burstKeep>"));
+
+    // CLI export（--min-stars 4 --keep-only）：应导出非连拍单张 DSC00003 + 人工保留的 DSC00002，排除人工舍弃的 DSC00001
+    let filter = pic_process::export::ExportFilter {
+        min_stars: Some(4),
+        keep_only: true,
+        ..Default::default()
+    };
+    let (items, all_sources) =
+        pic_process::export::collect_items_for_cli(&root, &cfg, &cache_path, &filter).unwrap();
+    assert_eq!(items.len(), 2, "应命中 DSC00002(手动保留) + DSC00003(非连拍单张)");
+
+    let exp_opts = pic_process::export::ExportOptions::default();
+    let plan = pic_process::export::plan_export(&root, &items, &all_sources, &exp_opts).unwrap();
+    let summary = pic_process::export::run_export(
+        &plan,
+        &std::sync::atomic::AtomicBool::new(false),
+        &|_| {},
+    )
+    .unwrap();
+    assert_eq!(summary.jpg_copied, 2);
+    assert_eq!(summary.raw_copied, 2);
+    assert_eq!(summary.xmp_written, 4);
+    assert!(root.join("Selected/RAW/DSC00002.ARW").is_file());
+    assert!(root.join("Selected/RAW/DSC00003.ARW").is_file());
+    assert!(!root.join("Selected/RAW/DSC00001.ARW").exists());
+
+    // 导出后再次扫描相册，条目数保持 6（3 JPG + 3 ARW），绝不把 Selected/ 重复扫入
+    let rescanned = pic_process::scan::scan_directory(&root).unwrap();
+    assert_eq!(rescanned.len(), 6);
+    assert!(rescanned.iter().all(|e| e.has_pair));
 }

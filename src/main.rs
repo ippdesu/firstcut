@@ -94,6 +94,50 @@ enum Commands {
         #[arg(long)]
         no_browser: bool,
     },
+    /// 将筛选命中的 JPG/RAW/XMP 非破坏性复制到指定子目录或目标文件夹
+    Export {
+        /// 照片目录
+        dir: PathBuf,
+        /// 目标目录：相对路径写入 <照片目录>/<路径>（默认 Selected），绝对路径写入该外部目录
+        #[arg(long, default_value = "Selected")]
+        to: PathBuf,
+        /// 最低星级（1~5；与 --stars 互斥）
+        #[arg(long)]
+        min_stars: Option<u8>,
+        /// 精确星级列表（逗号分隔，例如 --stars 4,5；与 --min-stars 互斥）
+        #[arg(long, value_delimiter = ',')]
+        stars: Option<Vec<u8>>,
+        /// 仅保留有效帧（包含所有非连拍单张 + 连拍组中有效保留的帧）
+        #[arg(long)]
+        keep_only: bool,
+        /// 仅导出有人脸的照片
+        #[arg(long)]
+        faces: bool,
+        /// 目录布局：split（默认 JPG/+RAW/）、flat（扁平化）、tree（保持原目录结构）
+        #[arg(long, default_value = "split")]
+        layout: String,
+        /// 不复制 JPG（默认复制）
+        #[arg(long)]
+        no_jpg: bool,
+        /// 不复制 RAW/ARW（默认复制）
+        #[arg(long)]
+        no_raw: bool,
+        /// 不复制/生成 XMP 侧车（默认启用）
+        #[arg(long)]
+        no_xmp: bool,
+        /// 仅为尚无源侧车、在导出目录中新生成的 XMP 附带 Adobe 建议曝光 crs:Exposure2012
+        #[arg(long)]
+        xmp_exposure: bool,
+        /// 仅预览待复制文件与预计空间占用，不写磁盘
+        #[arg(long)]
+        dry_run: bool,
+        /// 评分配置文件（默认优先读取 <照片目录>/.firstcut/config.toml）
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// 增量缓存文件（默认 <照片目录>/.firstcut/cache.sqlite）
+        #[arg(long)]
+        cache: Option<PathBuf>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -185,6 +229,120 @@ fn main() -> Result<()> {
                 &dir, &cfg, &cache, bind, port, !no_browser, config.as_deref(), public_url.as_deref(),
             )
                 .with_context(|| "复核服务启动失败")?;
+        }
+        Commands::Export {
+            dir,
+            to,
+            min_stars,
+            stars,
+            keep_only,
+            faces,
+            layout,
+            no_jpg,
+            no_raw,
+            no_xmp,
+            xmp_exposure,
+            dry_run,
+            config,
+            cache,
+        } => {
+            let dir = pic_process::review::normal_photo_root(&dir)?;
+            let paths = pic_process::review::photo_root_paths(&dir);
+            let config = pic_process::storage::absolute_output(config)?;
+            let (cfg, _) = pic_process::review::load_review_config(&dir, config.as_deref())?;
+            let cache = pic_process::storage::absolute_output(cache)?.unwrap_or(paths.cache);
+            let layout = match layout.trim().to_ascii_lowercase().as_str() {
+                "split" | "split_by_type" => pic_process::export::ExportLayout::SplitByType,
+                "flat" => pic_process::export::ExportLayout::Flat,
+                "tree" | "preserve_tree" => pic_process::export::ExportLayout::PreserveTree,
+                other => anyhow::bail!("未知导出布局 {other:?}；可选: split, flat, tree"),
+            };
+            let target = if to.is_absolute() {
+                pic_process::export::ExportTarget::ExternalDir(to)
+            } else {
+                pic_process::export::ExportTarget::AlbumSubdir(to)
+            };
+            let filter = pic_process::export::ExportFilter {
+                stars,
+                min_stars,
+                keep_only,
+                group_filter: pic_process::export::GroupFilter::All,
+                faces_only: faces,
+            };
+            let (items, all_sources) =
+                pic_process::export::collect_items_for_cli(&dir, &cfg, &cache, &filter)?;
+            let opts = pic_process::export::ExportOptions {
+                target,
+                layout,
+                include_jpg: !no_jpg,
+                include_raw: !no_raw,
+                include_xmp: !no_xmp,
+                xmp_exposure,
+            };
+            let plan = pic_process::export::plan_export(&dir, &items, &all_sources, &opts)?;
+            let p = &plan.preview;
+            eprintln!(
+                "[export] 目标: {} | 命中 {} 张照片 | 待写入: JPG {} / RAW {} / XMP {}（新生成 {}）| 跳过未变 {} | 保留既有 {} | 预计 {:.1} MB",
+                p.target_display,
+                p.selected_photos,
+                p.jpg_to_copy,
+                p.raw_to_copy,
+                p.xmp_to_write,
+                p.xmp_generated,
+                p.skipped_unchanged,
+                p.protected_existing,
+                p.total_copy_bytes as f64 / (1024.0 * 1024.0),
+            );
+            if let Some(free) = p.available_bytes {
+                eprintln!(
+                    "[export] 目标磁盘可用空间: {:.2} GB",
+                    free as f64 / (1024.0 * 1024.0 * 1024.0)
+                );
+            }
+            if p.missing_raw_count > 0 {
+                eprintln!("[export] 提示: {} 张照片无配对 RAW，已跳过其 RAW", p.missing_raw_count);
+            }
+            if p.renamed_count > 0 {
+                eprintln!("[export] 提示: {} 张照片存在跨目录重名，已自动加目录前缀防覆盖", p.renamed_count);
+            }
+            for w in &p.warnings {
+                eprintln!("[export] 警告: {w}");
+            }
+            if dry_run {
+                eprintln!("[export] --dry-run 预览结束，未写入磁盘。");
+                return Ok(());
+            }
+            let cancel = std::sync::atomic::AtomicBool::new(false);
+            let summary = pic_process::export::run_export(&plan, &cancel, &|ev| match ev {
+                pic_process::export::ExportEvent::Info(s) => eprintln!("[export] {s}"),
+                pic_process::export::ExportEvent::Progress { done, total, .. } => {
+                    if total > 0 && (done % 20 == 0 || done == total) {
+                        eprintln!("[export] 进度 {done}/{total}");
+                    }
+                }
+            })?;
+            for conflict in &summary.conflicts {
+                eprintln!("[export] 冲突（已保留既有文件）: {conflict}");
+            }
+            let conflict_note = if summary.conflicts.is_empty() {
+                String::new()
+            } else {
+                format!("，冲突 {}", summary.conflicts.len())
+            };
+            eprintln!(
+                "[export] 完成: 复制 JPG {} / RAW {} / XMP {}（共 {:.1} MB，跳过 {}，保留既有 {}，失败 {}{conflict_note}）→ {}",
+                summary.jpg_copied,
+                summary.raw_copied,
+                summary.xmp_written,
+                summary.bytes_written as f64 / (1024.0 * 1024.0),
+                summary.skipped_unchanged,
+                summary.protected_existing,
+                summary.failed,
+                summary.target_display,
+            );
+            if summary.failed > 0 {
+                anyhow::bail!("导出完成但有 {} 个文件失败", summary.failed);
+            }
         }
     }
     Ok(())

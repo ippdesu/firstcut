@@ -62,6 +62,46 @@ impl Folder {
         Ok(Self(dir))
     }
 
+    /// 打开或安全创建显式目标目录（用于导出到相册外的已授权目录）：
+    /// 从已存在的最近祖先起逐级无链接创建并校验每一层不是符号链接或重解析点。
+    pub fn open_or_create_explicit(path: &Path, create: bool) -> io::Result<Self> {
+        let absolute = std::path::absolute(path)?;
+        if !create {
+            return Self::open_explicit(&absolute);
+        }
+        // 找到已存在的最近祖先目录，避免 create_dir_all 盲目穿越符号链接
+        let mut existing = absolute.as_path();
+        let mut missing: Vec<OsString> = Vec::new();
+        while !existing.exists() {
+            let name = existing
+                .file_name()
+                .ok_or_else(|| denied("目标路径缺少有效祖先目录"))?;
+            missing.push(name.to_os_string());
+            existing = existing
+                .parent()
+                .ok_or_else(|| denied("目标路径缺少有效祖先目录"))?;
+        }
+        let mut dir = Self::open_explicit(existing)?;
+        for name in missing.into_iter().rev() {
+            dir = dir.child(&name, true)?;
+        }
+        Ok(dir)
+    }
+
+    /// 打开相册根目录内的相对子目录（逐级无链接校验；`create = true` 时按需创建）。
+    pub fn open_album_subdir(root: &Path, relative: &Path, create: bool) -> io::Result<Self> {
+        let dir = Self::open(root)?;
+        dir.descend(relative, create)
+    }
+
+    pub fn try_clone(&self) -> io::Result<Self> {
+        Ok(Self(self.0.try_clone()?))
+    }
+
+    pub fn descend_cloned(&self, relative: &Path, create: bool) -> io::Result<Self> {
+        self.try_clone()?.descend(relative, create)
+    }
+
     pub fn child(&self, name: impl AsRef<Path>, create: bool) -> io::Result<Self> {
         let name = name.as_ref();
         one_name(name)?;
@@ -109,6 +149,84 @@ impl Folder {
     pub fn unlink(&self, name: impl AsRef<Path>) -> io::Result<()> {
         self.0.remove_file(one_name(name.as_ref())?)
     }
+
+    /// 检查目录下是否包含未被 `marker_name` 标记的原始照片文件（无链接逐级遍历）。
+    pub fn contains_unmarked_photos(
+        &self,
+        marker_name: &str,
+        is_photo_name: impl Fn(&str) -> bool,
+    ) -> io::Result<bool> {
+        if self.file(marker_name)?.open_read()?.is_some() {
+            return Ok(false);
+        }
+        const MAX_DEPTH: usize = 64;
+        let mut stack = vec![(self.try_clone()?, 0usize)];
+        while let Some((dir, depth)) = stack.pop() {
+            for entry in dir.0.entries()? {
+                let entry = entry?;
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                if name_str.eq_ignore_ascii_case(STATE_DIR) {
+                    continue;
+                }
+                let meta = match dir.0.symlink_metadata(&name) {
+                    Ok(m) => m,
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+                    Err(err) => return Err(err),
+                };
+                if is_reparse(&meta) {
+                    continue;
+                }
+                if meta.is_file() {
+                    if is_photo_name(&name_str) {
+                        return Ok(true);
+                    }
+                } else if meta.is_dir() && depth < MAX_DEPTH {
+                    let child = match dir.child(&name, false) {
+                        Ok(c) => c,
+                        Err(err)
+                            if matches!(
+                                err.kind(),
+                                io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+                            ) =>
+                        {
+                            continue;
+                        }
+                        Err(err) => return Err(err),
+                    };
+                    if child
+                        .file(marker_name)
+                        .and_then(|f| f.open_read())
+                        .ok()
+                        .flatten()
+                        .is_some()
+                    {
+                        continue;
+                    }
+                    stack.push((child, depth + 1));
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// 非递归列出当前目录下所有普通文件的文件名（跳过符号链接与重解析点）。
+    pub fn list_regular_filenames(&self) -> io::Result<Vec<String>> {
+        let mut names = Vec::new();
+        for entry in self.0.entries()? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let meta = match self.0.symlink_metadata(&name) {
+                Ok(m) => m,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(err),
+            };
+            if meta.is_file() && !is_reparse(&meta) {
+                names.push(name.to_string_lossy().into_owned());
+            }
+        }
+        Ok(names)
+    }
 }
 
 fn check_directory(metadata: cap_std::fs::Metadata) -> io::Result<()> {
@@ -130,6 +248,16 @@ fn is_reparse(metadata: &cap_std::fs::Metadata) -> bool {
 #[cfg(not(windows))]
 fn is_reparse(metadata: &cap_std::fs::Metadata) -> bool {
     metadata.is_symlink()
+}
+
+/// 导出写入结果：成功写入或因目标在规划后发生变化而保护既有文件。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportWriteOutcome {
+    Written {
+        bytes: u64,
+        mtime_nanos: Option<i64>,
+    },
+    Conflict,
 }
 
 pub struct FileRef {
@@ -235,8 +363,125 @@ impl FileRef {
         check_handle(file)
     }
 
+    /// 安全读取目标文件的大小与修改时间指纹（不跟随符号链接/重解析点）。
+    pub fn fingerprint(&self) -> io::Result<Option<(u64, i64)>> {
+        let Some(file) = self.open_read()? else {
+            return Ok(None);
+        };
+        let meta = file.metadata()?;
+        Ok(crate::cache::metadata_fingerprint(&meta))
+    }
+
     pub fn write(&self, data: &[u8]) -> io::Result<()> {
         self.replace(|file| file.write_all(data))
+    }
+
+    /// 导出场景专用：按流式分块将已安全打开的源文件复制到临时文件，保留修改时间；
+    /// 在原子重命名覆盖目标前执行 `check_before_rename`，若返回 `false` 则删除临时文件并返回 `Conflict`。
+    pub fn copy_from_reader_checked(
+        &self,
+        src: &mut File,
+        preserve_mtime: Option<std::time::SystemTime>,
+        check_before_rename: impl FnOnce(&Self) -> io::Result<bool>,
+    ) -> io::Result<ExportWriteOutcome> {
+        self.open_read()?; // 拒绝已存在的硬链接/重解析点
+        let mut entropy = [0u8; 16];
+        getrandom::fill(&mut entropy).map_err(|err| io::Error::other(err.to_string()))?;
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        let temp = format!(".firstcut-{}.tmp", URL_SAFE_NO_PAD.encode(entropy));
+        let temp_ref = self.parent.file(&temp)?;
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use cap_std::fs::OpenOptionsExt;
+            options.mode(0o644);
+        }
+        let mut file = temp_ref.open(&options)?;
+        let result = (|| {
+            let mut buf = vec![0u8; 256 * 1024];
+            let mut total = 0u64;
+            loop {
+                let n = src.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                file.write_all(&buf[..n])?;
+                total += n as u64;
+            }
+            if let Some(mtime) = preserve_mtime {
+                // 在 sync 与 rename 之前写回源修改时间；若目标文件系统不支持则降级忽略
+                let _ = file.set_modified(mtime);
+            }
+            file.sync_all()?;
+            check_handle(&file)?;
+            let actual_mtime = file
+                .metadata()
+                .ok()
+                .and_then(|m| crate::cache::metadata_fingerprint(&m))
+                .map(|(_, mt)| mt);
+            drop(file);
+            if !check_before_rename(self)? {
+                let _ = self.parent.unlink(&temp);
+                return Ok(ExportWriteOutcome::Conflict);
+            }
+            self.parent.0.rename(&temp, &self.parent.0, &self.name)?;
+            Ok(ExportWriteOutcome::Written {
+                bytes: total,
+                mtime_nanos: actual_mtime,
+            })
+        })();
+        if result.is_err() {
+            let _ = self.parent.unlink(&temp);
+        }
+        result
+    }
+
+    /// 导出场景专用：写出完整字节内容（如 XMP 侧车）；
+    /// 在原子重命名覆盖目标前执行 `check_before_rename`，若返回 `false` 则删除临时文件并返回 `Conflict`。
+    pub fn write_exported_bytes_checked(
+        &self,
+        data: &[u8],
+        check_before_rename: impl FnOnce(&Self) -> io::Result<bool>,
+    ) -> io::Result<ExportWriteOutcome> {
+        self.open_read()?;
+        let mut entropy = [0u8; 16];
+        getrandom::fill(&mut entropy).map_err(|err| io::Error::other(err.to_string()))?;
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        let temp = format!(".firstcut-{}.tmp", URL_SAFE_NO_PAD.encode(entropy));
+        let temp_ref = self.parent.file(&temp)?;
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use cap_std::fs::OpenOptionsExt;
+            options.mode(0o644);
+        }
+        let mut file = temp_ref.open(&options)?;
+        let result = (|| {
+            file.write_all(data)?;
+            file.sync_all()?;
+            check_handle(&file)?;
+            let actual_mtime = file
+                .metadata()
+                .ok()
+                .and_then(|m| crate::cache::metadata_fingerprint(&m))
+                .map(|(_, mt)| mt);
+            drop(file);
+            if !check_before_rename(self)? {
+                let _ = self.parent.unlink(&temp);
+                return Ok(ExportWriteOutcome::Conflict);
+            }
+            self.parent.0.rename(&temp, &self.parent.0, &self.name)?;
+            Ok(ExportWriteOutcome::Written {
+                bytes: data.len() as u64,
+                mtime_nanos: actual_mtime,
+            })
+        })();
+        if result.is_err() {
+            let _ = self.parent.unlink(&temp);
+        }
+        result
     }
 
     /// Never truncate a named file. Write a new file and then replace the
@@ -269,6 +514,46 @@ impl FileRef {
         }
         result
     }
+}
+
+/// 若 `path` 位于 `root` 之下（经 `std::path::absolute` 归一化，Windows 大小写不敏感），
+/// 返回相对 `root` 的路径。
+pub fn relative_under_album(root: &Path, path: &Path) -> io::Result<Option<PathBuf>> {
+    let abs_root = std::path::absolute(root)?;
+    let abs_path = std::path::absolute(path)?;
+    Ok(strip_album_prefix(&abs_root, &abs_path))
+}
+
+/// 查询目标路径所在卷的可用剩余字节数（沿祖先找到最近已存在目录；不支持平台返回 None）。
+pub fn available_disk_space(path: &Path) -> Option<u64> {
+    let abs = std::path::absolute(path).ok()?;
+    let existing = abs.ancestors().find(|p| p.exists())?;
+    available_disk_space_inner(existing)
+}
+
+#[cfg(windows)]
+fn available_disk_space_inner(existing: &Path) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+
+    let wide: Vec<u16> = existing.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut free_to_caller = 0u64;
+    let mut total_bytes = 0u64;
+    let mut total_free = 0u64;
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &mut free_to_caller,
+            &mut total_bytes,
+            &mut total_free,
+        )
+    };
+    (ok != 0).then_some(free_to_caller)
+}
+
+#[cfg(not(windows))]
+fn available_disk_space_inner(_existing: &Path) -> Option<u64> {
+    None
 }
 
 fn strip_album_prefix(root: &Path, path: &Path) -> Option<PathBuf> {

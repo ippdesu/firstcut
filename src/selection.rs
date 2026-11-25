@@ -6,15 +6,14 @@ use std::path::Path;
 use anyhow::Result;
 
 use crate::config::ScoreConfig;
-use crate::decision::{self, EffectiveRating};
-use crate::dedup::BurstInfo;
+use crate::decision::{self, EffectiveBurst, EffectiveRating};
 use crate::output::xmp;
 use crate::scan::PhotoEntry;
 use crate::score::{self, AnalysisResult};
 
 /// 针对某个照片批次与配置计算的结果。key 均为扫描器提供的 pair_id。
 pub struct SelectionResult {
-    pub bursts: HashMap<String, BurstInfo>,
+    pub bursts: HashMap<String, EffectiveBurst>,
     pub ratings: HashMap<String, EffectiveRating>,
 }
 
@@ -26,7 +25,9 @@ pub fn build(
     keep_override: Option<usize>,
 ) -> Result<SelectionResult> {
     let dedup = crate::config::effective_dedup(keep_override, cfg);
-    let bursts = score::analyze_photo_bursts(entries, analyzed, &dedup, &cfg.weights);
+    let algo_bursts = score::analyze_photo_bursts(entries, analyzed, &dedup, &cfg.weights);
+    let manual_bursts = decision::load_burst_overrides(root)?;
+    let bursts = decision::effective_bursts(root, entries, &algo_bursts, &manual_bursts)?;
     let totals: Vec<(String, f64)> = analyzed
         .iter()
         .map(|(key, result)| {

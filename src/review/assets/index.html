@@ -151,8 +151,24 @@
   .starbtns button{background:none;border:1px solid var(--line);color:#ffc107;font-size:14px;padding:2px 7px;border-radius:4px;cursor:pointer}
   .starbtns button:hover{background:#333}
   #modal{position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:30;display:none;align-items:center;justify-content:center}
-  #modal .box{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:18px;width:min(720px,calc(100vw - 24px));max-height:85vh;overflow-y:auto;font-size:13px}
-  #modal h3{margin:0 0 4px;font-size:15px}
+  #modal .box,#exportModal .box{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:18px;width:min(720px,calc(100vw - 24px));max-height:85vh;overflow-y:auto;font-size:13px}
+  #modal h3,#exportModal h3{margin:0 0 4px;font-size:15px}
+  #exportModal{position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:35;display:none;align-items:center;justify-content:center}
+  #exportModal .grp{margin-top:10px;padding-top:8px;border-top:1px solid var(--line)}
+  #exportModal .grp b{color:var(--acc);font-size:12px;display:block;margin-bottom:6px}
+  #exportModal .row{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:6px 0}
+  #exportModal input[type=text],#exportModal select{background:#111;border:1px solid var(--line);color:var(--fg);padding:5px 8px;border-radius:4px;font-size:12px}
+  #exportModal input[type=text]{flex:1;min-width:180px}
+  #exportModal label.chk{display:inline-flex;align-items:center;gap:5px;cursor:pointer;margin-right:12px;font-size:12px}
+  #exportPreviewBox{background:#121212;border:1px solid var(--line);border-radius:6px;padding:10px 12px;font-size:12px;line-height:1.6}
+  #exportPreviewBox .warn{color:#ffb74d;margin-top:4px}
+  #exportPreviewBox .err{color:#ef5350}
+  #exportPreviewBox ul{margin:4px 0 0 18px;padding:0;color:var(--dim);font-size:11px}
+  #exportBarWrap{height:8px;background:#111;border-radius:4px;overflow:hidden;margin:8px 0;display:none}
+  #exportBar{height:100%;width:0;background:var(--acc);transition:width .25s}
+  #exportLog{display:none;max-height:140px;overflow-y:auto;background:#0d0d0d;border:1px solid var(--line);border-radius:4px;padding:6px;font-size:11px;line-height:1.5;white-space:pre-wrap;word-break:break-all;color:#9c9c9c;margin-top:6px}
+  #exportModal .foot{display:flex;gap:8px;justify-content:flex-end;margin-top:14px;flex-wrap:wrap}
+  .btn.danger{background:#6b2626;border-color:#8a3333;color:#fff}
   #modal .grp{margin-top:10px;padding-top:8px;border-top:1px solid var(--line)}
   #modal .grp b{color:var(--acc);font-size:12px}
   #modal .cfg-field{padding:7px 0;border-bottom:1px solid #292929}
@@ -203,8 +219,8 @@
     <h3>连拍保留</h3>
     <select id="fKeep">
       <option value="all">全部</option>
-      <option value="keep">仅保留</option>
-      <option value="drop">仅舍弃</option>
+      <option value="keep">保留（含非连拍单张）</option>
+      <option value="drop">仅连拍舍弃</option>
     </select>
     <h3>连拍组</h3>
     <select id="fGroup">
@@ -235,6 +251,7 @@
         <button class="btn primary" id="runBtn" style="flex:1">▶ 重新评分</button>
         <button class="btn" id="cfgBtn">⚙ 配置</button>
       </div>
+      <button class="btn" id="exportBtn" style="width:100%;margin-top:6px">📦 导出筛选结果…</button>
       <div id="runBarWrap"><div id="runBar"></div></div>
       <div class="dim" id="runState" style="display:none"></div>
       <pre id="runLog"></pre>
@@ -322,6 +339,63 @@
     <div class="foot">
       <button class="btn" id="cfgCancel">取消</button>
       <button class="btn primary" id="cfgSave">保存评分配置</button>
+    </div>
+  </div>
+</div>
+
+<div id="exportModal">
+  <div class="box" role="dialog" aria-modal="true" aria-labelledby="exportTitle">
+    <h3 id="exportTitle">导出当前筛选结果</h3>
+    <div class="dim" id="exportFilterSummary">基于当前左侧筛选命中的全部照片（不受“按连拍组聚合”折叠影响）。</div>
+    <div class="grp">
+      <b>目标目录</b>
+      <div class="row" id="exportSubdirRow">
+        <label for="exportSubdir" class="dim">相册内子目录</label>
+        <input type="text" id="exportSubdir" value="Selected" placeholder="例如 Selected 或 Selected/精修" spellcheck="false">
+        <button class="btn" type="button" id="exportPickFolder" hidden>选择其他文件夹…</button>
+      </div>
+      <div class="row" id="exportExternalRow" hidden>
+        <span class="dim">外部目标：</span>
+        <code id="exportExternalPath" style="font-size:12px;word-break:break-all"></code>
+        <button class="btn" type="button" id="exportUseSubdir">改回相册子目录</button>
+      </div>
+      <div class="dim">严格非破坏增量复制：跳过大小与时间一致的已有文件，绝不删除目标目录任何既有文件，保护你在 PS/ACR 修改过的 XMP；相册内导出自动写 `.firstcut-export` 防止下次重复扫入。</div>
+    </div>
+    <div class="grp">
+      <b>文件类型与目录布局</b>
+      <div class="row">
+        <label class="chk"><input type="checkbox" id="exportJpg" checked> JPG</label>
+        <label class="chk"><input type="checkbox" id="exportRaw" checked> RAW (ARW)</label>
+        <label class="chk"><input type="checkbox" id="exportXmp" checked> XMP 侧车（已有原样复制，无侧车自动生成）</label>
+      </div>
+      <div class="row">
+        <label class="chk" title="仅对原目录尚无侧车、本次在导出目录新生成的 XMP 生效；原目录已有侧车一律原样复制"><input type="checkbox" id="exportXmpExposure"> 新建 XMP 附带 Adobe 建议曝光（crs:Exposure2012）</label>
+      </div>
+      <div class="dim" id="exportRawDisabledNote" hidden>当前已关闭“关联同名 RAW 照片”，仅导出 JPG / XMP。</div>
+      <div class="row" style="margin-top:8px">
+        <label for="exportLayout" class="dim">目录布局</label>
+        <select id="exportLayout">
+          <option value="split_by_type">按类型分目录：JPG/ + RAW/（推荐，适合拖入 PS/ACR）</option>
+          <option value="flat">扁平化：全部放入同一目录（共享一份 XMP）</option>
+          <option value="preserve_tree">保持原相对目录结构</option>
+        </select>
+      </div>
+    </div>
+    <div class="grp">
+      <b>导出前预览</b>
+      <div id="exportPreviewBox"><span class="dim">正在计算导出预览…</span></div>
+    </div>
+    <div class="grp" id="exportJobGroup" hidden>
+      <b>导出进度</b>
+      <div id="exportBarWrap"><div id="exportBar"></div></div>
+      <div class="dim" id="exportState"></div>
+      <pre id="exportLog"></pre>
+    </div>
+    <div class="foot">
+      <button class="btn" type="button" id="exportOpenDir" hidden>📂 打开导出目录</button>
+      <button class="btn danger" type="button" id="exportCancelJob" hidden>取消导出</button>
+      <button class="btn" type="button" id="exportClose">关闭</button>
+      <button class="btn primary" type="button" id="exportStart">开始导出</button>
     </div>
   </div>
 </div>

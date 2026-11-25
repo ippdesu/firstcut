@@ -40,7 +40,7 @@ firstcut 是 Rust 编写的本地照片初筛与复核工具。扫描索尼 JPG+
 
 选一次拍摄活动的根目录，支持同目录 JPG+ARW，也支持 `JPG/`、`RAW/` 子目录布局。配对先匹配同目录同主干，再对剩余同名且无歧义的 JPG/ARW 跨目录兜底；遇到歧义不猜测，避免相机编号回绕导致错误合并。
 
-“关联同名 RAW 照片”是照片根目录级偏好，UI、CLI `score` 和 `review` 共用；关闭后只处理 JPG。扫描跳过 `.firstcut/` 与所选根下的 `Processed/` 输出子树；直接选择 `Processed/` 本身则可以浏览成片。根目录顶层的成片 JPG 无法自动区分，建议单独放在 `Processed/`。
+“关联同名 RAW 照片”是照片根目录级偏好，UI、CLI `score` 和 `review` 共用；关闭后只处理 JPG。扫描跳过 `.firstcut/`、所选根下的 `Processed/` 输出子树，以及任何包含 `.firstcut-export` 标记文件的导出子目录；直接选择 `Processed/` 或导出目录本身则可以单独浏览。根目录顶层的成片 JPG 无法自动区分，建议单独放在 `Processed/`。
 
 照片根统一规范化，Windows 去掉影响旧缓存匹配的 `\\?\` 路径形式。同一根目录不应因启动器、CLI 或进程工作目录不同而产生不同默认状态位置。
 
@@ -49,15 +49,15 @@ firstcut 是 Rust 编写的本地照片初筛与复核工具。扫描索尼 JPG+
 | 照片根目录下的路径 | 用途 / 保留方式 |
 |---|---|
 | `.firstcut/cache.sqlite` | 可重建的分析缓存 |
-| `.firstcut/decisions.sqlite` | 人工星级决定，随照片备份 |
-| `.firstcut/burst-overrides.json` | review 人工保留/舍弃覆盖，需保留 |
+| `.firstcut/decisions.sqlite` | 统一人工决定库（人工星级 + 人工连拍保留/舍弃覆盖），随照片备份；自动兼容并迁移旧版 `.firstcut/burst-overrides.json` |
 | `.firstcut/scene-feedback.jsonl` | 场景纠正、备注与当时评分线索，需保留 |
 | `.firstcut/config.toml` | 当前评分配置；不存在时使用内置默认值 |
 | `.firstcut/ui-preferences.json` | RAW 关联和直方图抽样比例等照片根级偏好 |
 | `.firstcut/report.csv`、`scan-report.csv`、`metrics.csv` | 评分、扫描和调参报告 |
 | `.firstcut/thumbs/v2/` | 按照片清单身份生成；8192 个固定槽、每槽最多 64 KiB，碰撞时可重新生成 |
-| `.firstcut/review.log` | 评分任务时间日志，严格限制为单文件 256 KiB |
+| `.firstcut/review.log` | 评分与导出任务时间日志，严格限制为单文件 256 KiB |
 | 照片旁的 `<stem>.xmp` | 唯一有意放在照片旁的元数据导出，供 Lightroom 发现 |
+| `<导出子目录>/.firstcut-export` | 导出清单与防二次扫描标记（上级扫描自动跳过该导出目录） |
 
 默认应用状态集中到 `.firstcut/`。CLI 显式 `--cache`、`--output`、`--config` 可覆盖对应路径；旧工作目录缓存不自动猜测或搬移，可用 `--cache` 明确读取。`config-template` 没有照片根参数，默认写当前目录 `.firstcut/firstcut-template.toml`；gallery 默认输出到输入报告旁，常规工作流因此仍在 `.firstcut/`。
 
@@ -101,7 +101,7 @@ firstcut 是 Rust 编写的本地照片初筛与复核工具。扫描索尼 JPG+
 
 按 EXIF 时间排序，非负且 ≤2s 的相邻间隔聚为连拍组；组内 dHash（9×8 → 64 bit，汉明距离 ≤10）分近似子簇，再按 SCRFD 五关键点归一化的 10 维姿态描述子贪心聚类。姿态距离阈值默认 0.25；每个姿态簇按实际加权总分保留 top-K，默认 3 张，单组总保留上限 20。
 
-无有效姿态描述子的帧共用伪簇；`adaptive_keep = false` 回退到 dHash 子簇保留；`-k` 显式值优先于配置。`burst_size` / `burst_rank` 对应保留单元，不一定是整组张数。姿态只影响候选，不改变五维分数和星级。保留/舍弃是建议或人工标记，不是文件删除操作。
+无有效姿态描述子的帧共用伪簇；`adaptive_keep = false` 回退到 dHash 子簇保留；`-k` 显式值优先于配置。`burst_size` / `burst_rank` 对应保留单元，不一定是整组张数。姿态只影响候选，不改变五维分数和星级。保留/舍弃是建议或人工标记，不是文件删除操作；人工连拍保留覆盖统一存放在 `.firstcut/decisions.sqlite`（兼容迁移旧 `.firstcut/burst-overrides.json`），经 `selection.rs` 同步驱动 `score`（CSV/XMP）、`export` 与 `review`。
 
 ## 5. 处理链路与模块职责
 
@@ -109,19 +109,19 @@ firstcut 是 Rust 编写的本地照片初筛与复核工具。扫描索尼 JPG+
 扫描/EXIF/配对 (scan) → 安全文件边界 (storage) → 缓存匹配 (cache)
     → JPG 解码与像素指标 (decode / metrics) → AI 主体与美学 (ai)
     → 统一结果合成 (selection / dedup / decision)
-    → 导出与交互 (output/csv, output/xmp, review)
+    → 导出与交互 (output/csv, output/xmp, export, review)
 ```
 
 | 模块 | 职责 |
 |---|---|
-| `main.rs`、`bin/firstcut_ui.rs` | CLI 参数解析（`scan`/`score`/`config-template`/`review`）与 Windows 无控制台选目录启动器 |
-| `storage.rs` | 基于 `cap-std` 句柄的安全目录与文件访问边界，逐级拒绝符号链接、重解析点、硬链接逃逸与未关闭数据库旁路日志 |
-| `scan.rs`、`decode.rs` | 目录扫描、JPG/ARW 配对、EXIF 解析、JPEG 快速解码与安全兜底、EXIF 方向变换 |
+| `main.rs`、`bin/firstcut_ui.rs` | CLI 参数解析（`scan`/`score`/`export`/`config-template`/`review`）与 Windows 无控制台选目录启动器 |
+| `storage.rs` | 基于 `cap-std` 句柄的安全目录与文件访问边界，逐级拒绝符号链接、重解析点、硬链接逃逸与未关闭数据库旁路日志，提供流式分块原子复制与卷剩余空间查询 |
+| `scan.rs`、`decode.rs` | 目录扫描（跳过 `.firstcut`、`Processed/` 与含 `.firstcut-export` 的导出目录）、JPG/ARW 配对、EXIF 解析、JPEG 快速解码与安全兜底、EXIF 方向变换 |
 | `metrics/`、`ai/`、`score.rs` | 五维像素指标、ONNX Runtime 推理（含固定 SHA-256 校验）、并行分析调度与 CLI/UI 共用跑批入口 |
 | `cache.rs`、`config.rs` | SQLite 增量缓存匹配/写入、配置加载与严格校验、配置指纹与 5 份内置预设 |
-| `dedup.rs`、`selection.rs`、`decision.rs` | 连拍分组与姿态聚类、最终星级合成、独立人工星级持久化 |
-| `output/` | CSV（默认表格公式防护 / `--raw-csv`）与 XMP 侧车渲染、受管理 XML 字段合并 |
-| `review/` | 本地 Web 复核服务（`mod.rs` 路由、`access.rs` 会话与来源鉴权、`snapshot.rs` 快照、`job.rs` 跑批与日志、`config_edit.rs`、`scene_feedback.rs`、`thumb.rs` 缩略图槽位缓存、`assets/` 内嵌前端） |
+| `dedup.rs`、`selection.rs`、`decision.rs` | 连拍分组与姿态聚类、最终星级与有效连拍决定合成、统一人工星级与连拍覆盖持久化 |
+| `output/`、`export.rs` | CSV（默认表格公式防护 / `--raw-csv`）、XMP 侧车渲染/合并，以及筛选结果非破坏增量导出（分类型/扁平/保结构布局、索尼回绕冲突防覆盖、PS/ACR 侧车修改保护与取消安全） |
+| `review/` | 本地 Web 复核服务（`mod.rs` 路由、`access.rs` 会话与来源鉴权、`snapshot.rs` 快照、`job.rs` 评分/导出单任务互斥与日志、`config_edit.rs`、`scene_feedback.rs`、`thumb.rs` 缩略图槽位缓存、`assets/` 内嵌前端） |
 | `bin/tune.rs`、`gallery.rs`、`debug_*`、`probe.rs` | 调参指标导出、HTML 联系表生成与模型/像素诊断工具 |
 
 JPEG 使用 `jpeg-decoder` 快速路径、`image` 兜底，全解码后 box 块平均到约 1024px 分析图；灰度 JPEG 走安全路径。EXIF Orientation 1–8 在降采样后应用，5/7 为先旋转后镜像。像素任务使用 rayon；AI 使用 ort 池化 Session/Mutex，当前单 Session 策略，历史实测增加池未改善性能。
@@ -165,11 +165,11 @@ JPEG 使用 `jpeg-decoder` 快速路径、`image` 兜底，全解码后 box 块�
 HTTP 端点：
 - **公开与鉴权**：`/`（页面框架）、`/review.js`（内嵌脚本）、`/healthz`（启动器探活）、`POST /api/session`（凭据换会话）
 - **数据与图像（需会话）**：`GET /api/photos`、`GET /api/load`、`GET /thumb`、`GET /image`
-- **任务、标注与配置（需会话 + 写接口来源校验）**：`GET /api/job`、`POST /api/score/run`、`POST /api/rate`、`POST /api/burst/keep`、`POST /api/scene-feedback`、`GET/POST /api/config`、`GET/POST /api/ui-settings`、`GET/POST /api/control`
+- **任务、标注与配置（需会话 + 写接口来源校验）**：`GET /api/job`、`POST /api/score/run`、`POST /api/export/pick-folder`、`POST /api/export/preview`、`POST /api/export/run`、`POST /api/export/cancel`、`POST /api/export/open`、`POST /api/rate`、`POST /api/burst/keep`、`POST /api/scene-feedback`、`GET/POST /api/config`、`GET/POST /api/ui-settings`、`GET/POST /api/control`
 
 ## 8. 安全、验证与发布
 
-默认只监听 `127.0.0.1:8787`。复核链接中的访问凭据位于 URL fragment，不进入普通 HTTP 请求地址；页面兑换服务会话后清除链接片段。`POST /api/session` 具备滑动窗口失败限速（60 秒内连续失败 5 次返回 `429 Too Many Requests` 与 `Retry-After`）。会话按浏览器的协议、主机名和端口保存，由请求头显式发送，完整进程退出后失效。Windows 双击启动器通过当前登录会话内命名事件（`Local\firstcut-ui-reopen-8787`）唤起已有进程重开带凭据链接，不在磁盘或 HTTP 暴露凭据。访问校验在路由统一处理：公开页只返回页面框架与脚本，图片与照片元数据需要有效会话；写接口还要求匹配服务地址的 Origin 和 JSON 请求体，并通过统一的取消安全执行器将异步写互斥锁（`OwnedMutexGuard`）、`JobState` 写守卫（与跑批及服务关闭互斥）及 `AppState` 一并移入 `spawn_blocking` 任务——即使客户端中途断连取消 HTTP 请求，后台任务仍会持锁并持有守卫直到落盘、内存状态与快照全部更新完成。响应禁止第三方站点加载；原图只按当前快照的 JPG 身份读取并流式传输。
+默认只监听 `127.0.0.1:8787`。复核链接中的访问凭据位于 URL fragment，不进入普通 HTTP 请求地址；页面兑换服务会话后清除链接片段。`POST /api/session` 具备滑动窗口失败限速（60 秒内连续失败 5 次返回 `429 Too Many Requests` 与 `Retry-After`）。会话按浏览器的协议、主机名和端口保存，由请求头显式发送，完整进程退出后失效。Windows 双击启动器通过当前登录会话内命名事件（`Local\firstcut-ui-reopen-8787`）唤起已有进程重开带凭据链接，不在磁盘或 HTTP 暴露凭据。访问校验在路由统一处理：公开页只返回页面框架与脚本，图片与照片元数据需要有效会话；写接口还要求匹配服务地址的 Origin 和 JSON 请求体，并通过统一的取消安全执行器将异步写互斥锁（`OwnedMutexGuard`）、`JobState` 写守卫（与跑批、导出及服务关闭互斥）及 `AppState` 一并移入 `spawn_blocking` 任务——即使客户端中途断连取消 HTTP 请求，后台任务仍会持锁并持有守卫直到落盘、内存状态与快照全部更新完成。Web UI 导出相册外目录仅允许本机 Windows 桌面回环模式通过原生文件夹弹窗授权并由服务端颁发不透明 `target_id`（不接受浏览器任意外部路径，且打开资源管理器仅限服务端记录的最近导出目录）；容器/远程监听模式（`--bind 0.0.0.0`）仅允许相册内独立子目录（且拒绝相册根、`.firstcut` 与已有原片目录）。响应禁止第三方站点加载；原图只按当前快照的 JPG 身份读取并流式传输。
 
 `.firstcut/`、自动导出的 XMP 与相册照片通过打开的目录句柄定位（`storage.rs`，Windows 上对相册前缀按大小写不敏感归属判定），逐级拒绝符号链接、Windows 重解析点（含 OneDrive 云占位目录）与有多条硬链接的文件。数据库从安全打开的文件读入，SQLite 不直接操作相册内的文件名；拒绝未关闭或有待恢复日志的库，保留原件。普通状态以新文件完整写入后原子替换；日志与场景反馈受大小和文件身份约束。场景反馈达到 16 MiB 时拒绝继续追加并提示归档。分析限制为单图 128 MiB、1.1 亿像素和进程内最多两次并行解码；原图接口发送体积同样上限 128 MiB。
 
@@ -192,9 +192,9 @@ HTML 联系表转义所有元数据，只允许运行固定的排序脚本；读
 
 | 优先顺序 | 方向 | 理由与验收重点 |
 |---|---|---|
-| 1 | 统一人工连拍保留决定与导出 | 接入独立决定模型和 `selection`，验证 CLI、review、CSV/XMP 同一规则；不让 UI 覆盖孤立在 JSON |
+| 1 | 选片手感与人像工作流 | 一键 1:1 居中定焦人脸/眼睛查合焦、粘贴文件名清单反选 RAW、闭眼/表情废片过滤 |
 | 2 | 建立真实选片标注集 | 检查好片被排除率、每组最佳帧候选覆盖率，再决定权重/阈值优化；单次“界面可用”不能代表算法质量验收 |
-| 3 | Lightroom / ACR 实际导入 | 核对 JPG/ARW 配对、星级、firstcut 字段和 `crs:Exposure2012` 的实际显示及效果 |
+| 3 | Lightroom / ACR 实际导入 | 核对 JPG/ARW 配对、星级、firstcut 字段、导出目录布局和 `crs:Exposure2012` 的实际显示及效果 |
 | 4 | 模型输入和主体可靠性 | letterbox/坐标反算、遮挡和超大脸、主体分策略均需检出率与选片回归，不能无验证直接替换 |
 | 待单独设计 | 原生 macOS / HDR | Apple Silicon 原生需验证 CoreML 与发行链路；HDR 需设计色彩管理、亮度域及增益图语义，不能把 SDR 直方图直接当 HDR 支持 |
 

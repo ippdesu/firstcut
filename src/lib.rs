@@ -6,6 +6,7 @@ pub mod decision;
 pub mod config;
 pub mod decode;
 pub mod dedup;
+pub mod export;
 pub mod metrics;
 pub mod output;
 pub mod review;

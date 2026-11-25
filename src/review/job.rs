@@ -4,9 +4,26 @@
 
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 #[cfg(not(windows))]
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// 后台任务类型（全局单任务互斥：评分与导出不可并发）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobKind {
+    Score,
+    Export,
+}
+
+impl JobKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Score => "score",
+            Self::Export => "export",
+        }
+    }
+}
 
 /// 任务状态机：Idle → Running → Done/Failed
 #[derive(Debug, Clone, PartialEq)]
@@ -17,17 +34,36 @@ pub enum JobStatus {
     Failed { error: String },
 }
 
+/// 供 `/api/job` 序列化的完整任务快照
+#[derive(Debug, Clone)]
+pub struct JobSnapshot {
+    pub kind: JobKind,
+    pub status: JobStatus,
+    pub log: Vec<String>,
+    pub bytes_done: u64,
+    pub bytes_total: u64,
+    pub current_file: String,
+    pub cancellable: bool,
+    pub can_open_export: bool,
+}
+
 #[derive(Debug)]
 struct JobInner {
+    kind: JobKind,
     status: JobStatus,
     stopping: bool,
     /// 进行中的前端写请求数（改星/连拍覆盖/场景反馈/配置保存）；
-    /// 非零时禁止启动新跑批或关闭服务，消除 TOCTOU 竞态。
+    /// 非零时禁止启动新跑批/导出或关闭服务，消除 TOCTOU 竞态。
     active_mutations: usize,
     /// 最近 200 行日志，供 UI 即时显示。
     log: Vec<String>,
     /// 磁盘写入连续失败后停止重试，避免刷屏和无意义磁盘访问。
     log_file_disabled: bool,
+    bytes_done: u64,
+    bytes_total: u64,
+    current_file: String,
+    cancel: Option<Arc<AtomicBool>>,
+    last_export_dir: Option<PathBuf>,
 }
 
 /// RAII 写操作守卫：持有期间阻塞跑批启动与服务关闭，离开作用域（含 panic）自动释放。
@@ -66,11 +102,17 @@ impl JobState {
     fn with_optional_log_file(log_file: Option<(PathBuf, PathBuf)>) -> Self {
         JobState {
             inner: Mutex::new(JobInner {
+                kind: JobKind::Score,
                 status: JobStatus::Idle,
                 stopping: false,
                 active_mutations: 0,
                 log: Vec::new(),
                 log_file_disabled: false,
+                bytes_done: 0,
+                bytes_total: 0,
+                current_file: String::new(),
+                cancel: None,
+                last_export_dir: None,
             }),
             log_file,
         }
@@ -84,7 +126,7 @@ impl JobState {
         matches!(self.status(), JobStatus::Running { .. })
     }
 
-    /// 占用写操作槽位：仅在未跑批且未关闭时成功；防止与 `begin()` / `begin_shutdown()` 竞态。
+    /// 占用写操作槽位：仅在未跑批/未导出且未关闭时成功；防止与 `begin()` / `begin_shutdown()` 竞态。
     pub fn begin_mutation(self: &Arc<Self>) -> Option<MutationGuard> {
         let mut g = self.inner.lock().unwrap();
         if g.stopping || matches!(g.status, JobStatus::Running { .. }) {
@@ -96,19 +138,49 @@ impl JobState {
         })
     }
 
-    /// 尝试占坑：Idle/Done/Failed 且无进行中写操作时进入 Running 并清空日志；否则返回 false
+    /// 尝试占坑启动评分任务：Idle/Done/Failed 且无进行中写操作时进入 Running 并清空日志；否则返回 false
     pub fn begin(&self) -> bool {
+        self.begin_kind(JobKind::Score).is_some()
+    }
+
+    /// 尝试占坑启动导出任务，返回可用于安全取消的原子标志；与评分、写操作、关闭严格互斥。
+    pub fn begin_export(&self) -> Option<Arc<AtomicBool>> {
+        self.begin_kind(JobKind::Export)
+    }
+
+    fn begin_kind(&self, kind: JobKind) -> Option<Arc<AtomicBool>> {
         let mut g = self.inner.lock().unwrap();
         if g.stopping || g.active_mutations > 0 || matches!(g.status, JobStatus::Running { .. }) {
-            return false;
+            return None;
         }
+        let cancel = Arc::new(AtomicBool::new(false));
+        g.kind = kind;
         g.status = JobStatus::Running { done: 0, total: 0 };
         g.log.clear();
         g.log_file_disabled = false;
-        true
+        g.bytes_done = 0;
+        g.bytes_total = 0;
+        g.current_file.clear();
+        g.cancel = (kind == JobKind::Export).then(|| Arc::clone(&cancel));
+        if kind == JobKind::Export {
+            g.last_export_dir = None;
+        }
+        Some(cancel)
     }
 
-    /// 只有评分空闲且无进行中写操作时才能关闭服务；与 begin 共用锁，避免关闭与写/跑批竞态。
+    /// 请求取消当前进行中的导出任务；无运行中导出任务时返回 false。
+    pub fn request_cancel(&self) -> bool {
+        let g = self.inner.lock().unwrap();
+        if matches!(g.status, JobStatus::Running { .. }) {
+            if let Some(flag) = &g.cancel {
+                flag.store(true, Ordering::Release);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// 只有任务空闲且无进行中写操作时才能关闭服务；与 begin 共用锁，避免关闭与写/跑批/导出竞态。
     pub fn begin_shutdown(&self) -> bool {
         let mut g = self.inner.lock().unwrap();
         if g.stopping || g.active_mutations > 0 || matches!(g.status, JobStatus::Running { .. }) {
@@ -124,6 +196,32 @@ impl JobState {
             *d = done;
             *t = total;
         }
+    }
+
+    pub fn export_progress(
+        &self,
+        done: usize,
+        total: usize,
+        bytes_done: u64,
+        bytes_total: u64,
+        current_file: String,
+    ) {
+        let mut g = self.inner.lock().unwrap();
+        if let JobStatus::Running { done: d, total: t } = &mut g.status {
+            *d = done;
+            *t = total;
+            g.bytes_done = bytes_done;
+            g.bytes_total = bytes_total;
+            g.current_file = current_file;
+        }
+    }
+
+    pub fn set_last_export_dir(&self, dir: PathBuf) {
+        self.inner.lock().unwrap().last_export_dir = Some(dir);
+    }
+
+    pub fn last_export_dir(&self) -> Option<PathBuf> {
+        self.inner.lock().unwrap().last_export_dir.clone()
     }
 
     pub fn log(&self, line: impl Into<String>) {
@@ -151,18 +249,49 @@ impl JobState {
         }
     }
 
+    /// 启动校验失败（尚未真正启动后台线程）时把任务退回 Idle 并释放占位。
+    pub fn abort_start(&self) {
+        let mut g = self.inner.lock().unwrap();
+        g.status = JobStatus::Idle;
+        g.cancel = None;
+        g.current_file.clear();
+    }
+
     pub fn finish(&self, summary: String) {
-        self.inner.lock().unwrap().status = JobStatus::Done { summary };
+        let mut g = self.inner.lock().unwrap();
+        g.status = JobStatus::Done { summary };
+        g.cancel = None;
+        g.current_file.clear();
     }
 
     pub fn fail(&self, error: String) {
-        self.inner.lock().unwrap().status = JobStatus::Failed { error };
+        let mut g = self.inner.lock().unwrap();
+        g.status = JobStatus::Failed { error };
+        g.cancel = None;
+        g.current_file.clear();
     }
 
-    /// 快照（供 /api/job 序列化）
+    /// 快照（供旧测试使用）
     pub fn snapshot(&self) -> (JobStatus, Vec<String>) {
         let g = self.inner.lock().unwrap();
         (g.status.clone(), g.log.clone())
+    }
+
+    /// 完整快照（供 `/api/job` 序列化）
+    pub fn detail_snapshot(&self) -> JobSnapshot {
+        let g = self.inner.lock().unwrap();
+        JobSnapshot {
+            kind: g.kind,
+            status: g.status.clone(),
+            log: g.log.clone(),
+            bytes_done: g.bytes_done,
+            bytes_total: g.bytes_total,
+            current_file: g.current_file.clone(),
+            cancellable: matches!(g.status, JobStatus::Running { .. }) && g.cancel.is_some(),
+            can_open_export: g.kind == JobKind::Export
+                && !matches!(g.status, JobStatus::Running { .. })
+                && g.last_export_dir.is_some(),
+        }
     }
 }
 
