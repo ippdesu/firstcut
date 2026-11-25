@@ -21,7 +21,7 @@ use crate::cache::{self, ScoreCache};
 use crate::config::ScoreConfig;
 use crate::scan::{self, PhotoEntry, EXPORT_MARKER_NAME};
 use crate::score::{self, AnalysisResult, PixelScores};
-use crate::storage::{self, FileRef, Folder};
+use crate::storage::{self, ExportWriteOutcome, FileRef, Folder};
 
 /// 预留磁盘安全余量（64 MiB），低于此余量在预览阶段发出空间警告。
 const DISK_HEADROOM_BYTES: u64 = 64 * 1024 * 1024;
@@ -156,6 +156,9 @@ pub struct ManifestEntry {
     pub kind: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
+    /// 记录导出该目标文件的来源相册规范根路径，防止不同相册共用导出目录时同名互相覆盖。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_root: Option<String>,
     /// 记录导出该目标文件的源照片相对路径，防止不同批次把另一张同名照片误覆盖已有副本。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_rel: Option<String>,
@@ -218,6 +221,8 @@ pub struct ExportSummary {
     pub bytes_written: u64,
     pub cancelled: bool,
     pub errors: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflicts: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -259,6 +264,7 @@ enum PlannedSource {
         src_rel: String,
         src_size: u64,
         src_mtime: Option<SystemTime>,
+        src_mtime_nanos: i64,
     },
     WriteXmp {
         bytes: Vec<u8>,
@@ -279,6 +285,7 @@ struct PlannedFile {
 /// 完整的导出执行计划（由 `plan_export` 产出，可供预览并直接交给 `run_export` 执行）
 pub struct ExportPlan {
     root: PathBuf,
+    album_id: String,
     target: ResolvedTarget,
     files: Vec<PlannedFile>,
     pub preview: ExportPreview,
@@ -454,6 +461,7 @@ pub fn plan_export(
         }
     };
 
+    let album_id = canonical_album_id(root);
     let manifest = match &target_folder {
         Some(folder) => match read_manifest(folder) {
             Ok(m) => m,
@@ -492,6 +500,7 @@ pub fn plan_export(
                     let action = classify_photo_target(
                         target_folder.as_ref(),
                         &manifest,
+                        &album_id,
                         &dst_rel,
                         jpg_rel,
                         src_size,
@@ -505,6 +514,7 @@ pub fn plan_export(
                             src_rel: jpg_rel.clone(),
                             src_size,
                             src_mtime,
+                            src_mtime_nanos,
                         },
                         action,
                     });
@@ -521,6 +531,7 @@ pub fn plan_export(
                     let action = classify_photo_target(
                         target_folder.as_ref(),
                         &manifest,
+                        &album_id,
                         &dst_rel,
                         raw_rel,
                         src_size,
@@ -534,6 +545,7 @@ pub fn plan_export(
                             src_rel: raw_rel.clone(),
                             src_size,
                             src_mtime,
+                            src_mtime_nanos,
                         },
                         action,
                     });
@@ -568,6 +580,7 @@ pub fn plan_export(
                     let action = classify_xmp_target(
                         target_folder.as_ref(),
                         &manifest,
+                        &album_id,
                         &dst_rel,
                         &source_identity,
                         &sha256,
@@ -663,26 +676,49 @@ pub fn plan_export(
 
     Ok(ExportPlan {
         root: root.to_path_buf(),
+        album_id,
         target: resolved_target,
         files: planned,
         preview,
     })
 }
 
-/// 执行导出计划（支持原子取消、实时进度与非破坏清单维护）。
+/// 执行导出计划（支持原子取消、实时进度、写入前实时冲突复核与非破坏清单维护）。
 pub fn run_export(
     plan: &ExportPlan,
     cancel: &AtomicBool,
     on_event: &(dyn Fn(ExportEvent) + Sync),
 ) -> Result<ExportSummary> {
+    if plan.target.is_in_album() {
+        if let Ok(existing_dir) = plan.target.open_folder(&plan.root, false) {
+            if existing_dir
+                .contains_unmarked_photos(EXPORT_MARKER_NAME, scan::is_supported_file)
+                .with_context(|| format!("检查导出目录内容失败: {}", plan.target.display_path().display()))?
+            {
+                bail!(
+                    "导出目录「{}」内已包含原始照片，不能将其作为导出目录；请改用独立子目录（如 Selected）",
+                    plan.target.display_path().display()
+                );
+            }
+        }
+    }
+
     let target_folder = plan
         .target
         .open_folder(&plan.root, true)
         .with_context(|| format!("创建或打开导出目录失败: {}", plan.target.display_path().display()))?;
 
     let mut manifest = read_manifest(&target_folder).unwrap_or_default();
+    if !manifest.source_root.is_empty() {
+        let legacy_root = normalize_root_string(&manifest.source_root);
+        for entry in manifest.files.values_mut() {
+            if entry.source_root.is_none() {
+                entry.source_root = Some(legacy_root.clone());
+            }
+        }
+    }
     manifest.version = 1;
-    manifest.source_root = plan.root.display().to_string();
+    manifest.source_root = plan.album_id.clone();
     manifest.updated_at_unix_ms = now_unix_ms();
     // 在复制任何照片之前先落盘 `.firstcut-export`，即使中途取消/崩溃也不会被上级扫描反吃。
     save_manifest(&target_folder, &manifest)?;
@@ -706,10 +742,13 @@ pub fn run_export(
     let mut jpg_copied = 0usize;
     let mut raw_copied = 0usize;
     let mut xmp_written = 0usize;
+    let mut skipped_unchanged = plan.preview.skipped_unchanged;
+    let mut protected_existing = plan.preview.protected_existing;
     let mut bytes_written = 0u64;
     let mut done_files = 0usize;
     let mut cancelled = false;
     let mut errors = Vec::new();
+    let mut conflicts = Vec::new();
 
     for planned in to_write {
         if cancel.load(Ordering::Acquire) {
@@ -725,8 +764,63 @@ pub fn run_export(
             current_file: planned.dst_rel.clone(),
         });
 
-        let write_result: Result<(u64, Option<i64>, Option<String>)> = (|| {
+        let live_action = match (&planned.kind, &planned.source) {
+            (
+                ExportFileKind::Jpg | ExportFileKind::Raw,
+                PlannedSource::CopyPhoto {
+                    src_rel,
+                    src_size,
+                    src_mtime_nanos,
+                    ..
+                },
+            ) => classify_photo_target(
+                Some(&target_folder),
+                &manifest,
+                &plan.album_id,
+                &planned.dst_rel,
+                src_rel,
+                *src_size,
+                *src_mtime_nanos,
+            ),
+            (ExportFileKind::Xmp, PlannedSource::WriteXmp { sha256, .. }) => classify_xmp_target(
+                Some(&target_folder),
+                &manifest,
+                &plan.album_id,
+                &planned.dst_rel,
+                &planned.source_identity,
+                sha256,
+            ),
+            _ => Ok(FileAction::Write),
+        };
+
+        match live_action {
+            Ok(FileAction::SkipUnchanged) => {
+                done_files += 1;
+                skipped_unchanged += 1;
+                continue;
+            }
+            Ok(FileAction::ProtectExisting) => {
+                done_files += 1;
+                protected_existing += 1;
+                let msg = format!("{} 在规划后发生外部变更或来源冲突，已保留既有文件", planned.dst_rel);
+                on_event(ExportEvent::Info(format!("[conflict] {msg}")));
+                conflicts.push(msg);
+                continue;
+            }
+            Ok(FileAction::Write) => {}
+            Err(err) => {
+                let msg = format!("{} 写入前校验失败: {err:#}", planned.dst_rel);
+                on_event(ExportEvent::Info(format!("[export] {msg}")));
+                errors.push(msg);
+                continue;
+            }
+        }
+
+        let write_result: Result<Option<(u64, Option<i64>, Option<String>)>> = (|| {
             let dst_ref = open_target_file_ref(&target_folder, &planned.dst_rel, true)?;
+            let recorded = find_manifest_entry(&manifest, &planned.dst_rel).filter(|r| {
+                entry_matches_source(&manifest, r, &plan.album_id, &planned.source_identity)
+            });
             match &planned.source {
                 PlannedSource::CopyPhoto {
                     src_rel,
@@ -737,19 +831,40 @@ pub fn run_export(
                     let mut src_file = FileRef::inside(&plan.root, &src_full)?
                         .open_read()?
                         .ok_or_else(|| anyhow!("源文件不存在: {src_rel}"))?;
-                    let (written, actual_mtime) =
-                        dst_ref.copy_from_reader(&mut src_file, *src_mtime)?;
-                    Ok((written, actual_mtime, None))
+                    let expected_fp = recorded.map(|r| (r.size, r.mtime_nanos));
+                    match dst_ref.copy_from_reader_checked(&mut src_file, *src_mtime, |dst| {
+                        Ok(match dst.fingerprint()? {
+                            None => true,
+                            Some(fp) => expected_fp == Some(fp),
+                        })
+                    })? {
+                        ExportWriteOutcome::Written { bytes, mtime_nanos } => {
+                            Ok(Some((bytes, mtime_nanos, None)))
+                        }
+                        ExportWriteOutcome::Conflict => Ok(None),
+                    }
                 }
                 PlannedSource::WriteXmp { bytes, sha256, .. } => {
-                    let (written, actual_mtime) = dst_ref.write_exported_bytes(bytes)?;
-                    Ok((written, actual_mtime, Some(sha256.clone())))
+                    let expected_sha = recorded.and_then(|r| r.sha256.clone());
+                    match dst_ref.write_exported_bytes_checked(bytes, |dst| {
+                        Ok(match dst.read(MAX_XMP_BYTES)? {
+                            None => true,
+                            Some(existing) => {
+                                expected_sha.as_deref() == Some(sha256_hex(&existing).as_str())
+                            }
+                        })
+                    })? {
+                        ExportWriteOutcome::Written { bytes, mtime_nanos } => {
+                            Ok(Some((bytes, mtime_nanos, Some(sha256.clone()))))
+                        }
+                        ExportWriteOutcome::Conflict => Ok(None),
+                    }
                 }
             }
         })();
 
         match write_result {
-            Ok((written, actual_mtime, sha256)) => {
+            Ok(Some((written, actual_mtime, sha256))) => {
                 done_files += 1;
                 bytes_written = bytes_written.saturating_add(written);
                 match planned.kind {
@@ -757,13 +872,15 @@ pub fn run_export(
                     ExportFileKind::Raw => raw_copied += 1,
                     ExportFileKind::Xmp => xmp_written += 1,
                 }
-                manifest.files.insert(
+                insert_manifest_entry(
+                    &mut manifest,
                     planned.dst_rel.clone(),
                     ManifestEntry {
                         size: written,
                         mtime_nanos: actual_mtime.unwrap_or(0),
                         kind: planned.kind.as_str().to_string(),
                         sha256,
+                        source_root: Some(plan.album_id.clone()),
                         source_rel: Some(planned.source_identity.clone()),
                     },
                 );
@@ -771,6 +888,13 @@ pub fn run_export(
                     manifest.updated_at_unix_ms = now_unix_ms();
                     let _ = save_manifest(&target_folder, &manifest);
                 }
+            }
+            Ok(None) => {
+                done_files += 1;
+                protected_existing += 1;
+                let msg = format!("{} 在写入替换前检测到外部修改，已保留既有文件", planned.dst_rel);
+                on_event(ExportEvent::Info(format!("[conflict] {msg}")));
+                conflicts.push(msg);
             }
             Err(err) => {
                 let msg = format!("{} 写入失败: {err:#}", planned.dst_rel);
@@ -798,12 +922,13 @@ pub fn run_export(
         jpg_copied,
         raw_copied,
         xmp_written,
-        skipped_unchanged: plan.preview.skipped_unchanged,
-        protected_existing: plan.preview.protected_existing,
+        skipped_unchanged,
+        protected_existing,
         failed: errors.len(),
         bytes_written,
         cancelled,
         errors,
+        conflicts,
     })
 }
 
@@ -888,6 +1013,26 @@ fn validate_album_subdir(
     for part in &clean_parts {
         clean_rel.push(part);
     }
+
+    // 即使在关闭 RAW 关联时快照里没有 RAW 路径，也要检查磁盘实际内容，防止把 .firstcut-export 写入原片目录
+    match Folder::open_album_subdir(root, &clean_rel, false) {
+        Ok(existing_dir) => {
+            if existing_dir
+                .contains_unmarked_photos(EXPORT_MARKER_NAME, scan::is_supported_file)
+                .with_context(|| format!("检查导出目录内容失败: {}", clean_parts.join("/")))?
+            {
+                bail!(
+                    "导出目录「{}」内已包含原始照片，不能将其作为导出目录；请改用独立子目录（如 Selected）",
+                    clean_parts.join("/")
+                );
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(err).with_context(|| format!("导出目录不可用: {}", clean_parts.join("/")));
+        }
+    }
+
     let display = root.join(&clean_rel);
     Ok(ResolvedTarget::AlbumSubdir {
         rel: clean_rel,
@@ -1134,9 +1279,125 @@ fn open_target_file_ref(target_root: &Folder, dst_rel: &str, create_parent: bool
     }
 }
 
+fn canonical_album_id(root: &Path) -> String {
+    let resolved = std::fs::canonicalize(root)
+        .or_else(|_| std::path::absolute(root))
+        .unwrap_or_else(|_| root.to_path_buf());
+    normalize_root_string(&resolved.to_string_lossy())
+}
+
+fn normalize_root_string(raw: &str) -> String {
+    let mut s = raw.trim().to_string();
+    #[cfg(windows)]
+    {
+        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+            s = format!(r"\\{rest}");
+        } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+            s = rest.to_string();
+        }
+        s = s.replace('/', "\\");
+        while s.len() > 3 && s.ends_with('\\') {
+            s.pop();
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        while s.len() > 1 && s.ends_with('/') {
+            s.pop();
+        }
+    }
+    s
+}
+
+fn same_album_root(recorded: &str, current_id: &str) -> bool {
+    let rec_norm = if Path::new(recorded).exists() {
+        canonical_album_id(Path::new(recorded))
+    } else {
+        normalize_root_string(recorded)
+    };
+    #[cfg(windows)]
+    {
+        rec_norm.eq_ignore_ascii_case(current_id)
+    }
+    #[cfg(not(windows))]
+    {
+        rec_norm == current_id
+    }
+}
+
+fn same_rel_path(a: &str, b: &str) -> bool {
+    let a = a.replace('\\', "/");
+    let b = b.replace('\\', "/");
+    #[cfg(windows)]
+    {
+        a.eq_ignore_ascii_case(&b)
+    }
+    #[cfg(not(windows))]
+    {
+        a == b
+    }
+}
+
+fn find_manifest_entry<'a>(manifest: &'a ExportManifest, dst_rel: &str) -> Option<&'a ManifestEntry> {
+    if let Some(entry) = manifest.files.get(dst_rel) {
+        return Some(entry);
+    }
+    #[cfg(windows)]
+    {
+        manifest
+            .files
+            .iter()
+            .find(|(k, _)| same_rel_path(k, dst_rel))
+            .map(|(_, v)| v)
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+fn insert_manifest_entry(manifest: &mut ExportManifest, dst_rel: String, entry: ManifestEntry) {
+    #[cfg(windows)]
+    {
+        let existing_key = manifest
+            .files
+            .keys()
+            .find(|k| *k != &dst_rel && same_rel_path(k, &dst_rel))
+            .cloned();
+        if let Some(old_key) = existing_key {
+            manifest.files.remove(&old_key);
+        }
+    }
+    manifest.files.insert(dst_rel, entry);
+}
+
+fn entry_matches_source(
+    manifest: &ExportManifest,
+    recorded: &ManifestEntry,
+    album_id: &str,
+    source_rel: &str,
+) -> bool {
+    let recorded_root = recorded
+        .source_root
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .or_else(|| (!manifest.source_root.is_empty()).then_some(manifest.source_root.as_str()));
+    let Some(recorded_root) = recorded_root else {
+        return false;
+    };
+    if !same_album_root(recorded_root, album_id) {
+        return false;
+    }
+    recorded
+        .source_rel
+        .as_deref()
+        .is_some_and(|r| same_rel_path(r, source_rel))
+}
+
 fn classify_photo_target(
     target_folder: Option<&Folder>,
     manifest: &ExportManifest,
+    album_id: &str,
     dst_rel: &str,
     src_rel: &str,
     src_size: u64,
@@ -1153,12 +1414,10 @@ fn classify_photo_target(
     let Some((dst_size, dst_mtime)) = dst_ref.fingerprint()? else {
         return Ok(FileAction::Write);
     };
-    if let Some(recorded) = manifest.files.get(dst_rel) {
-        // 如果清单记录该目标路径来自另一张不同源照片，绝不静默覆盖
-        if let Some(recorded_src) = recorded.source_rel.as_deref() {
-            if !recorded_src.eq_ignore_ascii_case(src_rel) {
-                return Ok(FileAction::ProtectExisting);
-            }
+    if let Some(recorded) = find_manifest_entry(manifest, dst_rel) {
+        // 如果清单记录该目标路径来自另一相册或另一张不同源照片，绝不静默覆盖
+        if !entry_matches_source(manifest, recorded, album_id, src_rel) {
+            return Ok(FileAction::ProtectExisting);
         }
         if recorded.size == dst_size && recorded.mtime_nanos == dst_mtime {
             if dst_size == src_size && (dst_mtime - src_mtime_nanos).abs() <= 2_000_000_000 {
@@ -1178,6 +1437,7 @@ fn classify_photo_target(
 fn classify_xmp_target(
     target_folder: Option<&Folder>,
     manifest: &ExportManifest,
+    album_id: &str,
     dst_rel: &str,
     source_identity: &str,
     desired_sha256: &str,
@@ -1194,18 +1454,21 @@ fn classify_xmp_target(
         return Ok(FileAction::Write);
     };
     let existing_sha = sha256_hex(&existing_bytes);
-    if existing_sha == desired_sha256 {
-        return Ok(FileAction::SkipUnchanged);
-    }
-    // 仅当目标 XMP 来自同一源照片且内容哈希与上次 firstcut 写出记录一致（用户未在 PS/ACR 改过）时才更新
-    if let Some(recorded) = manifest.files.get(dst_rel) {
-        let same_source = recorded
-            .source_rel
-            .as_deref()
-            .is_none_or(|s| s.eq_ignore_ascii_case(source_identity));
-        if same_source && recorded.sha256.as_deref() == Some(existing_sha.as_str()) {
+    if let Some(recorded) = find_manifest_entry(manifest, dst_rel) {
+        if !entry_matches_source(manifest, recorded, album_id, source_identity) {
+            return Ok(FileAction::ProtectExisting);
+        }
+        if existing_sha == desired_sha256 {
+            return Ok(FileAction::SkipUnchanged);
+        }
+        // 仅当目标 XMP 内容哈希与上次 firstcut 写出记录一致（用户未在 PS/ACR 改过）时才更新
+        if recorded.sha256.as_deref() == Some(existing_sha.as_str()) {
             return Ok(FileAction::Write);
         }
+        return Ok(FileAction::ProtectExisting);
+    }
+    if existing_sha == desired_sha256 {
+        return Ok(FileAction::SkipUnchanged);
     }
     Ok(FileAction::ProtectExisting)
 }
@@ -1532,5 +1795,190 @@ mod tests {
         assert!(std::fs::read_to_string(root.join("Selected/DSC00001.xmp"))
             .unwrap()
             .contains("<xmp:Rating>5</xmp:Rating>"));
+    }
+
+    #[test]
+    fn different_albums_sharing_export_dir_do_not_overwrite_same_filename() {
+        let temp = tempfile::tempdir().unwrap();
+        let album_a = temp.path().join("album_a");
+        let album_b = temp.path().join("album_b");
+        let shared = temp.path().join("SharedExport");
+        std::fs::create_dir_all(album_a.join("JPG")).unwrap();
+        std::fs::create_dir_all(album_b.join("JPG")).unwrap();
+        std::fs::write(album_a.join("JPG/DSC0001.JPG"), b"album-a-jpg").unwrap();
+        std::fs::write(album_b.join("JPG/DSC0001.JPG"), b"album-b-different-jpg").unwrap();
+        std::fs::write(album_b.join("JPG/DSC0002.JPG"), b"album-b-unique-jpg").unwrap();
+
+        let opts = ExportOptions {
+            target: ExportTarget::ExternalDir(shared.clone()),
+            layout: ExportLayout::SplitByType,
+            include_jpg: true,
+            include_raw: false,
+            include_xmp: true,
+            xmp_exposure: false,
+        };
+
+        // 1) 相册 A 导出 JPG/DSC0001.JPG
+        let items_a = vec![ExportPhotoItem {
+            pair_id: "a1".into(),
+            jpg_rel: Some("JPG/DSC0001.JPG".into()),
+            raw_rel: None,
+            xmp_meta: Some(sample_meta(&album_a, "JPG/DSC0001.JPG", 5)),
+        }];
+        let plan_a = plan_export(&album_a, &items_a, &["JPG/DSC0001.JPG".into()], &opts).unwrap();
+        run_export(&plan_a, &AtomicBool::new(false), &|_| {}).unwrap();
+
+        // 模拟旧版清单缺少逐条 source_root 的情形，验证回填迁移也能守住来源
+        let manifest_path = shared.join(EXPORT_MARKER_NAME);
+        let mut legacy_manifest: ExportManifest =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        for entry in legacy_manifest.files.values_mut() {
+            entry.source_root = None;
+        }
+        std::fs::write(&manifest_path, serde_json::to_vec_pretty(&legacy_manifest).unwrap()).unwrap();
+
+        // 2) 相册 B 导出同名 JPG/DSC0001.JPG 与无冲突 JPG/DSC0002.JPG
+        let items_b = vec![
+            ExportPhotoItem {
+                pair_id: "b1".into(),
+                jpg_rel: Some("JPG/DSC0001.JPG".into()),
+                raw_rel: None,
+                xmp_meta: Some(sample_meta(&album_b, "JPG/DSC0001.JPG", 3)),
+            },
+            ExportPhotoItem {
+                pair_id: "b2".into(),
+                jpg_rel: Some("JPG/DSC0002.JPG".into()),
+                raw_rel: None,
+                xmp_meta: Some(sample_meta(&album_b, "JPG/DSC0002.JPG", 4)),
+            },
+        ];
+        let plan_b = plan_export(
+            &album_b,
+            &items_b,
+            &["JPG/DSC0001.JPG".into(), "JPG/DSC0002.JPG".into()],
+            &opts,
+        )
+        .unwrap();
+        assert_eq!(plan_b.preview.jpg_to_copy, 1, "仅无冲突的 DSC0002.JPG 可导出");
+        assert_eq!(plan_b.preview.xmp_to_write, 1, "仅无冲突的 DSC0002.xmp 可导出");
+        assert_eq!(plan_b.preview.protected_existing, 2, "相册 A 的同名 JPG 与 XMP 必须受保护");
+        let summary_b = run_export(&plan_b, &AtomicBool::new(false), &|_| {}).unwrap();
+        assert_eq!(summary_b.jpg_copied, 1);
+        assert_eq!(summary_b.xmp_written, 1);
+        assert_eq!(summary_b.protected_existing, 2);
+        assert_eq!(std::fs::read(shared.join("JPG/DSC0001.JPG")).unwrap(), b"album-a-jpg");
+        assert!(std::fs::read_to_string(shared.join("JPG/DSC0001.xmp"))
+            .unwrap()
+            .contains("<xmp:Rating>5</xmp:Rating>"));
+        assert_eq!(std::fs::read(shared.join("JPG/DSC0002.JPG")).unwrap(), b"album-b-unique-jpg");
+
+        // 3) 之后相册 A 自己改星再导出时，仍能正常更新自己的 DSC0001.xmp
+        let items_a2 = vec![ExportPhotoItem {
+            pair_id: "a1".into(),
+            jpg_rel: Some("JPG/DSC0001.JPG".into()),
+            raw_rel: None,
+            xmp_meta: Some(sample_meta(&album_a, "JPG/DSC0001.JPG", 4)),
+        }];
+        let plan_a2 = plan_export(&album_a, &items_a2, &["JPG/DSC0001.JPG".into()], &opts).unwrap();
+        assert_eq!(plan_a2.preview.xmp_to_write, 1);
+        assert_eq!(plan_a2.preview.protected_existing, 0);
+        let summary_a2 = run_export(&plan_a2, &AtomicBool::new(false), &|_| {}).unwrap();
+        assert_eq!(summary_a2.xmp_written, 1);
+        assert!(std::fs::read_to_string(shared.join("JPG/DSC0001.xmp"))
+            .unwrap()
+            .contains("<xmp:Rating>4</xmp:Rating>"));
+    }
+
+    #[test]
+    fn run_export_rechecks_target_and_preserves_xmp_edited_after_planning() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("album");
+        std::fs::create_dir_all(root.join("JPG")).unwrap();
+        std::fs::create_dir_all(root.join("RAW")).unwrap();
+        std::fs::write(root.join("JPG/DSC00001.JPG"), b"jpg-bytes").unwrap();
+        std::fs::write(root.join("RAW/DSC00001.ARW"), b"raw-bytes").unwrap();
+
+        let all_sources = vec!["JPG/DSC00001.JPG".into(), "RAW/DSC00001.ARW".into()];
+        let items_5 = vec![ExportPhotoItem {
+            pair_id: "p1".into(),
+            jpg_rel: Some("JPG/DSC00001.JPG".into()),
+            raw_rel: Some("RAW/DSC00001.ARW".into()),
+            xmp_meta: Some(sample_meta(&root, "JPG/DSC00001.JPG", 5)),
+        }];
+        let opts = ExportOptions::default();
+        let plan1 = plan_export(&root, &items_5, &all_sources, &opts).unwrap();
+        run_export(&plan1, &AtomicBool::new(false), &|_| {}).unwrap();
+
+        // 改星为 3★ 并生成计划：此时目标目录尚未被外部修改，计划拟更新两侧 XMP
+        let items_3 = vec![ExportPhotoItem {
+            pair_id: "p1".into(),
+            jpg_rel: Some("JPG/DSC00001.JPG".into()),
+            raw_rel: Some("RAW/DSC00001.ARW".into()),
+            xmp_meta: Some(sample_meta(&root, "JPG/DSC00001.JPG", 3)),
+        }];
+        let plan2 = plan_export(&root, &items_3, &all_sources, &opts).unwrap();
+        assert_eq!(plan2.preview.xmp_to_write, 2);
+        assert_eq!(plan2.preview.protected_existing, 0);
+
+        // 在 plan_export 之后、run_export 之前，模拟用户在 ACR/PS 中编辑并保存了 RAW/DSC00001.xmp
+        let raw_xmp_path = root.join("Selected/RAW/DSC00001.xmp");
+        let old_raw_xmp = std::fs::read_to_string(&raw_xmp_path).unwrap();
+        let edited_xmp = old_raw_xmp.replace(
+            "xmlns:firstcut=\"http://firstcut.local/ns/\">",
+            "xmlns:firstcut=\"http://firstcut.local/ns/\" xmlns:crs=\"http://ns.adobe.com/camera-raw-settings/1.0/\" crs:Exposure2012=\"+1.25\">",
+        );
+        std::fs::write(&raw_xmp_path, &edited_xmp).unwrap();
+
+        let summary2 = run_export(&plan2, &AtomicBool::new(false), &|_| {}).unwrap();
+        assert_eq!(summary2.xmp_written, 1, "仅未冲突的 JPG/DSC00001.xmp 应被更新");
+        assert_eq!(summary2.protected_existing, 1);
+        assert_eq!(summary2.conflicts.len(), 1);
+        assert!(summary2.conflicts[0].contains("RAW/DSC00001.xmp"));
+        assert!(std::fs::read_to_string(&raw_xmp_path)
+            .unwrap()
+            .contains("crs:Exposure2012=\"+1.25\""));
+        assert!(std::fs::read_to_string(root.join("Selected/JPG/DSC00001.xmp"))
+            .unwrap()
+            .contains("<xmp:Rating>3</xmp:Rating>"));
+    }
+
+    #[test]
+    fn target_validation_rejects_raw_dir_even_when_raw_association_disabled() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("album");
+        std::fs::create_dir_all(root.join("JPG")).unwrap();
+        std::fs::create_dir_all(root.join("RAW")).unwrap();
+        std::fs::write(root.join("JPG/DSC0001.JPG"), b"jpg").unwrap();
+        std::fs::write(root.join("RAW/DSC0001.ARW"), b"raw").unwrap();
+
+        // 模拟关闭 RAW 关联：快照和 all_sources 里只有 JPG，没有 RAW/DSC0001.ARW
+        let jpg_only_sources = vec!["JPG/DSC0001.JPG".into()];
+        let items = vec![ExportPhotoItem {
+            pair_id: "p1".into(),
+            jpg_rel: Some("JPG/DSC0001.JPG".into()),
+            raw_rel: None,
+            xmp_meta: None,
+        }];
+        let subdir_opts = ExportOptions {
+            target: ExportTarget::AlbumSubdir(PathBuf::from("RAW")),
+            include_raw: false,
+            include_xmp: false,
+            ..Default::default()
+        };
+        assert!(plan_export(&root, &items, &jpg_only_sources, &subdir_opts).is_err());
+
+        let ext_raw_opts = ExportOptions {
+            target: ExportTarget::ExternalDir(root.join("RAW")),
+            include_raw: false,
+            include_xmp: false,
+            ..Default::default()
+        };
+        assert!(plan_export(&root, &items, &jpg_only_sources, &ext_raw_opts).is_err());
+        assert!(!root.join("RAW").join(EXPORT_MARKER_NAME).exists());
+
+        // 重新开启 RAW 关联并扫描全目录时，RAW 原片必须仍然可见
+        let full_scan = scan::scan_directory(&root).unwrap();
+        assert_eq!(full_scan.len(), 2);
+        assert!(full_scan.iter().any(|e| e.is_raw));
     }
 }

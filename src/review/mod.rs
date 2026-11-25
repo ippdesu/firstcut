@@ -1281,8 +1281,13 @@ async fn export_run(
                 job.set_last_export_dir(summary.target_path.clone());
                 let mb = summary.bytes_written as f64 / (1024.0 * 1024.0);
                 let prefix = if summary.cancelled { "已取消" } else { "导出完成" };
+                let conflict_note = if summary.conflicts.is_empty() {
+                    String::new()
+                } else {
+                    format!("，写入前冲突 {}", summary.conflicts.len())
+                };
                 let text = format!(
-                    "{prefix}：JPG {} / RAW {} / XMP {}（{:.1} MB，跳过未变 {}，保留既有 {}，失败 {}）→ {}",
+                    "{prefix}：JPG {} / RAW {} / XMP {}（{:.1} MB，跳过未变 {}，保留既有 {}，失败 {}{conflict_note}）→ {}",
                     summary.jpg_copied,
                     summary.raw_copied,
                     summary.xmp_written,
@@ -2311,5 +2316,86 @@ mod tests {
         assert!(dir.join("Selected/RAW/keep.ARW").is_file());
         assert!(!dir.join("Selected/JPG/drop.jpg").exists());
         assert!(dir.join("Selected").join(crate::scan::EXPORT_MARKER_NAME).is_file());
+    }
+
+    #[tokio::test]
+    async fn export_preview_rejects_raw_dir_when_raw_association_disabled() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("album");
+        std::fs::create_dir_all(dir.join("JPG")).unwrap();
+        std::fs::create_dir_all(dir.join("RAW")).unwrap();
+        std::fs::write(dir.join("JPG/only.jpg"), b"jpg").unwrap();
+        std::fs::write(dir.join("RAW/only.ARW"), b"raw").unwrap();
+
+        let state = Arc::new(AppState {
+            root: dir.clone(),
+            cache_path: dir.join(".firstcut/cache.sqlite"),
+            config_path: dir.join(".firstcut/config.toml"),
+            config_explicit: false,
+            scene_feedback: RwLock::new(HashMap::new()),
+            scene_feedback_path: scene_feedback::store_path(&dir),
+            image_slots: Arc::new(Semaphore::new(2)),
+            thumb_slots: Arc::new(Semaphore::new(1)),
+            snapshot: RwLock::new(Snapshot {
+                root: dir.display().to_string(),
+                weights: snapshot::WeightsJson {
+                    sharpness: 0.3,
+                    exposure: 0.25,
+                    noise: 0.15,
+                    composition: 0.15,
+                    aesthetic: 0.15,
+                },
+                photos: vec![snapshot::PhotoJson {
+                    path: "JPG/only.jpg".into(),
+                    filename: "only.jpg".into(),
+                    ext: "jpg".into(),
+                    is_raw: false,
+                    has_pair: false,
+                    pair_id: "only".into(),
+                    datetime: String::new(),
+                    iso: String::new(),
+                    f_number: String::new(),
+                    shutter: String::new(),
+                    focal: String::new(),
+                    scores: None,
+                    stars: Some(5),
+                    rating_source: Some("manual".into()),
+                    analysis_mode: None,
+                    faces: 0,
+                    burst: None,
+                    scene_hint: snapshot::SceneHintJson {
+                        id: "unknown",
+                        label: "未识别",
+                        reason: String::new(),
+                    },
+                    scene_feedback: None,
+                }],
+            }),
+            job: Arc::new(JobState::new()),
+            write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            loading: AtomicBool::new(false),
+            load_error: Mutex::new(None),
+            load_progress: Mutex::new(LoadProgress {
+                phase: String::new(),
+                done: 0,
+                total: 0,
+            }),
+            include_raw: false,
+            local_desktop: false,
+            approved_export_dirs: Mutex::new(Vec::new()),
+            control: None,
+        });
+
+        let req: ExportRequest = serde_json::from_value(serde_json::json!({
+            "subdir": "RAW",
+            "include_jpg": true,
+            "include_raw": false,
+            "include_xmp": false,
+            "filter": {}
+        }))
+        .unwrap();
+        let resp = export_preview(State(state), axum::Json(req)).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(!dir.join("RAW").join(crate::scan::EXPORT_MARKER_NAME).exists());
     }
 }

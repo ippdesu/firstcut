@@ -321,8 +321,16 @@ fn main() -> Result<()> {
                     }
                 }
             })?;
+            for conflict in &summary.conflicts {
+                eprintln!("[export] 冲突（已保留既有文件）: {conflict}");
+            }
+            let conflict_note = if summary.conflicts.is_empty() {
+                String::new()
+            } else {
+                format!("，写入前冲突 {}", summary.conflicts.len())
+            };
             eprintln!(
-                "[export] 完成: 复制 JPG {} / RAW {} / XMP {}（共 {:.1} MB，跳过 {}，保留既有 {}，失败 {}）→ {}",
+                "[export] 完成: 复制 JPG {} / RAW {} / XMP {}（共 {:.1} MB，跳过 {}，保留既有 {}，失败 {}{conflict_note}）→ {}",
                 summary.jpg_copied,
                 summary.raw_copied,
                 summary.xmp_written,

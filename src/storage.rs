@@ -149,6 +149,66 @@ impl Folder {
     pub fn unlink(&self, name: impl AsRef<Path>) -> io::Result<()> {
         self.0.remove_file(one_name(name.as_ref())?)
     }
+
+    /// 检查目录下是否包含未被 `marker_name` 标记的原始照片文件（无链接逐级遍历）。
+    pub fn contains_unmarked_photos(
+        &self,
+        marker_name: &str,
+        is_photo_name: impl Fn(&str) -> bool,
+    ) -> io::Result<bool> {
+        if self.file(marker_name)?.open_read()?.is_some() {
+            return Ok(false);
+        }
+        const MAX_DEPTH: usize = 64;
+        let mut stack = vec![(self.try_clone()?, 0usize)];
+        while let Some((dir, depth)) = stack.pop() {
+            for entry in dir.0.entries()? {
+                let entry = entry?;
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                if name_str.eq_ignore_ascii_case(STATE_DIR) {
+                    continue;
+                }
+                let meta = match dir.0.symlink_metadata(&name) {
+                    Ok(m) => m,
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+                    Err(err) => return Err(err),
+                };
+                if is_reparse(&meta) {
+                    continue;
+                }
+                if meta.is_file() {
+                    if is_photo_name(&name_str) {
+                        return Ok(true);
+                    }
+                } else if meta.is_dir() && depth < MAX_DEPTH {
+                    let child = match dir.child(&name, false) {
+                        Ok(c) => c,
+                        Err(err)
+                            if matches!(
+                                err.kind(),
+                                io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+                            ) =>
+                        {
+                            continue;
+                        }
+                        Err(err) => return Err(err),
+                    };
+                    if child
+                        .file(marker_name)
+                        .and_then(|f| f.open_read())
+                        .ok()
+                        .flatten()
+                        .is_some()
+                    {
+                        continue;
+                    }
+                    stack.push((child, depth + 1));
+                }
+            }
+        }
+        Ok(false)
+    }
 }
 
 fn check_directory(metadata: cap_std::fs::Metadata) -> io::Result<()> {
@@ -170,6 +230,16 @@ fn is_reparse(metadata: &cap_std::fs::Metadata) -> bool {
 #[cfg(not(windows))]
 fn is_reparse(metadata: &cap_std::fs::Metadata) -> bool {
     metadata.is_symlink()
+}
+
+/// 导出写入结果：成功写入或因目标在规划后发生变化而保护既有文件。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportWriteOutcome {
+    Written {
+        bytes: u64,
+        mtime_nanos: Option<i64>,
+    },
+    Conflict,
 }
 
 pub struct FileRef {
@@ -288,13 +358,14 @@ impl FileRef {
         self.replace(|file| file.write_all(data))
     }
 
-    /// 导出场景专用：按流式分块将已安全打开的源文件复制到临时文件，保留修改时间并原子替换。
-    /// 返回写入字节数与目标文件落盘后的 `(size, mtime_nanos)`。
-    pub fn copy_from_reader(
+    /// 导出场景专用：按流式分块将已安全打开的源文件复制到临时文件，保留修改时间；
+    /// 在原子重命名覆盖目标前执行 `check_before_rename`，若返回 `false` 则删除临时文件并返回 `Conflict`。
+    pub fn copy_from_reader_checked(
         &self,
         src: &mut File,
         preserve_mtime: Option<std::time::SystemTime>,
-    ) -> io::Result<(u64, Option<i64>)> {
+        check_before_rename: impl FnOnce(&Self) -> io::Result<bool>,
+    ) -> io::Result<ExportWriteOutcome> {
         self.open_read()?; // 拒绝已存在的硬链接/重解析点
         let mut entropy = [0u8; 16];
         getrandom::fill(&mut entropy).map_err(|err| io::Error::other(err.to_string()))?;
@@ -332,8 +403,15 @@ impl FileRef {
                 .and_then(|m| crate::cache::metadata_fingerprint(&m))
                 .map(|(_, mt)| mt);
             drop(file);
+            if !check_before_rename(self)? {
+                let _ = self.parent.unlink(&temp);
+                return Ok(ExportWriteOutcome::Conflict);
+            }
             self.parent.0.rename(&temp, &self.parent.0, &self.name)?;
-            Ok((total, actual_mtime))
+            Ok(ExportWriteOutcome::Written {
+                bytes: total,
+                mtime_nanos: actual_mtime,
+            })
         })();
         if result.is_err() {
             let _ = self.parent.unlink(&temp);
@@ -341,8 +419,13 @@ impl FileRef {
         result
     }
 
-    /// 导出场景专用：写出完整字节内容（如 XMP 侧车）并返回落盘后的 `(size, mtime_nanos)`。
-    pub fn write_exported_bytes(&self, data: &[u8]) -> io::Result<(u64, Option<i64>)> {
+    /// 导出场景专用：写出完整字节内容（如 XMP 侧车）；
+    /// 在原子重命名覆盖目标前执行 `check_before_rename`，若返回 `false` 则删除临时文件并返回 `Conflict`。
+    pub fn write_exported_bytes_checked(
+        &self,
+        data: &[u8],
+        check_before_rename: impl FnOnce(&Self) -> io::Result<bool>,
+    ) -> io::Result<ExportWriteOutcome> {
         self.open_read()?;
         let mut entropy = [0u8; 16];
         getrandom::fill(&mut entropy).map_err(|err| io::Error::other(err.to_string()))?;
@@ -367,8 +450,15 @@ impl FileRef {
                 .and_then(|m| crate::cache::metadata_fingerprint(&m))
                 .map(|(_, mt)| mt);
             drop(file);
+            if !check_before_rename(self)? {
+                let _ = self.parent.unlink(&temp);
+                return Ok(ExportWriteOutcome::Conflict);
+            }
             self.parent.0.rename(&temp, &self.parent.0, &self.name)?;
-            Ok((data.len() as u64, actual_mtime))
+            Ok(ExportWriteOutcome::Written {
+                bytes: data.len() as u64,
+                mtime_nanos: actual_mtime,
+            })
         })();
         if result.is_err() {
             let _ = self.parent.unlink(&temp);
