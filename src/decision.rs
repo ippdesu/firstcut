@@ -53,10 +53,12 @@ pub struct EffectiveBurst {
 }
 
 fn relative_key(root: &Path, photo: &Path) -> Result<String> {
-    let relative = photo
-        .strip_prefix(root)
-        .with_context(|| format!("照片不在根目录内: {}", photo.display()))?
-        .to_string_lossy();
+    let rel_buf = match photo.strip_prefix(root) {
+        Ok(rel) => rel.to_path_buf(),
+        Err(_) => crate::storage::relative_under_album(root, photo)?
+            .with_context(|| format!("照片不在根目录内: {}", photo.display()))?,
+    };
+    let relative = rel_buf.to_string_lossy();
     #[cfg(windows)]
     let relative = relative.replace('\\', "/");
     #[cfg(not(windows))]
