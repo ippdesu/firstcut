@@ -91,6 +91,41 @@ pub enum GroupFilter {
     Group(usize),
 }
 
+/// 人工三态选片标记筛选
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FlagFilter {
+    #[default]
+    All,
+    PickedOnly,
+    ExcludeRejected,
+    RejectedOnly,
+    UnflaggedOnly,
+}
+
+impl FlagFilter {
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "all" | "" => Some(Self::All),
+            "pick" | "picked" => Some(Self::PickedOnly),
+            "exclude_reject" | "not_rejected" | "active" => Some(Self::ExcludeRejected),
+            "reject" | "rejected" => Some(Self::RejectedOnly),
+            "unflagged" | "none" => Some(Self::UnflaggedOnly),
+            _ => None,
+        }
+    }
+
+    pub fn matches(self, flag: crate::decision::CurationFlag) -> bool {
+        use crate::decision::CurationFlag;
+        match self {
+            Self::All => true,
+            Self::PickedOnly => flag == CurationFlag::Pick,
+            Self::ExcludeRejected => flag != CurationFlag::Reject,
+            Self::RejectedOnly => flag == CurationFlag::Reject,
+            Self::UnflaggedOnly => flag == CurationFlag::Unflagged,
+        }
+    }
+}
+
 /// CLI `export` 使用的筛选条件（与 Web UI 语义对齐）
 #[derive(Debug, Clone, Default)]
 pub struct ExportFilter {
@@ -100,6 +135,7 @@ pub struct ExportFilter {
     pub keep_only: bool,
     pub group_filter: GroupFilter,
     pub faces_only: bool,
+    pub flag_filter: FlagFilter,
 }
 
 /// 用于导出目录内新生成 XMP 的照片元数据
@@ -121,6 +157,8 @@ pub struct ExportPhotoItem {
     /// 相对照片根目录的配对 RAW 路径（正斜杠）
     pub raw_rel: Option<String>,
     pub xmp_meta: Option<ExportXmpMeta>,
+    /// 未评分但已有人工打星时的星级（用于在导出目录生成/合并仅含 `xmp:Rating` 的 XMP）
+    pub manual_rating: Option<u8>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -407,7 +445,12 @@ pub fn collect_items_for_cli_in_workspace(
         let pair_id = e.pair_id();
         let stars = selection.ratings.get(pair_id).map(|r| r.stars);
         let burst = selection.bursts.get(pair_id);
+        let flag = selection.flags.get(pair_id).copied().unwrap_or_default();
         let analysis = analyzed.get(pair_id);
+
+        if !filter.flag_filter.matches(flag) {
+            continue;
+        }
 
         if let Some(min_s) = filter.min_stars {
             if !stars.is_some_and(|s| s >= min_s) {
@@ -472,6 +515,7 @@ pub fn collect_items_for_cli_in_workspace(
             jpg_rel: Some(jpg_rel),
             raw_rel,
             xmp_meta,
+            manual_rating: if analysis.is_none() { stars } else { None },
         });
     }
 
@@ -1493,23 +1537,33 @@ fn resolve_xmp_bytes(
                         return Ok(Some((merged.into_bytes(), false)));
                     }
                 }
+            } else if let Some(rating) = item.manual_rating {
+                if let Ok(content) = std::str::from_utf8(&bytes) {
+                    if let Ok(merged) = crate::output::xmp::merge_xmp_rating_only_for_export(content, rating) {
+                        return Ok(Some((merged.into_bytes(), false)));
+                    }
+                }
             }
             return Ok(Some((bytes, false)));
         }
     }
 
-    let Some(meta) = &item.xmp_meta else {
-        return Ok(None);
-    };
-    let xml = crate::output::xmp::render_xmp_with_crs(
-        &meta.entry,
-        &meta.scores,
-        meta.total,
-        meta.rating,
-        meta.suggested_ev,
-        write_crs,
-    );
-    Ok(Some((xml.into_bytes(), true)))
+    if let Some(meta) = &item.xmp_meta {
+        let xml = crate::output::xmp::render_xmp_with_crs(
+            &meta.entry,
+            &meta.scores,
+            meta.total,
+            meta.rating,
+            meta.suggested_ev,
+            write_crs,
+        );
+        return Ok(Some((xml.into_bytes(), true)));
+    }
+    if let Some(rating) = item.manual_rating {
+        let xml = crate::output::xmp::render_rating_only_xmp(rating);
+        return Ok(Some((xml.into_bytes(), true)));
+    }
+    Ok(None)
 }
 
 fn read_source_meta(
@@ -2042,13 +2096,15 @@ mod tests {
                 pair_id: "p1".into(),
                 jpg_rel: Some("JPG/DSC00001.JPG".into()),
                 raw_rel: Some("RAW/DSC00001.ARW".into()),
-                xmp_meta: Some(sample_meta(&root, "JPG/DSC00001.JPG", 5)),
+                manual_rating: None,
+            xmp_meta: Some(sample_meta(&root, "JPG/DSC00001.JPG", 5)),
             },
             ExportPhotoItem {
                 pair_id: "p2".into(),
                 jpg_rel: Some("JPG/DSC00002.JPG".into()),
                 raw_rel: None,
-                xmp_meta: Some(sample_meta(&root, "JPG/DSC00002.JPG", 4)),
+                manual_rating: None,
+            xmp_meta: Some(sample_meta(&root, "JPG/DSC00002.JPG", 4)),
             },
         ];
 
@@ -2132,13 +2188,15 @@ mod tests {
                 pair_id: "p1".into(),
                 jpg_rel: Some("Day1/DSC00001.JPG".into()),
                 raw_rel: Some("Day1/DSC00001.ARW".into()),
-                xmp_meta: Some(sample_meta(&root, "Day1/DSC00001.JPG", 5)),
+                manual_rating: None,
+            xmp_meta: Some(sample_meta(&root, "Day1/DSC00001.JPG", 5)),
             },
             ExportPhotoItem {
                 pair_id: "p2".into(),
                 jpg_rel: Some("Day2/DSC00001.JPG".into()),
                 raw_rel: Some("Day2/DSC00001.ARW".into()),
-                xmp_meta: Some(sample_meta(&root, "Day2/DSC00001.JPG", 4)),
+                manual_rating: None,
+            xmp_meta: Some(sample_meta(&root, "Day2/DSC00001.JPG", 4)),
             },
         ];
 
@@ -2193,12 +2251,14 @@ mod tests {
                 jpg_rel: Some("a.jpg".into()),
                 raw_rel: None,
                 xmp_meta: None,
+            manual_rating: None,
             },
             ExportPhotoItem {
                 pair_id: "b".into(),
                 jpg_rel: Some("b.jpg".into()),
                 raw_rel: None,
                 xmp_meta: None,
+            manual_rating: None,
             },
         ];
         let opts = ExportOptions {
@@ -2248,6 +2308,7 @@ mod tests {
             pair_id: "d1".into(),
             jpg_rel: Some("Day1/DSC00001.JPG".into()),
             raw_rel: None,
+            manual_rating: None,
             xmp_meta: Some(sample_meta(&root, "Day1/DSC00001.JPG", 5)),
         }];
         let plan1 = plan_export(&root, &item1, &sources, &opts).unwrap();
@@ -2258,6 +2319,7 @@ mod tests {
             pair_id: "d2".into(),
             jpg_rel: Some("Day2/DSC00001.JPG".into()),
             raw_rel: None,
+            manual_rating: None,
             xmp_meta: Some(sample_meta(&root, "Day2/DSC00001.JPG", 3)),
         }];
         let plan2 = plan_export(&root, &item2, &sources, &opts).unwrap();
@@ -2297,6 +2359,7 @@ mod tests {
             pair_id: "a1".into(),
             jpg_rel: Some("JPG/DSC0001.JPG".into()),
             raw_rel: None,
+            manual_rating: None,
             xmp_meta: Some(sample_meta(&album_a, "JPG/DSC0001.JPG", 5)),
         }];
         let plan_a = plan_export(&album_a, &items_a, &["JPG/DSC0001.JPG".into()], &opts).unwrap();
@@ -2317,13 +2380,15 @@ mod tests {
                 pair_id: "b1".into(),
                 jpg_rel: Some("JPG/DSC0001.JPG".into()),
                 raw_rel: None,
-                xmp_meta: Some(sample_meta(&album_b, "JPG/DSC0001.JPG", 3)),
+                manual_rating: None,
+            xmp_meta: Some(sample_meta(&album_b, "JPG/DSC0001.JPG", 3)),
             },
             ExportPhotoItem {
                 pair_id: "b2".into(),
                 jpg_rel: Some("JPG/DSC0002.JPG".into()),
                 raw_rel: None,
-                xmp_meta: Some(sample_meta(&album_b, "JPG/DSC0002.JPG", 4)),
+                manual_rating: None,
+            xmp_meta: Some(sample_meta(&album_b, "JPG/DSC0002.JPG", 4)),
             },
         ];
         let plan_b = plan_export(
@@ -2352,6 +2417,7 @@ mod tests {
             pair_id: "a1".into(),
             jpg_rel: Some("JPG/DSC0001.JPG".into()),
             raw_rel: None,
+            manual_rating: None,
             xmp_meta: Some(sample_meta(&album_a, "JPG/DSC0001.JPG", 4)),
         }];
         let plan_a2 = plan_export(&album_a, &items_a2, &["JPG/DSC0001.JPG".into()], &opts).unwrap();
@@ -2378,6 +2444,7 @@ mod tests {
             pair_id: "p1".into(),
             jpg_rel: Some("JPG/DSC00001.JPG".into()),
             raw_rel: Some("RAW/DSC00001.ARW".into()),
+            manual_rating: None,
             xmp_meta: Some(sample_meta(&root, "JPG/DSC00001.JPG", 5)),
         }];
         let opts = ExportOptions::default();
@@ -2389,6 +2456,7 @@ mod tests {
             pair_id: "p1".into(),
             jpg_rel: Some("JPG/DSC00001.JPG".into()),
             raw_rel: Some("RAW/DSC00001.ARW".into()),
+            manual_rating: None,
             xmp_meta: Some(sample_meta(&root, "JPG/DSC00001.JPG", 3)),
         }];
         let plan2 = plan_export(&root, &items_3, &all_sources, &opts).unwrap();
@@ -2433,6 +2501,7 @@ mod tests {
             jpg_rel: Some("JPG/DSC0001.JPG".into()),
             raw_rel: None,
             xmp_meta: None,
+            manual_rating: None,
         }];
         let subdir_opts = ExportOptions {
             target: ExportTarget::AlbumSubdir(PathBuf::from("RAW")),
@@ -2476,6 +2545,7 @@ mod tests {
             pair_id: "a1".into(),
             jpg_rel: Some("JPG/DSC0001.JPG".into()),
             raw_rel: None,
+            manual_rating: None,
             xmp_meta: Some(sample_meta(&album_a, "JPG/DSC0001.JPG", 5)),
         }];
         let opts_split_jpg = ExportOptions {
@@ -2494,6 +2564,7 @@ mod tests {
             pair_id: "b1".into(),
             jpg_rel: Some("JPG/DSC0001.JPG".into()),
             raw_rel: Some("RAW/DSC0001.ARW".into()),
+            manual_rating: None,
             xmp_meta: Some(sample_meta(&album_b, "JPG/DSC0001.JPG", 4)),
         }];
         let sources_b = vec!["JPG/DSC0001.JPG".into(), "RAW/DSC0001.ARW".into()];
@@ -2589,6 +2660,7 @@ mod tests {
             pair_id: "a1".into(),
             jpg_rel: Some("JPG/DSC0001.JPG".into()),
             raw_rel: Some("RAW/DSC0001.ARW".into()),
+            manual_rating: None,
             xmp_meta: Some(sample_meta(&album_a, "JPG/DSC0001.JPG", 5)),
         }];
         let opts_split_a_raw = ExportOptions {
@@ -2634,13 +2706,15 @@ mod tests {
                 pair_id: "p1".into(),
                 jpg_rel: Some("100MSDCF/IMG_0001.JPG".into()),
                 raw_rel: Some("104MSDCF/IMG_0001.NEF".into()),
-                xmp_meta: Some(sample_meta(&jpg_card, "100MSDCF/IMG_0001.JPG", 5)),
+                manual_rating: None,
+            xmp_meta: Some(sample_meta(&jpg_card, "100MSDCF/IMG_0001.JPG", 5)),
             },
             ExportPhotoItem {
                 pair_id: "p2".into(),
                 jpg_rel: Some("100MSDCF/IMG_0002.JPG".into()),
                 raw_rel: Some("104MSDCF/IMG_0002.CR3".into()),
-                xmp_meta: Some(sample_meta(&jpg_card, "100MSDCF/IMG_0002.JPG", 4)),
+                manual_rating: None,
+            xmp_meta: Some(sample_meta(&jpg_card, "100MSDCF/IMG_0002.JPG", 4)),
             },
         ];
 
@@ -2711,6 +2785,7 @@ mod tests {
             pair_id: "p1".into(),
             jpg_rel: Some("JPG/DSC0001.JPG".into()),
             raw_rel: Some("RAW/DSC0001.RAF".into()),
+            manual_rating: None,
             xmp_meta: Some(sample_meta(&root, "JPG/DSC0001.JPG", 5)),
         }];
         let opts = ExportOptions {
@@ -2725,5 +2800,183 @@ mod tests {
         assert!(exported_xmp.contains("crs:Exposure2012=\"+1.25\""));
         // 源目录 XMP 必须保持原样未修改
         assert_eq!(std::fs::read_to_string(&source_xmp_path).unwrap(), source_xmp);
+    }
+
+    #[test]
+    fn flag_filter_and_unscored_manual_rating_xmp_export() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("album");
+        let out_dir = temp.path().join("Exported");
+        std::fs::create_dir_all(root.join("JPG")).unwrap();
+        std::fs::create_dir_all(root.join("RAW")).unwrap();
+        let j1 = root.join("JPG/DSC0001.JPG");
+        let j2 = root.join("JPG/DSC0002.JPG");
+        let j3 = root.join("JPG/DSC0003.JPG");
+        std::fs::write(&j1, b"jpg-1").unwrap();
+        std::fs::write(&j2, b"jpg-2").unwrap();
+        std::fs::write(&j3, b"jpg-3").unwrap();
+        std::fs::write(root.join("RAW/DSC0001.ARW"), b"raw-1").unwrap();
+        std::fs::write(root.join("RAW/DSC0002.ARW"), b"raw-2").unwrap();
+        std::fs::write(root.join("RAW/DSC0003.ARW"), b"raw-3").unwrap();
+
+        let source = WorkspaceSource::single(&root).unwrap();
+        let paths = WorkspacePaths::in_state_dir(temp.path().join("state"));
+        crate::decision::set_flag_in(&paths.state_dir, &root, &j1, crate::decision::CurationFlag::Pick).unwrap();
+        crate::decision::set_flag_in(&paths.state_dir, &root, &j2, crate::decision::CurationFlag::Reject).unwrap();
+        crate::decision::set_in(&paths.state_dir, &root, &j1, 5).unwrap();
+
+        let cfg = ScoreConfig::default();
+        let (picked_items, all_sources) = collect_items_for_cli_in_workspace(
+            &source,
+            &paths,
+            &cfg,
+            &paths.cache,
+            &ExportFilter {
+                flag_filter: FlagFilter::PickedOnly,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(picked_items.len(), 1);
+        assert_eq!(picked_items[0].jpg_rel.as_deref(), Some("JPG/DSC0001.JPG"));
+        assert_eq!(picked_items[0].manual_rating, Some(5));
+
+        let (active_items, _) = collect_items_for_cli_in_workspace(
+            &source,
+            &paths,
+            &cfg,
+            &paths.cache,
+            &ExportFilter {
+                flag_filter: FlagFilter::ExcludeRejected,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(active_items.len(), 2);
+
+        let opts = ExportOptions {
+            target: ExportTarget::ExternalDir(out_dir.clone()),
+            ..Default::default()
+        };
+        let plan = plan_export_workspace(&source, &picked_items, &all_sources, &opts).unwrap();
+        run_export(&plan, &AtomicBool::new(false), &|_| {}).unwrap();
+        let exported_xmp = std::fs::read_to_string(out_dir.join("RAW/DSC0001.xmp")).unwrap();
+        assert!(exported_xmp.contains("<xmp:Rating>5</xmp:Rating>"));
+        assert!(!root.join("JPG/DSC0001.xmp").exists());
+        assert!(!root.join("RAW/DSC0001.xmp").exists());
+    }
+
+    #[test]
+    fn cli_export_merges_manual_rating_into_self_closing_external_xmp_preserving_crs_exposure() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("album");
+        let out_dir = temp.path().join("exported");
+        std::fs::create_dir_all(root.join("JPG")).unwrap();
+        let jpg_path = root.join("JPG/DSC0001.JPG");
+        std::fs::write(&jpg_path, b"jpg-unscored").unwrap();
+        let external_xmp = concat!(
+            "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">",
+            "<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">",
+            "<rdf:Description rdf:about=\"\" ",
+            "xmlns:crs=\"http://ns.adobe.com/camera-raw-settings/1.0/\" ",
+            "crs:Exposure2012=\"+0.75\"/>",
+            "</rdf:RDF></x:xmpmeta>",
+        );
+        std::fs::write(root.join("JPG/DSC0001.xmp"), external_xmp).unwrap();
+
+        let source = WorkspaceSource::single(&root).unwrap();
+        let paths = WorkspacePaths::in_state_dir(temp.path().join("state"));
+        crate::decision::set_in(&paths.state_dir, &root, &jpg_path, 5).unwrap();
+
+        let (items, all_sources) = collect_items_for_cli_in_workspace(
+            &source,
+            &paths,
+            &ScoreConfig::default(),
+            &paths.cache,
+            &ExportFilter::default(),
+        )
+        .unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].manual_rating, Some(5));
+
+        let opts = ExportOptions {
+            target: ExportTarget::ExternalDir(out_dir.clone()),
+            ..Default::default()
+        };
+        let plan = plan_export_workspace(&source, &items, &all_sources, &opts).unwrap();
+        run_export(&plan, &AtomicBool::new(false), &|_| {}).unwrap();
+
+        let exported_xmp = std::fs::read_to_string(out_dir.join("JPG/DSC0001.xmp")).unwrap();
+        let doc = roxmltree::Document::parse(&exported_xmp).unwrap();
+        let desc = doc
+            .descendants()
+            .find(|n| n.has_tag_name(("http://www.w3.org/1999/02/22-rdf-syntax-ns#", "Description")))
+            .unwrap();
+        assert_eq!(
+            desc.attribute(("http://ns.adobe.com/xap/1.0/", "Rating")),
+            Some("5")
+        );
+        assert_eq!(
+            desc.attribute(("http://ns.adobe.com/camera-raw-settings/1.0/", "Exposure2012")),
+            Some("+0.75")
+        );
+        assert_eq!(std::fs::read_to_string(root.join("JPG/DSC0001.xmp")).unwrap(), external_xmp);
+    }
+
+    #[test]
+    fn cli_export_preserves_namespace_on_self_closing_rating_element() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("album");
+        let out_dir = temp.path().join("exported");
+        std::fs::create_dir_all(root.join("JPG")).unwrap();
+        let jpg_path = root.join("JPG/DSC0001.JPG");
+        std::fs::write(&jpg_path, b"jpg-unscored").unwrap();
+        let external_xmp = concat!(
+            "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">",
+            "<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">",
+            "<rdf:Description rdf:about=\"\" ",
+            "xmlns:crs=\"http://ns.adobe.com/camera-raw-settings/1.0/\" ",
+            "crs:Exposure2012=\"+0.75\">",
+            "<score:Rating xmlns:score=\"http://ns.adobe.com/xap/1.0/\"/>",
+            "</rdf:Description>",
+            "</rdf:RDF></x:xmpmeta>",
+        );
+        std::fs::write(root.join("JPG/DSC0001.xmp"), external_xmp).unwrap();
+
+        let source = WorkspaceSource::single(&root).unwrap();
+        let paths = WorkspacePaths::in_state_dir(temp.path().join("state"));
+        crate::decision::set_in(&paths.state_dir, &root, &jpg_path, 5).unwrap();
+
+        let (items, all_sources) = collect_items_for_cli_in_workspace(
+            &source,
+            &paths,
+            &ScoreConfig::default(),
+            &paths.cache,
+            &ExportFilter::default(),
+        )
+        .unwrap();
+        let opts = ExportOptions {
+            target: ExportTarget::ExternalDir(out_dir.clone()),
+            ..Default::default()
+        };
+        let plan = plan_export_workspace(&source, &items, &all_sources, &opts).unwrap();
+        run_export(&plan, &AtomicBool::new(false), &|_| {}).unwrap();
+
+        let exported_xmp = std::fs::read_to_string(out_dir.join("JPG/DSC0001.xmp")).unwrap();
+        let doc = roxmltree::Document::parse(&exported_xmp).unwrap();
+        let rating_node = doc
+            .descendants()
+            .find(|n| n.has_tag_name(("http://ns.adobe.com/xap/1.0/", "Rating")))
+            .unwrap();
+        assert_eq!(rating_node.text(), Some("5"));
+        let desc = doc
+            .descendants()
+            .find(|n| n.has_tag_name(("http://www.w3.org/1999/02/22-rdf-syntax-ns#", "Description")))
+            .unwrap();
+        assert_eq!(
+            desc.attribute(("http://ns.adobe.com/camera-raw-settings/1.0/", "Exposure2012")),
+            Some("+0.75")
+        );
+        assert_eq!(std::fs::read_to_string(root.join("JPG/DSC0001.xmp")).unwrap(), external_xmp);
     }
 }

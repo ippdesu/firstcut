@@ -249,12 +249,14 @@ impl JobState {
         }
     }
 
-    /// 启动校验失败（尚未真正启动后台线程）时把任务退回 Idle 并释放占位。
+    /// 启动校验失败（尚未真正启动后台线程）或预检阶段被取消时把任务退回 Idle 并释放占位。
     pub fn abort_start(&self) {
-        let mut g = self.inner.lock().unwrap();
-        g.status = JobStatus::Idle;
-        g.cancel = None;
-        g.current_file.clear();
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if matches!(g.status, JobStatus::Running { .. }) {
+            g.status = JobStatus::Idle;
+            g.cancel = None;
+            g.current_file.clear();
+        }
     }
 
     pub fn finish(&self, summary: String) {

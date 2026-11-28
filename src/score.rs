@@ -618,13 +618,19 @@ pub fn run_score_job_in_workspace(
         )));
     }
 
-    // 星级
+    // 星级与选片标记
     let ratings = &selection.ratings;
+    let flags = &selection.flags;
     for e in entries.iter_mut() {
         if let Some(st) = ratings.get(e.pair_id()) {
             e.stars = st.stars.to_string();
             e.rating_source = st.source.as_str().into();
         }
+        e.curation_flag = match flags.get(e.pair_id()).copied().unwrap_or_default() {
+            crate::decision::CurationFlag::Pick => "pick".into(),
+            crate::decision::CurationFlag::Reject => "reject".into(),
+            crate::decision::CurationFlag::Unflagged => String::new(),
+        };
     }
 
     // XMP 侧车（仅单目录且显式开启 opts.xmp 时写入源目录）

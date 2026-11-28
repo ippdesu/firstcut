@@ -125,6 +125,12 @@ enum Commands {
         /// 仅导出有人脸的照片
         #[arg(long)]
         faces: bool,
+        /// 仅导出人工标记为「留用 (pick)」的照片（等价 --flag pick）
+        #[arg(long)]
+        picked: bool,
+        /// 按选片标记筛选：all / pick / exclude_reject / reject / unflagged（与 --picked 互斥）
+        #[arg(long)]
+        flag: Option<String>,
         /// 目录布局：split（默认 JPG/+RAW/）、flat（扁平化）、tree（保持原目录结构）
         #[arg(long, default_value = "split")]
         layout: String,
@@ -260,6 +266,8 @@ fn main() -> Result<()> {
             stars,
             keep_only,
             faces,
+            picked,
+            flag,
             layout,
             no_jpg,
             no_raw,
@@ -287,12 +295,27 @@ fn main() -> Result<()> {
             } else {
                 pic_process::export::ExportTarget::AlbumSubdir(to)
             };
+            if picked && flag.is_some() {
+                anyhow::bail!("--picked 与 --flag 不能同时指定");
+            }
+            let flag_filter = if picked {
+                pic_process::export::FlagFilter::PickedOnly
+            } else if let Some(raw_flag) = &flag {
+                pic_process::export::FlagFilter::parse(raw_flag).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "未知 --flag 值 {raw_flag:?}；可选: all, pick, exclude_reject, reject, unflagged"
+                    )
+                })?
+            } else {
+                pic_process::export::FlagFilter::All
+            };
             let filter = pic_process::export::ExportFilter {
                 stars,
                 min_stars,
                 keep_only,
                 group_filter: pic_process::export::GroupFilter::All,
                 faces_only: faces,
+                flag_filter,
             };
             let (items, all_sources) =
                 pic_process::export::collect_items_for_cli_in_workspace(&source, &paths, &cfg, &cache, &filter)?;

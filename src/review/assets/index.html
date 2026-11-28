@@ -75,14 +75,27 @@
     #lb .top .meta{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   }
   .card{position:relative;background:#000;border-radius:6px;overflow:hidden;cursor:pointer;aspect-ratio:4/3}
-  .card img{width:100%;height:100%;object-fit:cover;display:block}
+  .card img{width:100%;height:100%;object-fit:cover;display:block;transition:opacity .12s,filter .12s}
   .card.noscore img{filter:grayscale(1) brightness(.5)}
+  .card.flag-pick{box-shadow:inset 0 0 0 2px #4caf50}
+  .card.flag-reject{box-shadow:inset 0 0 0 2px rgba(239,83,80,.85)}
+  .card.flag-reject img{opacity:.45;filter:saturate(.35)}
   .card .b{position:absolute;font-size:11px;padding:1px 6px;border-radius:3px;background:rgba(0,0,0,.7)}
-  .card .stars{top:4px;left:4px;color:#ffc107;font-weight:bold}
-  .card .total{top:4px;right:4px;color:#fff;font-weight:bold}
-  .card .burst{bottom:4px;left:4px;color:#8bc34a}
+  .card-top-left{position:absolute;top:4px;left:4px;display:flex;align-items:center;gap:3px;pointer-events:none;z-index:2}
+  .card-top-left .b{position:static}
+  .card .b.flag.pick{background:#1b5e20;color:#c8e6c9;font-weight:600}
+  .card .b.flag.reject{background:#7f1d1d;color:#ffcdd2;font-weight:600}
+  .card .stars{color:#ffc107;font-weight:bold}
+  .card .total{top:4px;right:4px;color:#fff;font-weight:bold;z-index:2}
+  .card .burst{bottom:4px;left:4px;color:#8bc34a;z-index:2}
   .card .burst.drop{color:#f44336}
-  .card .name{bottom:4px;right:4px;color:var(--dim);max-width:60%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .card .name{bottom:4px;right:4px;color:var(--dim);max-width:60%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;z-index:2}
+  .card-actions{position:absolute;top:26px;right:4px;display:flex;gap:3px;opacity:0;transition:opacity .12s;z-index:3}
+  .card:hover .card-actions,.card:focus-within .card-actions{opacity:1}
+  @media(hover:none){.card .card-actions{opacity:1}}
+  .card-actions button{border:1px solid rgba(255,255,255,.22);background:rgba(0,0,0,.78);color:#ddd;font-size:11px;line-height:1;padding:3px 6px;border-radius:4px;cursor:pointer}
+  .card-actions button.act-pick:hover,.card-actions button.act-pick.on{background:#2e7d32;border-color:#4caf50;color:#fff}
+  .card-actions button.act-reject:hover,.card-actions button.act-reject.on{background:#b71c1c;border-color:#ef5350;color:#fff}
   #pager{display:flex;gap:8px;align-items:center;justify-content:center;padding:16px;color:var(--dim)}
   #pager button{background:var(--panel);border:1px solid var(--line);color:var(--fg);padding:4px 12px;border-radius:4px;cursor:pointer}
   #pager button:disabled{opacity:.4;cursor:default}
@@ -126,17 +139,25 @@
   #lbDetails textarea{min-height:60px;resize:vertical}
   #lbDetails .detail-save{margin-top:8px;background:#2e6b30;border:0;border-radius:4px;color:#fff;padding:7px 12px;cursor:pointer}
   #panes{flex:1;display:flex;gap:2px;min-height:0}
-  .pane{flex:1;position:relative;overflow:hidden;background:#000;cursor:grab;touch-action:none}
+  .pane{flex:1;position:relative;overflow:hidden;background:#000;cursor:grab;touch-action:none;user-select:none;-webkit-user-select:none}
   .pane.dragging{cursor:grabbing}
+  body.dragging-pane{user-select:none;cursor:grabbing!important}
   .pane.active::after{content:"";position:absolute;inset:0;border:2px solid var(--acc);pointer-events:none;z-index:2}
   .pane img{position:absolute;transform-origin:0 0;user-select:none;-webkit-user-drag:none;pointer-events:none}
-  .pane .tag{position:absolute;top:6px;left:8px;font-size:12px;background:rgba(0,0,0,.7);padding:2px 8px;border-radius:4px;pointer-events:none}
-  .pane .hint{position:absolute;bottom:8px;left:50%;transform:translateX(-50%);font-size:11px;color:var(--dim);pointer-events:none}
+  .pane .tag{position:absolute;top:6px;left:8px;font-size:12px;background:rgba(0,0,0,.7);padding:2px 8px;border-radius:4px;pointer-events:none;user-select:none;-webkit-user-select:none}
+  .pane-actions{position:absolute;top:6px;right:8px;display:flex;gap:4px;z-index:3;pointer-events:auto}
+  .pane-actions button{background:rgba(0,0,0,.78);border:1px solid rgba(255,255,255,.25);color:#ddd;padding:3px 8px;border-radius:4px;font-size:12px;cursor:pointer}
+  .pane-actions button.act-pick:hover,.pane-actions button.act-pick.on{background:#2e7d32;border-color:#4caf50;color:#fff}
+  .pane-actions button.act-reject:hover,.pane-actions button.act-reject.on{background:#b71c1c;border-color:#ef5350;color:#fff}
+  .pane .hint{position:absolute;bottom:8px;left:50%;transform:translateX(-50%);font-size:11px;color:var(--dim);pointer-events:none;user-select:none;-webkit-user-select:none}
   #strip{display:flex;gap:6px;padding:8px 12px;overflow-x:auto;background:var(--panel);border-top:1px solid var(--line)}
   #strip .st{position:relative;flex:none;width:86px;cursor:pointer;border:2px solid transparent;border-radius:4px}
   #strip .st img{width:100%;aspect-ratio:4/3;object-fit:cover;display:block;border-radius:2px}
   #strip .st.cur{border-color:var(--acc)}
   #strip .st input{position:absolute;top:2px;left:2px;cursor:pointer}
+  #strip .st .st-flag{position:absolute;top:2px;right:2px;font-size:10px;line-height:1;padding:1px 4px;border-radius:2px;font-weight:600}
+  #strip .st .st-flag.pick{background:#1b5e20;color:#c8e6c9}
+  #strip .st .st-flag.reject{background:#7f1d1d;color:#ffcdd2}
   #strip .st .r{position:absolute;bottom:2px;right:2px;font-size:10px;background:rgba(0,0,0,.75);padding:0 4px;border-radius:2px}
   #empty{color:var(--dim);text-align:center;padding:60px 0}
   /* ---- M-UI2 操作台 ---- */
@@ -147,9 +168,15 @@
   #runBarWrap{height:8px;background:#111;border-radius:4px;overflow:hidden;margin:6px 0;display:none}
   #runBar{height:100%;width:0;background:var(--acc);transition:width .3s}
   #runLog{display:none;max-height:150px;overflow-y:auto;background:#0d0d0d;border:1px solid var(--line);border-radius:4px;padding:6px;font-size:11px;line-height:1.5;white-space:pre-wrap;word-break:break-all;color:#9c9c9c;margin-top:6px}
-  .starbtns{display:flex;gap:4px;margin-top:6px}
+  .starbtns{display:flex;gap:4px}
   .starbtns button{background:none;border:1px solid var(--line);color:#ffc107;font-size:14px;padding:2px 7px;border-radius:4px;cursor:pointer}
   .starbtns button:hover{background:#333}
+  #lbFlagBtns{display:inline-flex;gap:2px;background:#141414;border:1px solid var(--line);border-radius:4px;padding:2px}
+  #lbFlagBtns button{background:transparent;border:0;color:var(--dim);padding:3px 8px;border-radius:3px;font-size:12px;cursor:pointer}
+  #lbFlagBtns button:hover{background:#2a2a2a;color:var(--fg)}
+  #lbFlagBtns button.pick-on{background:#2e7d32;color:#fff}
+  #lbFlagBtns button.unflag-on{background:#333;color:#fff}
+  #lbFlagBtns button.reject-on{background:#b71c1c;color:#fff}
   #modal{position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:30;display:none;align-items:center;justify-content:center}
   #modal .box,#exportModal .box{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:18px;width:min(720px,calc(100vw - 24px));max-height:85vh;overflow-y:auto;font-size:13px}
   #modal h3,#exportModal h3{margin:0 0 4px;font-size:15px}
@@ -272,6 +299,20 @@
     </div>
     <h3>搜索</h3>
     <input type="text" id="fSearch" placeholder="文件名…">
+    <h3>选片标记</h3>
+    <div id="curationSummary" class="dim" style="margin-bottom:5px"></div>
+    <select id="fFlag">
+      <option value="all">全部照片</option>
+      <option value="pick">仅已留用 ⚑</option>
+      <option value="exclude_reject">排除已剔除</option>
+      <option value="reject">仅已剔除 ✕</option>
+      <option value="unflagged">仅未标记</option>
+    </select>
+    <button class="btn primary" type="button" id="batchPickBtn" style="width:100%;margin-top:6px" title="将当前左侧筛选命中的全部照片（不受连拍聚合折叠影响）批量标记为留用">⚑ 将当前筛选设为留用</button>
+    <div style="display:flex;gap:4px;margin-top:4px">
+      <button class="btn" type="button" id="batchUnflagBtn" style="flex:1">清除筛选标记</button>
+      <button class="btn danger" type="button" id="batchRejectBtn" style="flex:1">批量剔除</button>
+    </div>
     <details class="side-section" id="starsSection"><summary>星级 <span class="filter-count" id="starFilterCount"></span></summary>
       <div id="fStars"></div>
     </details>
@@ -299,7 +340,9 @@
       <option value="total">总分 高→低</option>
       <option value="-total">总分 低→高</option>
       <option value="time">拍摄时间 新→旧</option>
-      <option value="path">文件名</option>
+      <option value="-time">拍摄时间 旧→新</option>
+      <option value="path">文件名 A→Z</option>
+      <option value="-path">文件名 Z→A</option>
     </select>
     <h3>评分</h3>
     <div id="runBlock">
@@ -315,7 +358,7 @@
       <div class="dim">缓存、星级与日志均保存在本机工作区目录（源目录零写入）；XMP 侧车在导出时自动生成或合并。</div>
     </div>
     <details class="side-section" id="usageHelp"><summary>使用说明</summary>
-      <div class="dim">点击卡片看 1:1 原图（滚轮缩放 / 拖拽平移 / 双击复位 / ←→ 组内切换 / Esc 关闭）。连拍组内可在灯箱勾选 2~4 张进入同步缩放对比。</div>
+      <div class="dim">点击卡片看 1:1 原图（滚轮缩放 / 拖拽平移 / 双击复位 / ←→ 组内切换 / Esc 关闭）；P 留用 / X 剔除 / U 取消标记 / 1~5 改星（未评分照片也可直接标记和打星）。连拍组内可在灯箱勾选 2~4 张进入同步缩放对比。</div>
     </details>
   </aside>
   <div id="sidebarResize" role="separator" tabindex="0" aria-label="调整筛选栏宽度" aria-orientation="vertical" aria-valuemin="190" aria-valuemax="480" aria-valuenow="230" title="拖动调整侧栏宽度；双击恢复默认"></div>
@@ -350,8 +393,14 @@
   <div class="top">
     <span id="lbName"></span>
     <span class="meta" id="lbMeta"></span>
+    <span id="lbFlagBtns" role="group" aria-label="选片标记">
+      <button type="button" id="lbFlagPick" title="标记为留用 (快捷键 P)">⚑ 留用</button>
+      <button type="button" id="lbFlagUnflag" title="取消标记 / 恢复未定 (快捷键 U)">未定</button>
+      <button type="button" id="lbFlagReject" title="标记为剔除 (快捷键 X)">✕ 剔除</button>
+    </span>
     <span class="starbtns" id="lbStars" title="点击改星（快捷键 1~5），保存在本机并在导出时合并进 XMP"></span>
     <button id="lbCompare">并排对比</button>
+    <button type="button" id="lbLockBurst" aria-pressed="false" title="开启后 ←/→ 方向键仅在当前连拍组内循环；关闭后可自由跨组浏览全部筛选照片">🔓 跨组切换</button>
     <span id="lbZoom" role="status" aria-live="polite" title="相对于照片适配窗格尺寸的缩放倍率">缩放 100%</span>
     <button id="lbHistogramToggle" aria-expanded="true">直方图</button>
     <button id="lbDetailsToggle" aria-expanded="false">评分说明</button>
@@ -391,6 +440,10 @@
         <div class="cfg-range"><span>1%</span><input id="histogramSampleRange" type="range" min="1" max="25" step="1" value="10" aria-label="直方图抽样比例滑块"><span>25%</span></div>
         <div class="cfg-help">比例越高，曲线统计越细，计算时间和临时内存也按比例增加。照片像素只在浏览器内抽样，不写入缓存。</div>
       </div>
+      <div class="cfg-field">
+        <div class="cfg-line"><span class="cfg-name">灯箱方向键锁定在当前连拍组内</span><label class="cfg-check"><input type="checkbox" id="uiLockBurstNav"></label></div>
+        <div class="cfg-help">开启后在连拍照片上按 ←/→ 只在当前连拍组内循环；关闭后可自由进出连拍组浏览全部筛选结果。也可在灯箱顶部随时切换。</div>
+      </div>
       <div class="cfg-line"><span id="uiSettingsStatus" class="dim"></span><button class="btn" id="uiSettingsSave">保存界面设置</button></div>
     </div>
     <div class="foot">
@@ -402,8 +455,15 @@
 
 <div id="exportModal">
   <div class="box" role="dialog" aria-modal="true" aria-labelledby="exportTitle">
-    <h3 id="exportTitle">导出当前筛选结果</h3>
-    <div class="dim" id="exportFilterSummary">基于当前左侧筛选命中的全部照片（不受“按连拍组聚合”折叠影响）。</div>
+    <h3 id="exportTitle">导出照片</h3>
+    <div class="grp">
+      <b>导出范围</b>
+      <div class="row">
+        <label class="chk"><input type="radio" name="exportScope" id="exportScopeFilter" value="filter" checked> <span id="exportScopeFilterLabel">按当前左侧筛选</span></label>
+        <label class="chk"><input type="radio" name="exportScope" id="exportScopePicked" value="picked"> <span id="exportScopePickedLabel">仅导出全部「留用」照片</span></label>
+      </div>
+      <div class="dim" id="exportFilterSummary">基于当前左侧筛选命中的全部照片（不受“按连拍组聚合”折叠影响）。</div>
+    </div>
     <div class="grp">
       <b>目标目录</b>
       <div class="row" id="exportSubdirRow">

@@ -1,7 +1,7 @@
 //! 用户复核决定。算法每次可以重算，人工星级与人工连拍保留覆盖统一独立保存在
 //! `.firstcut/decisions.sqlite`（并兼容读取/单向迁移旧版 `.firstcut/burst-overrides.json`）。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
@@ -43,6 +43,58 @@ pub struct EffectiveRating {
     pub source: RatingSource,
 }
 
+/// 三态人工选片标记（留用 / 未定 / 剔除）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CurationFlag {
+    #[default]
+    Unflagged,
+    Pick,
+    Reject,
+}
+
+impl CurationFlag {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unflagged => "unflagged",
+            Self::Pick => "pick",
+            Self::Reject => "reject",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "pick" | "picked" | "p" => Some(Self::Pick),
+            "reject" | "rejected" | "x" => Some(Self::Reject),
+            "unflagged" | "none" | "clear" | "u" | "" => Some(Self::Unflagged),
+            _ => None,
+        }
+    }
+
+    fn to_db(self) -> Option<i64> {
+        match self {
+            Self::Pick => Some(1),
+            Self::Reject => Some(-1),
+            Self::Unflagged => None,
+        }
+    }
+
+    fn from_db(v: i64) -> Option<Self> {
+        match v {
+            1 => Some(Self::Pick),
+            -1 => Some(Self::Reject),
+            _ => None,
+        }
+    }
+}
+
+/// 批量设置选片标记的结果摘要。
+#[derive(Debug, Clone, Default)]
+pub struct BatchFlagOutcome {
+    pub updated: Vec<String>,
+    pub failed: Vec<String>,
+}
+
 /// 统一后的单张连拍有效结果（算法建议 + 人工保留/舍弃覆盖）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EffectiveBurst {
@@ -73,7 +125,7 @@ fn relative_key(root: &Path, photo: &Path) -> Result<String> {
     Ok(relative)
 }
 
-fn photo_fingerprint(root: &Path, rel_key: &str) -> Result<String> {
+pub(crate) fn photo_fingerprint(root: &Path, rel_key: &str) -> Result<String> {
     let mut file = FileRef::inside(root, &root.join(rel_key))
         .with_context(|| format!("无法安全打开照片文件以生成指纹: {rel_key}"))?
         .open_read()
@@ -83,6 +135,29 @@ fn photo_fingerprint(root: &Path, rel_key: &str) -> Result<String> {
         .metadata()
         .with_context(|| format!("读取照片元数据失败: {rel_key}"))?
         .len();
+    fingerprint_opened_file(&mut file, len, rel_key)
+}
+
+pub(crate) fn photo_fingerprint_for_source(
+    source: &crate::workspace::WorkspaceSource,
+    is_raw: bool,
+    rel_key: &str,
+) -> Result<String> {
+    let full = source.photo_full(is_raw, rel_key);
+    let mut file = source
+        .file_ref_for_photo(is_raw, &full)
+        .with_context(|| format!("无法安全打开照片文件以生成指纹: {rel_key}"))?
+        .open_read()
+        .with_context(|| format!("读取照片文件失败: {rel_key}"))?
+        .with_context(|| format!("照片文件不存在或不可读，无法生成内容指纹: {rel_key}"))?;
+    let len = file
+        .metadata()
+        .with_context(|| format!("读取照片元数据失败: {rel_key}"))?
+        .len();
+    fingerprint_opened_file(&mut file, len, rel_key)
+}
+
+fn fingerprint_opened_file<R: Read + Seek>(file: &mut R, len: u64, rel_key: &str) -> Result<String> {
     let mut hasher = Sha256::new();
     hasher.update(len.to_le_bytes());
     let mut buf = [0u8; FINGERPRINT_SLICE_BYTES];
@@ -129,6 +204,15 @@ fn has_column(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<
     Ok(false)
 }
 
+fn imported_legacy_needs_flag_upgrade(conn: &Connection) -> rusqlite::Result<bool> {
+    let mut stmt = conn.prepare(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'imported_legacy_decision' LIMIT 1",
+    )?;
+    let mut rows = stmt.query([])?;
+    let sql = rows.next()?.and_then(|r| r.get::<_, String>(0).ok());
+    Ok(sql.is_some_and(|s| !s.contains("'flag'")))
+}
+
 fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS manual_rating (
@@ -143,17 +227,37 @@ fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
             keep INTEGER NOT NULL CHECK(keep IN (0, 1)),
             PRIMARY KEY (photo_path, photo_fp)
         );
+        CREATE TABLE IF NOT EXISTS manual_flag (
+            photo_path TEXT NOT NULL,
+            photo_fp TEXT NOT NULL DEFAULT '',
+            flag INTEGER NOT NULL CHECK(flag IN (-1, 1)),
+            PRIMARY KEY (photo_path, photo_fp)
+        );
         CREATE TABLE IF NOT EXISTS decision_meta (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS imported_legacy_decision (
-            kind TEXT NOT NULL CHECK(kind IN ('rating', 'burst')),
+            kind TEXT NOT NULL CHECK(kind IN ('rating', 'burst', 'flag')),
             photo_path TEXT NOT NULL,
             photo_fp TEXT NOT NULL,
             PRIMARY KEY (kind, photo_path, photo_fp)
         );",
     )?;
+    if imported_legacy_needs_flag_upgrade(conn)? {
+        conn.execute_batch(
+            "CREATE TABLE imported_legacy_decision_v2 (
+                kind TEXT NOT NULL CHECK(kind IN ('rating', 'burst', 'flag')),
+                photo_path TEXT NOT NULL,
+                photo_fp TEXT NOT NULL,
+                PRIMARY KEY (kind, photo_path, photo_fp)
+            );
+            INSERT INTO imported_legacy_decision_v2 (kind, photo_path, photo_fp)
+                SELECT kind, photo_path, photo_fp FROM imported_legacy_decision;
+            DROP TABLE imported_legacy_decision;
+            ALTER TABLE imported_legacy_decision_v2 RENAME TO imported_legacy_decision;",
+        )?;
+    }
     if !has_column(conn, "manual_rating", "photo_fp")? {
         conn.execute_batch(
             "CREATE TABLE manual_rating_v2 (
@@ -434,6 +538,168 @@ pub fn set_burst_keep_in(
     db.save()
 }
 
+/// 读取人工选片标记（照片相对路径 → `CurationFlag`）。
+pub fn load_flags(root: &Path) -> Result<HashMap<String, CurationFlag>> {
+    load_flags_in(&root.join(".firstcut"))
+}
+
+pub fn load_flags_in(state_dir: &Path) -> Result<HashMap<String, CurationFlag>> {
+    let map = load_flag_map_in(state_dir)?;
+    Ok(map
+        .into_iter()
+        .filter_map(|(k, v)| v.last().map(|(_, flag)| (k, *flag)))
+        .collect())
+}
+
+pub fn load_flag_map_in(state_dir: &Path) -> Result<DecisionMap<CurationFlag>> {
+    let state = match Folder::open_or_create_explicit(state_dir, false) {
+        Ok(dir) => dir,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(err) => return Err(err.into()),
+    };
+    let Some(db) = Database::open(state.file(DECISIONS_DB)?, false)? else {
+        return Ok(HashMap::new());
+    };
+    if !table_exists(&db.conn, "manual_flag")? {
+        return Ok(HashMap::new());
+    }
+    let mut out: DecisionMap<CurationFlag> = HashMap::new();
+    let mut stmt = db
+        .conn
+        .prepare("SELECT photo_path, photo_fp, flag FROM manual_flag")?;
+    let rows = stmt.query_map([], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+    })?;
+    for row in rows {
+        let (path, fp, raw) = row?;
+        if let Some(flag) = CurationFlag::from_db(raw) {
+            out.entry(path).or_default().push((fp, flag));
+        }
+    }
+    Ok(out)
+}
+
+pub fn set_flag(root: &Path, jpg: &Path, flag: CurationFlag) -> Result<()> {
+    set_flag_in(&root.join(".firstcut"), root, jpg, flag)
+}
+
+pub fn set_flag_in(
+    state_dir: &Path,
+    jpg_root: &Path,
+    jpg: &Path,
+    flag: CurationFlag,
+) -> Result<()> {
+    let key = relative_key(jpg_root, jpg)?;
+    let fp = photo_fingerprint(jpg_root, &key)?;
+    let state = Folder::open_or_create_explicit(state_dir, true)?;
+    let mut db = Database::open(state.file(DECISIONS_DB)?, true)?
+        .context("人工评分数据库不可用")?;
+    ensure_schema(&db.conn)?;
+    let tx = db.conn.transaction()?;
+    match flag.to_db() {
+        Some(val) => {
+            tx.execute(
+                "INSERT INTO manual_flag(photo_path, photo_fp, flag) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(photo_path, photo_fp) DO UPDATE SET flag = excluded.flag",
+                rusqlite::params![&key, &fp, val],
+            )?;
+        }
+        None => {
+            tx.execute(
+                "DELETE FROM manual_flag WHERE photo_path = ?1 AND photo_fp = ?2",
+                rusqlite::params![&key, &fp],
+            )?;
+        }
+    }
+    if !fp.is_empty() {
+        tx.execute(
+            "DELETE FROM manual_flag WHERE photo_path = ?1 AND photo_fp = ''",
+            [&key],
+        )?;
+    }
+    tx.execute(
+        "INSERT OR IGNORE INTO imported_legacy_decision(kind, photo_path, photo_fp) VALUES ('flag', ?1, ?2)",
+        rusqlite::params![&key, &fp],
+    )?;
+    tx.commit()?;
+    db.save()
+}
+
+/// 在单次 SQLite 事务内批量写入多张照片的选片标记；任何无法读取内容指纹的照片都会跳过并计入 `failed`。
+pub fn set_flags_batch_in(
+    state_dir: &Path,
+    jpg_root: &Path,
+    jpgs: &[std::path::PathBuf],
+    flag: CurationFlag,
+) -> Result<BatchFlagOutcome> {
+    if jpgs.is_empty() {
+        return Ok(BatchFlagOutcome::default());
+    }
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut verified: Vec<(String, String)> = Vec::with_capacity(jpgs.len());
+    let mut failed: Vec<String> = Vec::new();
+    for jpg in jpgs {
+        let key = match relative_key(jpg_root, jpg) {
+            Ok(k) => k,
+            Err(_) => {
+                failed.push(jpg.display().to_string());
+                continue;
+            }
+        };
+        if !seen.insert(key.clone()) {
+            continue;
+        }
+        match photo_fingerprint(jpg_root, &key) {
+            Ok(fp) => verified.push((key, fp)),
+            Err(_) => failed.push(key),
+        }
+    }
+    if verified.is_empty() {
+        anyhow::bail!(
+            "所选照片均无法读取内容指纹，未写入选片标记（{} 张失败）",
+            failed.len()
+        );
+    }
+
+    let state = Folder::open_or_create_explicit(state_dir, true)?;
+    let mut db = Database::open(state.file(DECISIONS_DB)?, true)?
+        .context("人工评分数据库不可用")?;
+    ensure_schema(&db.conn)?;
+    let tx = db.conn.transaction()?;
+    let mut updated = Vec::with_capacity(verified.len());
+    for (key, fp) in &verified {
+        match flag.to_db() {
+            Some(val) => {
+                tx.execute(
+                    "INSERT INTO manual_flag(photo_path, photo_fp, flag) VALUES (?1, ?2, ?3)
+                     ON CONFLICT(photo_path, photo_fp) DO UPDATE SET flag = excluded.flag",
+                    rusqlite::params![key, fp, val],
+                )?;
+            }
+            None => {
+                tx.execute(
+                    "DELETE FROM manual_flag WHERE photo_path = ?1 AND photo_fp = ?2",
+                    rusqlite::params![key, fp],
+                )?;
+            }
+        }
+        if !fp.is_empty() {
+            tx.execute(
+                "DELETE FROM manual_flag WHERE photo_path = ?1 AND photo_fp = ''",
+                [key],
+            )?;
+        }
+        tx.execute(
+            "INSERT OR IGNORE INTO imported_legacy_decision(kind, photo_path, photo_fp) VALUES ('flag', ?1, ?2)",
+            rusqlite::params![key, fp],
+        )?;
+        updated.push(key.clone());
+    }
+    tx.commit()?;
+    db.save()?;
+    Ok(BatchFlagOutcome { updated, failed })
+}
+
 /// 从原相册导入旧版 `decisions.sqlite` / `burst-overrides.json` 后，按原相册照片补齐内容指纹；
 /// 无法读取照片的旧记录保留在数据库中（`photo_fp = ''`），但绝不在后续匹配中自动应用。
 pub fn backfill_fingerprints_in(state_dir: &Path, jpg_root: &Path) -> Result<()> {
@@ -466,7 +732,9 @@ pub fn backfill_imported_decisions_in(
     let upgraded_schema = !table_exists(&db.conn, "manual_rating")?
         || !has_column(&db.conn, "manual_rating", "photo_fp")?
         || !table_exists(&db.conn, "manual_burst_keep")?
-        || !has_column(&db.conn, "manual_burst_keep", "photo_fp")?;
+        || !has_column(&db.conn, "manual_burst_keep", "photo_fp")?
+        || !table_exists(&db.conn, "manual_flag")?
+        || imported_legacy_needs_flag_upgrade(&db.conn)?;
     ensure_schema(&db.conn)?;
     let mut changed = upgraded_schema;
 
@@ -486,8 +754,17 @@ pub fn backfill_imported_decisions_in(
             let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
             rows.collect::<rusqlite::Result<Vec<_>>>()?
         };
+        let flag_rows: Vec<(String, i64)> = if table_exists(&db.conn, "manual_flag")? {
+            let mut stmt = db
+                .conn
+                .prepare("SELECT photo_path, flag FROM manual_flag WHERE photo_fp = ''")?;
+            let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
 
-        if !rating_rows.is_empty() || !burst_rows.is_empty() {
+        if !rating_rows.is_empty() || !burst_rows.is_empty() || !flag_rows.is_empty() {
             let tx = db.conn.transaction()?;
             for (path, stars) in rating_rows {
                 if let Ok(fp) = photo_fingerprint(jpg_root, &path) {
@@ -512,6 +789,20 @@ pub fn backfill_imported_decisions_in(
                     )?;
                     tx.execute(
                         "DELETE FROM manual_burst_keep WHERE photo_path = ?1 AND photo_fp = ''",
+                        [&path],
+                    )?;
+                    changed = true;
+                }
+            }
+            for (path, flag) in flag_rows {
+                if let Ok(fp) = photo_fingerprint(jpg_root, &path) {
+                    tx.execute(
+                        "INSERT INTO manual_flag(photo_path, photo_fp, flag) VALUES (?1, ?2, ?3)
+                         ON CONFLICT(photo_path, photo_fp) DO NOTHING",
+                        rusqlite::params![&path, &fp, flag],
+                    )?;
+                    tx.execute(
+                        "DELETE FROM manual_flag WHERE photo_path = ?1 AND photo_fp = ''",
                         [&path],
                     )?;
                     changed = true;
@@ -559,6 +850,7 @@ pub fn import_legacy_decisions_in(
 ) -> Result<()> {
     let mut db_ratings: Vec<(String, String, u8)> = Vec::new();
     let mut db_bursts: Vec<(String, String, i64)> = Vec::new();
+    let mut db_flags: Vec<(String, String, i64)> = Vec::new();
     let mut legacy_db_burst_migrated = false;
 
     if let Ok(src_ref) = legacy_folder.file(DECISIONS_DB) {
@@ -626,6 +918,27 @@ pub fn import_legacy_decisions_in(
                     }
                 }
             }
+
+            if table_exists(&legacy_db.conn, "manual_flag")? {
+                let mut stmt = legacy_db
+                    .conn
+                    .prepare("SELECT photo_path, photo_fp, flag FROM manual_flag")?;
+                let rows = stmt.query_map([], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+                })?;
+                for row in rows {
+                    let (path, stored_fp, raw_flag) = row?;
+                    if CurationFlag::from_db(raw_flag).is_none() {
+                        continue;
+                    }
+                    let fp = if stored_fp.is_empty() {
+                        photo_fingerprint(jpg_root, &path).unwrap_or_default()
+                    } else {
+                        stored_fp
+                    };
+                    db_flags.push((path, fp, raw_flag));
+                }
+            }
         }
     }
 
@@ -644,7 +957,7 @@ pub fn import_legacy_decisions_in(
         }
     }
 
-    if db_ratings.is_empty() && db_bursts.is_empty() && json_bursts.is_empty() {
+    if db_ratings.is_empty() && db_bursts.is_empty() && db_flags.is_empty() && json_bursts.is_empty() {
         return Ok(());
     }
 
@@ -655,7 +968,9 @@ pub fn import_legacy_decisions_in(
         || !has_column(&db.conn, "manual_rating", "photo_fp")?
         || !table_exists(&db.conn, "manual_burst_keep")?
         || !has_column(&db.conn, "manual_burst_keep", "photo_fp")?
-        || !table_exists(&db.conn, "imported_legacy_decision")?;
+        || !table_exists(&db.conn, "manual_flag")?
+        || !table_exists(&db.conn, "imported_legacy_decision")?
+        || imported_legacy_needs_flag_upgrade(&db.conn)?;
     ensure_schema(&db.conn)?;
 
     let mut changed = upgraded_schema;
@@ -682,6 +997,19 @@ pub fn import_legacy_decisions_in(
             tx.execute(
                 "INSERT OR IGNORE INTO manual_burst_keep(photo_path, photo_fp, keep) VALUES (?1, ?2, ?3)",
                 rusqlite::params![&path, &fp, keep],
+            )?;
+            changed = true;
+        }
+    }
+    for (path, fp, raw_flag) in db_flags {
+        if tx.execute(
+            "INSERT OR IGNORE INTO imported_legacy_decision(kind, photo_path, photo_fp) VALUES ('flag', ?1, ?2)",
+            rusqlite::params![&path, &fp],
+        )? > 0
+        {
+            tx.execute(
+                "INSERT OR IGNORE INTO manual_flag(photo_path, photo_fp, flag) VALUES (?1, ?2, ?3)",
+                rusqlite::params![&path, &fp, raw_flag],
             )?;
             changed = true;
         }
@@ -742,12 +1070,13 @@ pub fn effective_ratings(
         let key = relative_key(root, Path::new(&e.path))?;
         if let Some(&stars) = manual.get(&key) {
             if photo_fingerprint(root, &key).is_ok() {
-                if let Some(value) = out.get_mut(e.pair_id()) {
-                    *value = EffectiveRating {
+                out.insert(
+                    e.pair_id().to_string(),
+                    EffectiveRating {
                         stars,
                         source: RatingSource::Manual,
-                    };
-                }
+                    },
+                );
             }
         }
     }
@@ -776,12 +1105,33 @@ pub fn effective_ratings_checked(
         let key = relative_key(root, Path::new(&e.path))?;
         if let Some(candidates) = manual.get(&key) {
             if let Some(stars) = match_decision(root, &key, candidates) {
-                // 未分析的照片仍未评分；人工覆盖只替代已存在的算法建议。
-                if let Some(value) = out.get_mut(e.pair_id()) {
-                    *value = EffectiveRating {
+                // 未分析的照片也允许保留并生效人工打星（按内容指纹校验）。
+                out.insert(
+                    e.pair_id().to_string(),
+                    EffectiveRating {
                         stars,
                         source: RatingSource::Manual,
-                    };
+                    },
+                );
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// 按内容指纹校验合并人工选片标记，输出 `pair_id -> CurationFlag`（未定不写入映射）。
+pub fn effective_flags_checked(
+    root: &Path,
+    entries: &[PhotoEntry],
+    manual: &DecisionMap<CurationFlag>,
+) -> Result<HashMap<String, CurationFlag>> {
+    let mut out: HashMap<String, CurationFlag> = HashMap::new();
+    for e in entries.iter().filter(|e| !e.is_raw) {
+        let key = relative_key(root, Path::new(&e.path))?;
+        if let Some(candidates) = manual.get(&key) {
+            if let Some(flag) = match_decision(root, &key, candidates) {
+                if flag != CurationFlag::Unflagged {
+                    out.insert(e.pair_id().to_string(), flag);
                 }
             }
         }
@@ -1197,5 +1547,184 @@ mod tests {
             .unwrap();
         assert!(!eff["p1"].keep, "迁移后必须延续 SQLite（舍弃）优先于 JSON（保留）的规则");
         assert_eq!(eff["p1"].manual_keep, Some(false));
+    }
+
+    #[test]
+    fn curation_flag_persists_survives_swapped_card_and_propagates_to_raw() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("mount");
+        let state = temp.path().join("state");
+        std::fs::create_dir_all(root.join("JPG")).unwrap();
+        std::fs::create_dir_all(root.join("RAW")).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        let jpg_a = root.join("JPG/DSC00001.JPG");
+        let raw_a = root.join("RAW/DSC00001.ARW");
+        std::fs::write(&jpg_a, b"card-a-jpg-bytes").unwrap();
+        std::fs::write(&raw_a, b"card-a-raw-bytes").unwrap();
+
+        set_flag_in(&state, &root, &jpg_a, CurationFlag::Pick).unwrap();
+        let entries = vec![
+            PhotoEntry {
+                path: jpg_a.display().to_string(),
+                pair_id: "p1".into(),
+                ..Default::default()
+            },
+            PhotoEntry {
+                path: raw_a.display().to_string(),
+                pair_id: "p1".into(),
+                is_raw: true,
+                ..Default::default()
+            },
+        ];
+        let eff_a = effective_flags_checked(&root, &entries, &load_flag_map_in(&state).unwrap()).unwrap();
+        assert_eq!(eff_a.get("p1").copied(), Some(CurationFlag::Pick));
+
+        // 换卡 B：同路径不同内容，绝不继承卡 A 的留用标记
+        std::fs::write(&jpg_a, b"card-b-completely-different-photo").unwrap();
+        let eff_b = effective_flags_checked(&root, &entries, &load_flag_map_in(&state).unwrap()).unwrap();
+        assert!(!eff_b.contains_key("p1"));
+
+        // 卡 B 标记为剔除后，换回卡 A 仍保留卡 A 自己的留用标记
+        set_flag_in(&state, &root, &jpg_a, CurationFlag::Reject).unwrap();
+        std::fs::write(&jpg_a, b"card-a-jpg-bytes").unwrap();
+        let eff_a_back = effective_flags_checked(&root, &entries, &load_flag_map_in(&state).unwrap()).unwrap();
+        assert_eq!(eff_a_back.get("p1").copied(), Some(CurationFlag::Pick));
+
+        // 取消标记后清除，且对缺失照片 fail-closed 报错
+        set_flag_in(&state, &root, &jpg_a, CurationFlag::Unflagged).unwrap();
+        assert!(effective_flags_checked(&root, &entries, &load_flag_map_in(&state).unwrap())
+            .unwrap()
+            .is_empty());
+        std::fs::remove_file(&jpg_a).unwrap();
+        assert!(set_flag_in(&state, &root, &jpg_a, CurationFlag::Pick).is_err());
+    }
+
+    #[test]
+    fn batch_flag_updates_valid_photos_in_one_tx_and_skips_missing_fail_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("album");
+        let state = temp.path().join("state");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        let p1 = root.join("a.jpg");
+        let p2 = root.join("b.jpg");
+        let missing = root.join("missing.jpg");
+        std::fs::write(&p1, b"photo-a").unwrap();
+        std::fs::write(&p2, b"photo-b").unwrap();
+
+        let out = set_flags_batch_in(
+            &state,
+            &root,
+            &[p1.clone(), p2.clone(), p1.clone(), missing.clone()],
+            CurationFlag::Pick,
+        )
+        .unwrap();
+        assert_eq!(out.updated, vec!["a.jpg".to_string(), "b.jpg".to_string()]);
+        assert_eq!(out.failed, vec!["missing.jpg".to_string()]);
+
+        let map = load_flag_map_in(&state).unwrap();
+        assert!(!map.contains_key("missing.jpg"), "缺失照片不得写入空指纹记录");
+        assert_eq!(load_flags_in(&state).unwrap().get("a.jpg"), Some(&CurationFlag::Pick));
+        assert_eq!(load_flags_in(&state).unwrap().get("b.jpg"), Some(&CurationFlag::Pick));
+
+        // 全部失败时返回 Err
+        assert!(set_flags_batch_in(&state, &root, &[missing], CurationFlag::Reject).is_err());
+    }
+
+    #[test]
+    fn flag_upgrades_existing_pr17_imported_legacy_decision_check_constraint() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("album");
+        let state = temp.path().join("state");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        let photo = root.join("DSC00001.JPG");
+        std::fs::write(&photo, b"photo-bytes").unwrap();
+
+        // 预置 PR #17 旧版 CHECK(kind IN ('rating', 'burst')) 的数据库
+        {
+            let conn = rusqlite::Connection::open(state.join("decisions.sqlite")).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE manual_rating (
+                    photo_path TEXT NOT NULL,
+                    photo_fp TEXT NOT NULL DEFAULT '',
+                    stars INTEGER NOT NULL CHECK(stars BETWEEN 1 AND 5),
+                    PRIMARY KEY (photo_path, photo_fp)
+                );
+                CREATE TABLE manual_burst_keep (
+                    photo_path TEXT NOT NULL,
+                    photo_fp TEXT NOT NULL DEFAULT '',
+                    keep INTEGER NOT NULL CHECK(keep IN (0, 1)),
+                    PRIMARY KEY (photo_path, photo_fp)
+                );
+                CREATE TABLE decision_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                CREATE TABLE imported_legacy_decision (
+                    kind TEXT NOT NULL CHECK(kind IN ('rating', 'burst')),
+                    photo_path TEXT NOT NULL,
+                    photo_fp TEXT NOT NULL,
+                    PRIMARY KEY (kind, photo_path, photo_fp)
+                );
+                INSERT INTO imported_legacy_decision(kind, photo_path, photo_fp)
+                    VALUES ('rating', 'DSC00001.JPG', 'legacy-fp');",
+            )
+            .unwrap();
+        }
+
+        set_flag_in(&state, &root, &photo, CurationFlag::Pick).unwrap();
+        assert_eq!(load_flags_in(&state).unwrap().get("DSC00001.JPG"), Some(&CurationFlag::Pick));
+
+        let conn = rusqlite::Connection::open(state.join("decisions.sqlite")).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM imported_legacy_decision WHERE kind = 'rating' AND photo_fp = 'legacy-fp'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "升级 CHECK 约束时必须保留既有迁移记录");
+    }
+
+    #[test]
+    fn unscored_manual_rating_surfaces_in_effective_ratings_checked() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("album");
+        let state = temp.path().join("state");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        let photo = root.join("unscored.jpg");
+        std::fs::write(&photo, b"unscored-photo-bytes").unwrap();
+
+        set_in(&state, &root, &photo, 5).unwrap();
+        let entries = vec![PhotoEntry {
+            path: photo.display().to_string(),
+            pair_id: "p_unscored".into(),
+            ..Default::default()
+        }];
+        let empty_algo: HashMap<String, u8> = HashMap::new();
+        let eff = effective_ratings_checked(
+            &root,
+            &entries,
+            &empty_algo,
+            &load_ratings_in(&state).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            eff.get("p_unscored").copied(),
+            Some(EffectiveRating {
+                stars: 5,
+                source: RatingSource::Manual,
+            })
+        );
+
+        // 换卡不同内容后不得继承未评分的人工星级
+        std::fs::write(&photo, b"swapped-card-photo-bytes").unwrap();
+        let eff_swapped = effective_ratings_checked(
+            &root,
+            &entries,
+            &empty_algo,
+            &load_ratings_in(&state).unwrap(),
+        )
+        .unwrap();
+        assert!(!eff_swapped.contains_key("p_unscored"));
     }
 }

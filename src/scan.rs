@@ -63,6 +63,9 @@ pub struct PhotoEntry {
     pub burst_keep: String,
     /// M9 姿态簇号（组内从 1 起；0 = 未启用自适应保留；非连拍为空）
     pub burst_pose: String,
+    /// 人工三态选片标记（pick / reject / 空串表示未定；旧 CSV 缺失该列时默认空串）
+    #[serde(default)]
+    pub curation_flag: String,
 }
 
 /// 支持的主流相机 RAW 扩展名（全部小写；匹配时大小写不敏感）。

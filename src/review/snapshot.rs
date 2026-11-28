@@ -5,6 +5,8 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
@@ -25,6 +27,8 @@ pub struct PhotoJson {
     pub has_pair: bool,
     #[serde(skip)]
     pub pair_id: String,
+    #[serde(skip)]
+    pub content_fingerprint: Option<String>,
     pub datetime: String,
     pub iso: String,
     pub f_number: String,
@@ -37,6 +41,7 @@ pub struct PhotoJson {
     pub analysis_mode: Option<String>,
     pub faces: usize,
     pub burst: Option<BurstJson>,
+    pub flag: crate::decision::CurationFlag,
     pub scene_hint: SceneHintJson,
     pub scene_feedback: Option<SceneFeedbackRecord>,
 }
@@ -87,12 +92,33 @@ pub struct BurstJson {
 /// 一次 review 会话的完整数据
 #[derive(Debug, Clone, Serialize)]
 pub struct Snapshot {
+    pub version: u64,
+    pub session_id: String,
     pub root: String,
     pub source_mode: String,
     pub jpg_root: String,
     pub raw_root: Option<String>,
     pub weights: WeightsJson,
     pub photos: Vec<PhotoJson>,
+}
+
+static SNAPSHOT_VERSION_SEQ: OnceLock<AtomicU64> = OnceLock::new();
+
+pub fn next_snapshot_version() -> u64 {
+    let seq = SNAPSHOT_VERSION_SEQ.get_or_init(|| {
+        let mut bytes = [0u8; 8];
+        let _ = getrandom::fill(&mut bytes);
+        let base = (u64::from_le_bytes(bytes) & 0x0000_0FFF_FFFF_F000) | 0x1000;
+        AtomicU64::new(base)
+    });
+    seq.fetch_add(1, Ordering::AcqRel)
+}
+
+pub fn next_snapshot_session_id() -> String {
+    let mut bytes = [0u8; 16];
+    let _ = getrandom::fill(&mut bytes);
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    URL_SAFE_NO_PAD.encode(bytes)
 }
 
 impl Snapshot {
@@ -102,6 +128,8 @@ impl Snapshot {
 
     pub fn empty_for_source(source: &crate::workspace::WorkspaceSource, cfg: &ScoreConfig) -> Self {
         Self {
+            version: next_snapshot_version(),
+            session_id: next_snapshot_session_id(),
             root: source.display_label(),
             source_mode: source.mode_str().to_string(),
             jpg_root: source.jpg_root().display().to_string(),
@@ -208,9 +236,14 @@ pub fn build_snapshot_for_workspace(
 
     let mut photos: Vec<PhotoJson> = entries
         .iter()
-        .map(|e| {
+        .enumerate()
+        .map(|(index, e)| {
+            if index % 50 == 0 {
+                progress("校验照片身份", index, entries.len());
+            }
             let analyzed_result = analyzed.get(e.pair_id());
             let rel = source.photo_rel(e.is_raw, Path::new(&e.path));
+            let content_fingerprint = crate::decision::photo_fingerprint_for_source(source, e.is_raw, &rel).ok();
             let ai_mode = mode_by_pair.get(e.pair_id()) == Some(&true);
             PhotoJson {
                 path: rel.clone(),
@@ -219,6 +252,7 @@ pub fn build_snapshot_for_workspace(
                 is_raw: e.is_raw,
                 has_pair: e.has_pair,
                 pair_id: e.pair_id.clone(),
+                content_fingerprint,
                 datetime: e.date_time_original.clone(),
                 iso: e.iso.clone(),
                 f_number: e.f_number.clone(),
@@ -250,6 +284,7 @@ pub fn build_snapshot_for_workspace(
                     manual_keep: i.manual_keep,
                     pose_cluster: i.pose_cluster,
                 }),
+                flag: selection.flags.get(e.pair_id()).copied().unwrap_or_default(),
             }
         })
         .collect();
@@ -257,6 +292,8 @@ pub fn build_snapshot_for_workspace(
     progress("准备页面数据", entries.len(), entries.len());
 
     Ok(Snapshot {
+        version: next_snapshot_version(),
+        session_id: next_snapshot_session_id(),
         root: source.display_label(),
         source_mode: source.mode_str().to_string(),
         jpg_root: jpg_root.display().to_string(),

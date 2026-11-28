@@ -93,4 +93,23 @@ mod tests {
         assert_eq!(row.filename, entry.filename);
         assert_eq!(row.camera_model, entry.camera_model);
     }
+
+    #[test]
+    fn legacy_csv_without_curation_flag_column_deserializes_with_default() {
+        let legacy_csv = concat!(
+            "path,filename,extension,is_raw,has_pair,date_time_original,camera_make,camera_model,",
+            "lens_model,iso,f_number,shutter_speed,focal_length,sharpness_score,exposure_score,",
+            "noise_score,composition_score,aesthetic_score,total_score,suggested_ev,stars,",
+            "rating_source,faces,analysis_ok,analysis_mode,burst_group,burst_size,burst_rank,",
+            "burst_keep,burst_pose\n",
+            "a.jpg,a.jpg,jpg,false,false,,,,,,,,,,,,,,,,,,,,,,,,,\n"
+        );
+        let row: PhotoEntry = csv::Reader::from_reader(legacy_csv.as_bytes())
+            .deserialize()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.filename, "a.jpg");
+        assert_eq!(row.curation_flag, "");
+    }
 }

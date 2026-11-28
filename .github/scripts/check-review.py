@@ -75,9 +75,25 @@ def check(port, token, album, data_dir):
     session = json.loads(body)["session"]
     assert isinstance(session, str) and len(session) >= 32, "missing review session"
     _, body = request("/api/photos", 200, session=session)
-    photos = json.loads(body)["photos"]
+    initial_snap = json.loads(body)
+    photos = initial_snap["photos"]
+    initial_session = initial_snap["session_id"]
     assert len(photos) == 1 and photos[0]["path"] == "sample.jpg"
     assert photos[0]["scores"] is None
+    assert photos[0]["flag"] == "unflagged"
+
+    # Stale snapshot_session from another workspace/restart must be rejected with 409.
+    request("/api/flag", 409, data=b'{"p":"sample.jpg","flag":"pick","snapshot_session":"stale-session"}', session=session)
+    request("/api/rate", 409, data=b'{"p":"sample.jpg","stars":4,"snapshot_session":"stale-session"}', session=session)
+    request("/api/export/preview", 409, data=b'{"subdir":"Selected","filter":{},"snapshot_session":"stale-session"}', session=session)
+
+    # Unscored photo can be flagged and manually rated without touching the source album.
+    flag_payload = json.dumps({"p": "sample.jpg", "flag": "pick", "snapshot_session": initial_session}).encode()
+    _, body = request("/api/flag", 200, data=flag_payload, session=session)
+    assert json.loads(body)["flag"] == "pick"
+    rate_payload = json.dumps({"p": "sample.jpg", "stars": 4, "snapshot_session": initial_session}).encode()
+    _, body = request("/api/rate", 200, data=rate_payload, session=session)
+    assert json.loads(body)["stars"] == 4
 
     query = urlencode({"p": "sample.jpg"})
     for endpoint in ("/thumb", "/image"):
@@ -96,7 +112,44 @@ def check(port, token, album, data_dir):
     else:
         raise AssertionError("scoring did not finish")
     _, body = request("/api/photos", 200, session=session)
-    assert json.loads(body)["photos"][0]["scores"] is not None
+    snap = json.loads(body)
+    rescored = snap["photos"][0]
+    snap_version = snap["version"]
+    snap_session = snap["session_id"]
+    assert rescored["scores"] is not None
+    assert rescored["flag"] == "pick"
+    assert rescored["stars"] == 4 and rescored["rating_source"] == "manual"
+    stale_payload = json.dumps(
+        {
+            "filter": {"flag": "pick"},
+            "paths": ["sample.jpg"],
+            "snapshot_version": snap_version + 99,
+            "snapshot_session": snap_session,
+            "flag": "unflagged",
+        }
+    ).encode()
+    request("/api/flag/batch", 409, data=stale_payload, session=session)
+    stale_session_payload = json.dumps(
+        {
+            "filter": {"flag": "pick"},
+            "paths": ["sample.jpg"],
+            "snapshot_version": snap_version,
+            "snapshot_session": "stale-session",
+            "flag": "unflagged",
+        }
+    ).encode()
+    request("/api/flag/batch", 409, data=stale_session_payload, session=session)
+    valid_payload = json.dumps(
+        {
+            "filter": {"flag": "pick"},
+            "paths": ["sample.jpg"],
+            "snapshot_version": snap_version,
+            "snapshot_session": snap_session,
+            "flag": "unflagged",
+        }
+    ).encode()
+    _, body = request("/api/flag/batch", 200, data=valid_payload, session=session)
+    assert json.loads(body)["updated_count"] == 1
     assert not (album / ".firstcut").exists(), "source album must remain zero-write"
     reports = list(data_dir.glob("workspaces/*/report.csv"))
     assert len(reports) == 1 and reports[0].is_file(), "scoring report was not persisted in local data dir"
