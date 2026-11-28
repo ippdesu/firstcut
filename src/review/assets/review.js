@@ -497,8 +497,16 @@ function loadData(){
     if(!r.ok) throw new Error(r.status);
     return r.json();
   }).then(j=>{
+    const sessionChanged = Boolean(SNAPSHOT?.session_id && j?.session_id && j.session_id !== SNAPSHOT.session_id);
     const currentPath = LB?.current?.path || LB?.list?.[LB.idx]?.path;
     SNAPSHOT = j;
+    if(sessionChanged){
+      if(LB) closeLightbox();
+      clearFullImageCache();
+      ingest();
+      loadAppControls();
+      return true;
+    }
     ingest();
     if(currentPath){
       const list = visible();
@@ -883,6 +891,7 @@ async function batchSetFlag(targetFlag){
         filter: currentFilterPayload(),
         paths: matched.map(p => p.path),
         snapshot_version: SNAPSHOT?.version,
+        snapshot_session: SNAPSHOT?.session_id,
         flag: targetFlag
       })
     });

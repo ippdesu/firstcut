@@ -106,6 +106,7 @@ def check(port, token, album, data_dir):
     snap = json.loads(body)
     rescored = snap["photos"][0]
     snap_version = snap["version"]
+    snap_session = snap["session_id"]
     assert rescored["scores"] is not None
     assert rescored["flag"] == "pick"
     assert rescored["stars"] == 4 and rescored["rating_source"] == "manual"
@@ -114,15 +115,27 @@ def check(port, token, album, data_dir):
             "filter": {"flag": "pick"},
             "paths": ["sample.jpg"],
             "snapshot_version": snap_version + 99,
+            "snapshot_session": snap_session,
             "flag": "unflagged",
         }
     ).encode()
     request("/api/flag/batch", 409, data=stale_payload, session=session)
+    stale_session_payload = json.dumps(
+        {
+            "filter": {"flag": "pick"},
+            "paths": ["sample.jpg"],
+            "snapshot_version": snap_version,
+            "snapshot_session": "stale-session",
+            "flag": "unflagged",
+        }
+    ).encode()
+    request("/api/flag/batch", 409, data=stale_session_payload, session=session)
     valid_payload = json.dumps(
         {
             "filter": {"flag": "pick"},
             "paths": ["sample.jpg"],
             "snapshot_version": snap_version,
+            "snapshot_session": snap_session,
             "flag": "unflagged",
         }
     ).encode()

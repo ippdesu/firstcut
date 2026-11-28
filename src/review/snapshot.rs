@@ -5,6 +5,8 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
@@ -91,12 +93,32 @@ pub struct BurstJson {
 #[derive(Debug, Clone, Serialize)]
 pub struct Snapshot {
     pub version: u64,
+    pub session_id: String,
     pub root: String,
     pub source_mode: String,
     pub jpg_root: String,
     pub raw_root: Option<String>,
     pub weights: WeightsJson,
     pub photos: Vec<PhotoJson>,
+}
+
+static SNAPSHOT_VERSION_SEQ: OnceLock<AtomicU64> = OnceLock::new();
+
+pub fn next_snapshot_version() -> u64 {
+    let seq = SNAPSHOT_VERSION_SEQ.get_or_init(|| {
+        let mut bytes = [0u8; 8];
+        let _ = getrandom::fill(&mut bytes);
+        let base = (u64::from_le_bytes(bytes) & 0x0000_0FFF_FFFF_F000) | 0x1000;
+        AtomicU64::new(base)
+    });
+    seq.fetch_add(1, Ordering::AcqRel)
+}
+
+pub fn next_snapshot_session_id() -> String {
+    let mut bytes = [0u8; 16];
+    let _ = getrandom::fill(&mut bytes);
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    URL_SAFE_NO_PAD.encode(bytes)
 }
 
 impl Snapshot {
@@ -106,7 +128,8 @@ impl Snapshot {
 
     pub fn empty_for_source(source: &crate::workspace::WorkspaceSource, cfg: &ScoreConfig) -> Self {
         Self {
-            version: 1,
+            version: next_snapshot_version(),
+            session_id: next_snapshot_session_id(),
             root: source.display_label(),
             source_mode: source.mode_str().to_string(),
             jpg_root: source.jpg_root().display().to_string(),
@@ -269,7 +292,8 @@ pub fn build_snapshot_for_workspace(
     progress("准备页面数据", entries.len(), entries.len());
 
     Ok(Snapshot {
-        version: 1,
+        version: next_snapshot_version(),
+        session_id: next_snapshot_session_id(),
         root: source.display_label(),
         source_mode: source.mode_str().to_string(),
         jpg_root: jpg_root.display().to_string(),
