@@ -125,7 +125,7 @@ fn relative_key(root: &Path, photo: &Path) -> Result<String> {
     Ok(relative)
 }
 
-fn photo_fingerprint(root: &Path, rel_key: &str) -> Result<String> {
+pub(crate) fn photo_fingerprint(root: &Path, rel_key: &str) -> Result<String> {
     let mut file = FileRef::inside(root, &root.join(rel_key))
         .with_context(|| format!("无法安全打开照片文件以生成指纹: {rel_key}"))?
         .open_read()
@@ -135,6 +135,29 @@ fn photo_fingerprint(root: &Path, rel_key: &str) -> Result<String> {
         .metadata()
         .with_context(|| format!("读取照片元数据失败: {rel_key}"))?
         .len();
+    fingerprint_opened_file(&mut file, len, rel_key)
+}
+
+pub(crate) fn photo_fingerprint_for_source(
+    source: &crate::workspace::WorkspaceSource,
+    is_raw: bool,
+    rel_key: &str,
+) -> Result<String> {
+    let full = source.photo_full(is_raw, rel_key);
+    let mut file = source
+        .file_ref_for_photo(is_raw, &full)
+        .with_context(|| format!("无法安全打开照片文件以生成指纹: {rel_key}"))?
+        .open_read()
+        .with_context(|| format!("读取照片文件失败: {rel_key}"))?
+        .with_context(|| format!("照片文件不存在或不可读，无法生成内容指纹: {rel_key}"))?;
+    let len = file
+        .metadata()
+        .with_context(|| format!("读取照片元数据失败: {rel_key}"))?
+        .len();
+    fingerprint_opened_file(&mut file, len, rel_key)
+}
+
+fn fingerprint_opened_file<R: Read + Seek>(file: &mut R, len: u64, rel_key: &str) -> Result<String> {
     let mut hasher = Sha256::new();
     hasher.update(len.to_le_bytes());
     let mut buf = [0u8; FINGERPRINT_SLICE_BYTES];

@@ -493,7 +493,7 @@ async function boot(){
   return true;
 }
 function loadData(){
-  apiFetch("/api/photos").then(r=>{
+  return apiFetch("/api/photos", {cache:"no-store"}).then(r=>{
     if(!r.ok) throw new Error(r.status);
     return r.json();
   }).then(j=>{
@@ -506,7 +506,8 @@ function loadData(){
       if(idx < 0) closeLightbox();
       else { LB.list = list; LB.idx = idx; LB.current = list[idx]; renderLB(); }
     }
-  }).catch(()=>{});
+    return true;
+  }).catch(()=>false);
 }
 function rebuildGroupOptions(){
   const groupCounts = new Map();
@@ -807,6 +808,7 @@ async function setBurstKeep(photo, keep){
     const text = await response.text();
     if(!response.ok) throw new Error(text || response.statusText);
     const result = JSON.parse(text);
+    if(typeof result.snapshot_version === 'number' && SNAPSHOT) SNAPSHOT.version = result.snapshot_version;
     for(const item of jpgs){
       if(item.path === photo.path && item.burst){
         item.burst.keep = result.keep == null ? item.burst.suggested_keep : result.keep;
@@ -830,6 +832,7 @@ async function setPhotoFlag(photo, flag){
     const text = await response.text();
     if(!response.ok) throw new Error(text || response.statusText);
     const result = JSON.parse(text);
+    if(typeof result.snapshot_version === 'number' && SNAPSHOT) SNAPSHOT.version = result.snapshot_version;
     const nextFlag = result.flag || flag;
     const stem = photo.path.replace(/\.[^.]+$/,'').toLowerCase();
     for(const item of (SNAPSHOT?.photos || jpgs)){
@@ -876,11 +879,22 @@ async function batchSetFlag(targetFlag){
   try{
     const response = await apiFetch('/api/flag/batch', {
       method:'POST', headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({filter: currentFilterPayload(), flag: targetFlag})
+      body:JSON.stringify({
+        filter: currentFilterPayload(),
+        paths: matched.map(p => p.path),
+        snapshot_version: SNAPSHOT?.version,
+        flag: targetFlag
+      })
     });
     const text = await response.text();
+    if(response.status === 409){
+      await loadData();
+      toast(text || '筛选结果已在其他页面变化，已自动刷新，请核对后重新确认');
+      return;
+    }
     if(!response.ok) throw new Error(text || response.statusText);
     const result = JSON.parse(text);
+    if(typeof result.snapshot_version === 'number' && SNAPSHOT) SNAPSHOT.version = result.snapshot_version;
     const updatedSet = new Set(result.updated || []);
     const updatedStems = new Set([...updatedSet].map(p => p.replace(/\.[^.]+$/,'').toLowerCase()));
     for(const item of (SNAPSHOT?.photos || jpgs)){
@@ -1092,6 +1106,13 @@ function syncLBCurationBadges(){
     }
   });
 }
+function syncLBStripSelection(){
+  if(!LB || !LB.compare) return;
+  document.querySelectorAll("#strip .st").forEach(st=>{
+    const chk = st.querySelector('input[type="checkbox"]');
+    if(chk) chk.checked = LB.sel.has(st.dataset.path);
+  });
+}
 document.getElementById("lbFlagPick").addEventListener("click", ()=>{ const c = activePhoto(); if(c) setPhotoFlag(c, "pick"); });
 document.getElementById("lbFlagUnflag").addEventListener("click", ()=>{ const c = activePhoto(); if(c) setPhotoFlag(c, "unflagged"); });
 document.getElementById("lbFlagReject").addEventListener("click", ()=>{ const c = activePhoto(); if(c) setPhotoFlag(c, "reject"); });
@@ -1168,11 +1189,11 @@ function renderLB(){
       d.addEventListener("click", e=>{
         if(LB.compare && e.target.type === "checkbox"){
           if(e.target.checked){
-            if(LB.sel.size >= 4){ e.target.checked = false; return; }
+            if(LB.sel.size >= 4){ e.target.checked = false; toast('最多并排对比 4 张照片'); return; }
             LB.sel.add(m.path);
             LB.activePath = m.path;
           } else {
-            if(LB.sel.size <= 1){ e.target.checked = false; return; }
+            if(LB.sel.size <= 1){ e.target.checked = true; return; }
             LB.sel.delete(m.path);
             if(LB.activePath === m.path) LB.activePath = [...LB.sel][0];
           }
@@ -1194,6 +1215,7 @@ function renderLB(){
       thumbnail(d.querySelector('img'), m.path);
     }
   }
+  syncLBStripSelection();
   renderLBActive();
   syncLBCurationBadges();
   strip.querySelector('.st.cur')?.scrollIntoView({block:'nearest', inline:'nearest'});
@@ -1423,7 +1445,9 @@ async function saveSceneFeedback(photo){
     });
     const text = await response.text();
     if(!response.ok) throw new Error(text || response.statusText);
-    photo.scene_feedback = JSON.parse(text).record;
+    const saved = JSON.parse(text);
+    if(typeof saved.snapshot_version === 'number' && SNAPSHOT) SNAPSHOT.version = saved.snapshot_version;
+    photo.scene_feedback = saved.record;
     renderLBDetails();
     toast('场景记录已保存');
   }catch(error){ toast('场景记录保存失败：'+error.message); }
@@ -1901,9 +1925,14 @@ document.getElementById('exportStart').addEventListener('click', async ()=>{
       body: JSON.stringify(buildExportRequestPayload()),
     });
     if(!response.ok){
-      toast(await response.text() || `无法开始导出（${response.status}）`);
+      const reason = await response.text();
+      toast(reason || `无法开始导出（${response.status}）`);
+      if(response.status === 409){
+        exportPreviewData = null;
+        document.getElementById('exportPreviewBox').innerHTML = `<div class="err">${escapeHtml(reason || '照片已变化，请刷新工作区后再导出')}</div>`;
+      }
       syncExportStartButton();
-    updateCurationCounts();
+      updateCurationCounts();
       return;
     }
     document.getElementById('exportJobGroup').hidden = false;
@@ -1976,6 +2005,7 @@ function setStars(photo, n){
     let j = {};
     try { j = JSON.parse(text); } catch (_) {}
     if(r.ok && j.ok){
+      if(typeof j.snapshot_version === 'number' && SNAPSHOT) SNAPSHOT.version = j.snapshot_version;
       toast(j.warnings?.length ? `已保存 ${n} 星；${j.warnings.length} 个侧车未同步` : `已保存 ${n} 星`);
       // 本地数据同步（同 stem 共享星级）；不重建窗格 DOM，避免重拉原图与重算直方图
       const stem = photo.path.replace(/\.[^.]+$/,'').toLowerCase();

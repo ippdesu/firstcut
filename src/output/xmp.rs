@@ -296,15 +296,39 @@ pub fn merge_xmp_rating_only_for_export(
 
 fn update_external_xmp_rating(existing_content: &str, rating: u8) -> anyhow::Result<String> {
     use anyhow::{anyhow, Context};
-    use roxmltree::{Document, NodeType};
+    use roxmltree::{Document, Node, NodeType};
     let doc = Document::parse(existing_content).context("现有 XMP 无法解析")?;
     let mut output = existing_content.to_string();
 
-    if let Some(desc) = doc
+    let top_descriptions: Vec<Node<'_, '_>> = doc
         .descendants()
-        .find(|n| n.has_tag_name((NS_RDF, "Description"))
-            && (n.attributes().any(|a| a.namespace() == Some(NS_XMP) && a.name() == "Rating")
-                || n.children().any(|c| c.has_tag_name((NS_XMP, "Rating")))))
+        .find(|n| n.has_tag_name((NS_RDF, "RDF")))
+        .map(|rdf| {
+            rdf.children()
+                .filter(|n| n.has_tag_name((NS_RDF, "Description")))
+                .collect()
+        })
+        .filter(|list: &Vec<Node<'_, '_>>| !list.is_empty())
+        .unwrap_or_else(|| {
+            doc.descendants()
+                .filter(|n| n.has_tag_name((NS_RDF, "Description")))
+                .collect()
+        });
+
+    if let Some(desc) = top_descriptions
+        .iter()
+        .copied()
+        .find(|n| {
+            n.attributes().any(|a| a.namespace() == Some(NS_XMP) && a.name() == "Rating")
+                || n.children().any(|c| c.has_tag_name((NS_XMP, "Rating")))
+        })
+        .or_else(|| {
+            doc.descendants().find(|n| {
+                n.has_tag_name((NS_RDF, "Description"))
+                    && (n.attributes().any(|a| a.namespace() == Some(NS_XMP) && a.name() == "Rating")
+                        || n.children().any(|c| c.has_tag_name((NS_XMP, "Rating"))))
+            })
+        })
     {
         let mut edits: Vec<(std::ops::Range<usize>, String)> = Vec::new();
         if let Some(attr) = desc
@@ -318,11 +342,22 @@ fn update_external_xmp_rating(existing_content: &str, rating: u8) -> anyhow::Res
                 edits.push((text.range(), rating.to_string()));
             } else if child.children().next().is_none() {
                 let raw = &existing_content[child.range()];
-                let close = raw
-                    .rfind("</")
-                    .ok_or_else(|| anyhow!("XMP Rating 是空标签"))?;
-                let at = child.range().start + close;
-                edits.push((at..at, rating.to_string()));
+                if raw.trim_end().ends_with("/>") {
+                    let tag = raw
+                        .trim_start()
+                        .trim_start_matches('<')
+                        .split(|c: char| c.is_whitespace() || c == '/')
+                        .next()
+                        .filter(|s| !s.is_empty())
+                        .ok_or_else(|| anyhow!("XMP Rating 标签无效"))?;
+                    edits.push((child.range(), format!("<{tag}>{rating}</{tag}>")));
+                } else {
+                    let close = raw
+                        .rfind("</")
+                        .ok_or_else(|| anyhow!("XMP Rating 是空标签"))?;
+                    let at = child.range().start + close;
+                    edits.push((at..at, rating.to_string()));
+                }
             } else {
                 return Err(anyhow!("XMP Rating 不是纯文本字段"));
             }
@@ -335,25 +370,39 @@ fn update_external_xmp_rating(existing_content: &str, rating: u8) -> anyhow::Res
         return Ok(output);
     }
 
-    let primary = doc
-        .descendants()
-        .find(|n| n.has_tag_name((NS_RDF, "Description")))
+    let primary = top_descriptions
+        .first()
+        .copied()
+        .or_else(|| doc.descendants().find(|n| n.has_tag_name((NS_RDF, "Description"))))
         .ok_or_else(|| anyhow!("未找到 rdf:Description"))?;
-    let raw = &existing_content[primary.range()];
-    let close = raw
-        .rfind("</rdf:Description>")
-        .ok_or_else(|| anyhow!("无法定位 rdf:Description 结束标签"))?;
-    let has_xmp_ns = primary.lookup_prefix(NS_XMP).is_some();
-    let ns_attr = if has_xmp_ns {
-        ""
+    let (xmp_prefix, ns_decl) = if let Some(prefix) = primary.lookup_prefix(NS_XMP).filter(|p| !p.is_empty()) {
+        (prefix.to_string(), String::new())
     } else {
-        " xmlns:xmp=\"http://ns.adobe.com/xap/1.0/\""
+        if primary
+            .lookup_namespace_uri(Some("xmp"))
+            .is_some_and(|uri| uri != NS_XMP)
+        {
+            return Err(anyhow!("现有 xmp 前缀指向其他命名空间，已保护原文件"));
+        }
+        ("xmp".to_string(), format!(" xmlns:xmp=\"{NS_XMP}\""))
     };
-    let at = primary.range().start + close;
-    output.insert_str(
-        at,
-        &format!("    <xmp:Rating{ns_attr}>{rating}</xmp:Rating>\n  "),
-    );
+    let raw = &existing_content[primary.range()];
+    if raw.trim_end().ends_with("/>") {
+        let self_close = raw
+            .rfind("/>")
+            .ok_or_else(|| anyhow!("无法定位 rdf:Description 自闭合结束标记"))?;
+        let at = primary.range().start + self_close;
+        output.insert_str(at, &format!("{ns_decl} {xmp_prefix}:Rating=\"{rating}\""));
+    } else {
+        let close = raw
+            .rfind("</")
+            .ok_or_else(|| anyhow!("无法定位 rdf:Description 结束标签"))?;
+        let at = primary.range().start + close;
+        output.insert_str(
+            at,
+            &format!("    <{xmp_prefix}:Rating{ns_decl}>{rating}</{xmp_prefix}:Rating>\n  "),
+        );
+    }
     Document::parse(&output).context("合并后的 XMP 无效")?;
     Ok(output)
 }
@@ -911,5 +960,63 @@ mod tests {
         let merged = merge_xmp_rating_only_for_export(lr_xmp, 5).unwrap();
         assert!(merged.contains("xmp:Rating=\"5\""));
         assert!(merged.contains("crs:Exposure2012=\"+0.75\""));
+    }
+
+    #[test]
+    fn merge_xmp_rating_only_supports_self_closing_rdf_description_and_preserves_crs_exposure() {
+        let lr_without_rating = concat!(
+            "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">",
+            "<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">",
+            "<rdf:Description rdf:about=\"\" ",
+            "xmlns:crs=\"http://ns.adobe.com/camera-raw-settings/1.0/\" ",
+            "crs:Exposure2012=\"+0.75\"/>",
+            "</rdf:RDF></x:xmpmeta>",
+        );
+        let merged = merge_xmp_rating_only_for_export(lr_without_rating, 5).unwrap();
+        let doc = roxmltree::Document::parse(&merged).unwrap();
+        let desc = doc
+            .descendants()
+            .find(|n| n.has_tag_name((NS_RDF, "Description")))
+            .unwrap();
+        assert_eq!(desc.attribute((NS_XMP, "Rating")), Some("5"));
+        assert_eq!(desc.attribute((NS_CRS, "Exposure2012")), Some("+0.75"));
+
+        let lr_with_xmp_ns = concat!(
+            "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">",
+            "<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">",
+            "<rdf:Description rdf:about=\"\" ",
+            "xmlns:xmp=\"http://ns.adobe.com/xap/1.0/\" ",
+            "xmlns:crs=\"http://ns.adobe.com/camera-raw-settings/1.0/\" ",
+            "crs:Exposure2012=\"+0.75\"/>",
+            "</rdf:RDF></x:xmpmeta>",
+        );
+        let merged_ns = merge_xmp_rating_only_for_export(lr_with_xmp_ns, 5).unwrap();
+        assert_eq!(merged_ns.matches("xmlns:xmp=").count(), 1);
+        let doc_ns = roxmltree::Document::parse(&merged_ns).unwrap();
+        let desc_ns = doc_ns
+            .descendants()
+            .find(|n| n.has_tag_name((NS_RDF, "Description")))
+            .unwrap();
+        assert_eq!(desc_ns.attribute((NS_XMP, "Rating")), Some("5"));
+        assert_eq!(desc_ns.attribute((NS_CRS, "Exposure2012")), Some("+0.75"));
+
+        let empty_child_rating = concat!(
+            "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">",
+            "<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">",
+            "<rdf:Description rdf:about=\"\" ",
+            "xmlns:xmp=\"http://ns.adobe.com/xap/1.0/\" ",
+            "xmlns:crs=\"http://ns.adobe.com/camera-raw-settings/1.0/\" ",
+            "crs:Exposure2012=\"+0.75\">",
+            "<xmp:Rating/>",
+            "</rdf:Description>",
+            "</rdf:RDF></x:xmpmeta>",
+        );
+        let merged_empty = merge_xmp_rating_only_for_export(empty_child_rating, 5).unwrap();
+        let doc_empty = roxmltree::Document::parse(&merged_empty).unwrap();
+        let rating_node = doc_empty
+            .descendants()
+            .find(|n| n.has_tag_name((NS_XMP, "Rating")))
+            .unwrap();
+        assert_eq!(rating_node.text(), Some("5"));
     }
 }

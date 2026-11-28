@@ -25,6 +25,8 @@ pub struct PhotoJson {
     pub has_pair: bool,
     #[serde(skip)]
     pub pair_id: String,
+    #[serde(skip)]
+    pub content_fingerprint: Option<String>,
     pub datetime: String,
     pub iso: String,
     pub f_number: String,
@@ -88,6 +90,7 @@ pub struct BurstJson {
 /// 一次 review 会话的完整数据
 #[derive(Debug, Clone, Serialize)]
 pub struct Snapshot {
+    pub version: u64,
     pub root: String,
     pub source_mode: String,
     pub jpg_root: String,
@@ -103,6 +106,7 @@ impl Snapshot {
 
     pub fn empty_for_source(source: &crate::workspace::WorkspaceSource, cfg: &ScoreConfig) -> Self {
         Self {
+            version: 1,
             root: source.display_label(),
             source_mode: source.mode_str().to_string(),
             jpg_root: source.jpg_root().display().to_string(),
@@ -209,9 +213,14 @@ pub fn build_snapshot_for_workspace(
 
     let mut photos: Vec<PhotoJson> = entries
         .iter()
-        .map(|e| {
+        .enumerate()
+        .map(|(index, e)| {
+            if index % 50 == 0 {
+                progress("校验照片身份", index, entries.len());
+            }
             let analyzed_result = analyzed.get(e.pair_id());
             let rel = source.photo_rel(e.is_raw, Path::new(&e.path));
+            let content_fingerprint = crate::decision::photo_fingerprint_for_source(source, e.is_raw, &rel).ok();
             let ai_mode = mode_by_pair.get(e.pair_id()) == Some(&true);
             PhotoJson {
                 path: rel.clone(),
@@ -220,6 +229,7 @@ pub fn build_snapshot_for_workspace(
                 is_raw: e.is_raw,
                 has_pair: e.has_pair,
                 pair_id: e.pair_id.clone(),
+                content_fingerprint,
                 datetime: e.date_time_original.clone(),
                 iso: e.iso.clone(),
                 f_number: e.f_number.clone(),
@@ -259,6 +269,7 @@ pub fn build_snapshot_for_workspace(
     progress("准备页面数据", entries.len(), entries.len());
 
     Ok(Snapshot {
+        version: 1,
         root: source.display_label(),
         source_mode: source.mode_str().to_string(),
         jpg_root: jpg_root.display().to_string(),

@@ -103,11 +103,30 @@ def check(port, token, album, data_dir):
     else:
         raise AssertionError("scoring did not finish")
     _, body = request("/api/photos", 200, session=session)
-    rescored = json.loads(body)["photos"][0]
+    snap = json.loads(body)
+    rescored = snap["photos"][0]
+    snap_version = snap["version"]
     assert rescored["scores"] is not None
     assert rescored["flag"] == "pick"
     assert rescored["stars"] == 4 and rescored["rating_source"] == "manual"
-    _, body = request("/api/flag/batch", 200, data=b'{"filter":{"flag":"pick"},"flag":"unflagged"}', session=session)
+    stale_payload = json.dumps(
+        {
+            "filter": {"flag": "pick"},
+            "paths": ["sample.jpg"],
+            "snapshot_version": snap_version + 99,
+            "flag": "unflagged",
+        }
+    ).encode()
+    request("/api/flag/batch", 409, data=stale_payload, session=session)
+    valid_payload = json.dumps(
+        {
+            "filter": {"flag": "pick"},
+            "paths": ["sample.jpg"],
+            "snapshot_version": snap_version,
+            "flag": "unflagged",
+        }
+    ).encode()
+    _, body = request("/api/flag/batch", 200, data=valid_payload, session=session)
     assert json.loads(body)["updated_count"] == 1
     assert not (album / ".firstcut").exists(), "source album must remain zero-write"
     reports = list(data_dir.glob("workspaces/*/report.csv"))

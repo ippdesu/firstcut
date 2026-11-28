@@ -776,7 +776,7 @@ fn serve_once_workspace(
                     )
                 }));
                 match result {
-                    Ok(Ok(snapshot)) => *load_state.snapshot.write().unwrap() = snapshot,
+                    Ok(Ok(snapshot)) => replace_snapshot(&load_state.snapshot, snapshot),
                     Ok(Err(err)) => *load_state.load_error.lock().unwrap() = Some(format!("{err:#}")),
                     Err(_) => *load_state.load_error.lock().unwrap() =
                         Some("读取照片时发生内部错误；请重新选择目录或重启服务。".into()),
@@ -814,6 +814,10 @@ fn router(state: Arc<AppState>, access: Arc<access::Access>) -> Router {
     let session = Router::new()
         .route("/api/session", post(access::sign_in))
         .with_state(access.clone());
+    let batch_flag = Router::new()
+        .route("/api/flag/batch", post(set_flag_batch))
+        .layer(axum::extract::DefaultBodyLimit::max(2 * 1024 * 1024))
+        .with_state(Arc::clone(&state));
     Router::new()
         .route("/", get(index))
         .route("/review.js", get(review_js))
@@ -832,7 +836,6 @@ fn router(state: Arc<AppState>, access: Arc<access::Access>) -> Router {
         .route("/api/export/open", post(export_open))
         .route("/api/rate", post(rate))
         .route("/api/flag", post(set_flag))
-        .route("/api/flag/batch", post(set_flag_batch))
         .route("/api/burst/keep", post(burst_keep))
         .route("/api/scene-feedback", post(scene_feedback_save))
         .route("/api/config", get(config_get).post(config_save))
@@ -840,6 +843,7 @@ fn router(state: Arc<AppState>, access: Arc<access::Access>) -> Router {
         .route("/api/control", get(control_status).post(control_post))
         .layer(axum::extract::DefaultBodyLimit::max(64 * 1024))
         .with_state(state)
+        .merge(batch_flag)
         .merge(session.layer(axum::extract::DefaultBodyLimit::max(1024)))
         .layer(axum::middleware::from_fn_with_state(access, access::guard))
 }
@@ -1336,7 +1340,7 @@ async fn score_run(State(state): State<Arc<AppState>>,
                 match snapshot::build_snapshot_for_workspace(&source, &paths, &cfg, &cache_path,
                     &feedback, st.include_raw, true, &|_, _, _| {}) {
                     Ok(snap) => {
-                        *st.snapshot.write().unwrap() = snap;
+                        replace_snapshot(&st.snapshot, snap);
                         job.log("[review] 快照已刷新");
                     }
                     Err(err) => {
@@ -1543,12 +1547,98 @@ fn photo_matches_filter(
     true
 }
 
+fn replace_snapshot(slot: &RwLock<Snapshot>, mut next: Snapshot) {
+    let mut guard = slot.write().unwrap();
+    next.version = guard.version.saturating_add(1);
+    *guard = next;
+}
+
+#[derive(Clone)]
+struct ExpectedPhotoIdentity {
+    jpg_rel: String,
+    jpg_fp: Option<String>,
+    raw_rel: Option<String>,
+    raw_fp: Option<String>,
+}
+
+fn verify_export_identities(
+    source: &WorkspaceSource,
+    expected: &[ExpectedPhotoIdentity],
+    include_raw: bool,
+) -> std::result::Result<(), String> {
+    for item in expected {
+        if let Some(expected_fp) = item.jpg_fp.as_deref() {
+            let actual = crate::decision::photo_fingerprint_for_source(source, false, &item.jpg_rel)
+                .map_err(|_| {
+                    format!(
+                        "检测到源文件已变化或不可读（{}），当前快照已过期，请点击右上角「重启服务」或重新打开工作区后再导出",
+                        item.jpg_rel
+                    )
+                })?;
+            if actual != expected_fp {
+                return Err(format!(
+                    "检测到源文件已变化或被替换（{}），当前快照已过期，请点击右上角「重启服务」或重新打开工作区后再导出",
+                    item.jpg_rel
+                ));
+            }
+        }
+        if include_raw {
+            if let (Some(raw_rel), Some(expected_raw_fp)) =
+                (item.raw_rel.as_deref(), item.raw_fp.as_deref())
+            {
+                let actual_raw =
+                    crate::decision::photo_fingerprint_for_source(source, true, raw_rel).map_err(|_| {
+                        format!(
+                            "检测到配对 RAW 文件已变化或不可读（{}），当前快照已过期，请点击右上角「重启服务」或重新打开工作区后再导出",
+                            raw_rel
+                        )
+                    })?;
+                if actual_raw != expected_raw_fp {
+                    return Err(format!(
+                        "检测到配对 RAW 文件已变化或被替换（{}），当前快照已过期，请点击右上角「重启服务」或重新打开工作区后再导出",
+                        raw_rel
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn verify_jpg_identity_for_mutation(
+    source: &WorkspaceSource,
+    rel: &str,
+    expected_fp: Option<&str>,
+) -> std::result::Result<String, Response> {
+    let actual = crate::decision::photo_fingerprint_for_source(source, false, rel).map_err(|_| {
+        (
+            StatusCode::CONFLICT,
+            format!("检测到源文件已变化或不可读（{rel}），当前快照已过期，请重启服务或重新打开工作区后再操作"),
+        )
+            .into_response()
+    })?;
+    if let Some(expected) = expected_fp {
+        if actual != expected {
+            return Err((
+                StatusCode::CONFLICT,
+                format!("检测到源文件已变化或被替换（{rel}），当前快照已过期，请重启服务或重新打开工作区后再操作"),
+            )
+                .into_response());
+        }
+    }
+    Ok(actual)
+}
+
 fn build_export_items_from_snapshot(
     root: &Path,
     snap: &Snapshot,
     filter: &ExportFilterPayload,
     flag_filter: crate::export::FlagFilter,
-) -> (Vec<crate::export::ExportPhotoItem>, Vec<String>) {
+) -> (
+    Vec<crate::export::ExportPhotoItem>,
+    Vec<String>,
+    Vec<ExpectedPhotoIdentity>,
+) {
     let all_sources: Vec<String> = snap.photos.iter().map(|p| p.path.clone()).collect();
     let mut raw_by_pair: HashMap<&str, &snapshot::PhotoJson> = HashMap::new();
     for p in snap.photos.iter().filter(|p| p.is_raw) {
@@ -1556,12 +1646,20 @@ fn build_export_items_from_snapshot(
     }
 
     let mut items = Vec::new();
+    let mut identities = Vec::new();
     for photo in snap.photos.iter().filter(|p| !p.is_raw) {
         if !photo_matches_filter(photo, filter, flag_filter) {
             continue;
         }
 
-        let raw_rel = raw_by_pair.get(photo.pair_id.as_str()).map(|r| r.path.clone());
+        let paired_raw = raw_by_pair.get(photo.pair_id.as_str()).copied();
+        let raw_rel = paired_raw.map(|r| r.path.clone());
+        identities.push(ExpectedPhotoIdentity {
+            jpg_rel: photo.path.clone(),
+            jpg_fp: photo.content_fingerprint.clone(),
+            raw_rel: raw_rel.clone(),
+            raw_fp: paired_raw.and_then(|r| r.content_fingerprint.clone()),
+        });
         let xmp_meta = photo.scores.as_ref().map(|s| {
             let entry = crate::scan::PhotoEntry {
                 path: root.join(&photo.path).display().to_string(),
@@ -1619,7 +1717,7 @@ fn build_export_items_from_snapshot(
             manual_rating: if photo.scores.is_none() { photo.stars } else { None },
         });
     }
-    (items, all_sources)
+    (items, all_sources, identities)
 }
 
 /// POST /api/export/pick-folder：仅本机 Windows 桌面回环模式可用，调用系统原生目录弹窗授权导出目标。
@@ -1718,19 +1816,23 @@ async fn export_preview(
         Ok(o) => o,
         Err(resp) => return resp,
     };
-    let (items, all_sources) = {
+    let (items, all_sources, expected_identities) = {
         let guard = state.snapshot.read().unwrap();
         build_export_items_from_snapshot(&state.root, &guard, &req.filter, flag_filter)
     };
     let source = state.source.clone();
     match tokio::task::spawn_blocking(move || {
+        if let Err(msg) = verify_export_identities(&source, &expected_identities, opts.include_raw) {
+            return Err((StatusCode::CONFLICT, msg));
+        }
         crate::export::plan_export_workspace(&source, &items, &all_sources, &opts)
             .map(|plan| plan.preview)
+            .map_err(|err| (StatusCode::BAD_REQUEST, format!("{err:#}")))
     })
     .await
     {
         Ok(Ok(preview)) => json_response(serde_json::to_value(preview).unwrap_or_default()),
-        Ok(Err(err)) => (StatusCode::BAD_REQUEST, format!("{err:#}")).into_response(),
+        Ok(Err((status, msg))) => (status, msg).into_response(),
         Err(err) => internal_error(err.into()),
     }
 }
@@ -1754,7 +1856,7 @@ async fn export_run(
     let Some(cancel_flag) = state.job.begin_export() else {
         return (StatusCode::CONFLICT, "已有评分或导出任务在运行，请等待完成").into_response();
     };
-    let (items, all_sources) = {
+    let (items, all_sources, expected_identities) = {
         let guard = state.snapshot.read().unwrap();
         build_export_items_from_snapshot(&state.root, &guard, &req.filter, flag_filter)
     };
@@ -1763,12 +1865,36 @@ async fn export_run(
         return (StatusCode::BAD_REQUEST, "当前筛选条件下没有可导出的照片").into_response();
     }
 
+    let check_source = state.source.clone();
+    let check_identities = expected_identities.clone();
+    let include_raw_for_check = opts.include_raw;
+    match tokio::task::spawn_blocking(move || {
+        verify_export_identities(&check_source, &check_identities, include_raw_for_check)
+    })
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(msg)) => {
+            state.job.abort_start();
+            return (StatusCode::CONFLICT, msg).into_response();
+        }
+        Err(err) => {
+            state.job.abort_start();
+            return internal_error(err.into());
+        }
+    }
+
     let job = Arc::clone(&state.job);
     let source = state.source.clone();
     let paths = state.paths.clone();
     std::thread::spawn(move || {
         let started = std::time::Instant::now();
-        job.log("[export] 正在规划导出清单…");
+        job.log("[export] 正在校验源文件并规划导出清单…");
+        if let Err(msg) = verify_export_identities(&source, &expected_identities, opts.include_raw) {
+            job.log(format!("[export] {msg}"));
+            job.fail(msg);
+            return;
+        }
         let plan = match crate::export::plan_export_workspace(&source, &items, &all_sources, &opts) {
             Ok(p) => p,
             Err(err) => {
@@ -1922,7 +2048,7 @@ async fn burst_keep(State(state): State<Arc<AppState>>,
         state,
         "评分任务进行中或服务正在关闭，暂不能修改连拍标记",
         move |state| {
-            let (pair_id, jpg_path) = {
+            let (pair_id, rel_path, expected_fp) = {
                 let guard = state.snapshot.read().unwrap();
                 let Some(photo) = guard.photos.iter().find(|x| x.path == p.p && !x.is_raw) else {
                     return (StatusCode::NOT_FOUND, "照片不在快照中").into_response();
@@ -1930,8 +2056,21 @@ async fn burst_keep(State(state): State<Arc<AppState>>,
                 if !photo.burst.as_ref().is_some_and(|b| b.group > 0) {
                     return (StatusCode::BAD_REQUEST, "只有连拍组照片可以手动标记").into_response();
                 }
-                (photo.pair_id.clone(), state.root.join(&photo.path))
+                (
+                    photo.pair_id.clone(),
+                    photo.path.clone(),
+                    photo.content_fingerprint.clone(),
+                )
             };
+            let actual_fp = match verify_jpg_identity_for_mutation(
+                &state.source,
+                &rel_path,
+                expected_fp.as_deref(),
+            ) {
+                Ok(fp) => fp,
+                Err(resp) => return resp,
+            };
+            let jpg_path = state.root.join(&rel_path);
 
             if let Err(err) =
                 crate::decision::set_burst_keep_in(&state.paths.state_dir, &state.root, &jpg_path, p.keep)
@@ -1940,13 +2079,18 @@ async fn burst_keep(State(state): State<Arc<AppState>>,
             }
 
             let mut guard = state.snapshot.write().unwrap();
+            guard.version = guard.version.saturating_add(1);
+            let version = guard.version;
             for photo in guard.photos.iter_mut().filter(|x| x.pair_id == pair_id) {
+                if !photo.is_raw && photo.content_fingerprint.is_none() {
+                    photo.content_fingerprint = Some(actual_fp.clone());
+                }
                 if let Some(burst) = &mut photo.burst {
                     burst.keep = p.keep.unwrap_or(burst.suggested_keep);
                     burst.manual_keep = p.keep;
                 }
             }
-            json_response(serde_json::json!({"ok": true, "keep": p.keep}))
+            json_response(serde_json::json!({"ok": true, "keep": p.keep, "snapshot_version": version}))
         },
     )
     .await
@@ -1997,10 +2141,12 @@ async fn scene_feedback_save(State(state): State<Arc<AppState>>,
             }
             state.scene_feedback.write().unwrap().insert(record.photo_path.clone(), record.clone());
             let mut guard = state.snapshot.write().unwrap();
+            guard.version = guard.version.saturating_add(1);
+            let version = guard.version;
             if let Some(photo) = guard.photos.iter_mut().find(|x| x.path == record.photo_path) {
                 photo.scene_feedback = Some(record.clone());
             }
-            json_response(serde_json::json!({"ok": true, "record": record}))
+            json_response(serde_json::json!({"ok": true, "record": record, "snapshot_version": version}))
         },
     )
     .await
@@ -2015,7 +2161,11 @@ struct FlagParams {
 #[derive(Deserialize)]
 struct BatchFlagParams {
     #[serde(default)]
-    filter: ExportFilterPayload,
+    filter: Option<ExportFilterPayload>,
+    #[serde(default)]
+    paths: Option<Vec<String>>,
+    #[serde(default)]
+    snapshot_version: Option<u64>,
     flag: crate::decision::CurationFlag,
 }
 
@@ -2031,13 +2181,26 @@ async fn set_flag(
         state,
         "评分任务进行中或服务正在关闭，暂不能修改选片标记",
         move |state| {
-            let (pair_id, jpg_path) = {
+            let (pair_id, rel_path, expected_fp) = {
                 let guard = state.snapshot.read().unwrap();
                 let Some(photo) = guard.photos.iter().find(|x| x.path == p.p && !x.is_raw) else {
                     return (StatusCode::NOT_FOUND, "照片不在快照中").into_response();
                 };
-                (photo.pair_id.clone(), state.root.join(&photo.path))
+                (
+                    photo.pair_id.clone(),
+                    photo.path.clone(),
+                    photo.content_fingerprint.clone(),
+                )
             };
+            let actual_fp = match verify_jpg_identity_for_mutation(
+                &state.source,
+                &rel_path,
+                expected_fp.as_deref(),
+            ) {
+                Ok(fp) => fp,
+                Err(resp) => return resp,
+            };
+            let jpg_path = state.root.join(&rel_path);
             if let Err(err) = crate::decision::set_flag_in(
                 &state.paths.state_dir,
                 &state.root,
@@ -2047,20 +2210,26 @@ async fn set_flag(
                 return internal_error(err);
             }
             let mut guard = state.snapshot.write().unwrap();
+            guard.version = guard.version.saturating_add(1);
+            let version = guard.version;
             for photo in guard.photos.iter_mut().filter(|x| x.pair_id == pair_id) {
+                if !photo.is_raw && photo.content_fingerprint.is_none() {
+                    photo.content_fingerprint = Some(actual_fp.clone());
+                }
                 photo.flag = p.flag;
             }
             json_response(serde_json::json!({
                 "ok": true,
                 "path": p.p,
                 "flag": p.flag,
+                "snapshot_version": version,
             }))
         },
     )
     .await
 }
 
-/// POST /api/flag/batch：将当前筛选命中的全部照片（不受连拍聚合折叠影响）批量设为指定选片标记。
+/// POST /api/flag/batch：将用户确认的一批照片批量设为指定选片标记（校验快照版本与目标集合）。
 async fn set_flag_batch(
     State(state): State<Arc<AppState>>,
     axum::Json(req): axum::Json<BatchFlagParams>,
@@ -2068,24 +2237,93 @@ async fn set_flag_batch(
     if state.loading.load(Ordering::Acquire) {
         return (StatusCode::CONFLICT, "照片仍在加载，请稍后再批量标记").into_response();
     }
-    let Some(flag_filter) = crate::export::FlagFilter::parse(&req.filter.flag) else {
-        return (StatusCode::BAD_REQUEST, "无效的选片标记筛选条件").into_response();
+    if req.paths.is_none() && req.snapshot_version.is_none() {
+        return (StatusCode::BAD_REQUEST, "批量标记请求必须提供已确认的照片列表或快照版本")
+            .into_response();
+    }
+    let parsed_flag_filter = match &req.filter {
+        Some(filter) => match crate::export::FlagFilter::parse(&filter.flag) {
+            Some(parsed) => Some(parsed),
+            None => return (StatusCode::BAD_REQUEST, "无效的选片标记筛选条件").into_response(),
+        },
+        None => None,
     };
     run_serialized_mutation(
         state,
         "评分任务进行中或服务正在关闭，暂不能批量修改选片标记",
         move |state| {
-            let targets: Vec<(String, String, PathBuf)> = {
+            let targets: Vec<(String, String, PathBuf, Option<String>)> = {
                 let guard = state.snapshot.read().unwrap();
-                guard
-                    .photos
-                    .iter()
-                    .filter(|p| !p.is_raw && photo_matches_filter(p, &req.filter, flag_filter))
-                    .map(|p| (p.path.clone(), p.pair_id.clone(), state.root.join(&p.path)))
-                    .collect()
+                if req.snapshot_version.is_some_and(|v| v != guard.version) {
+                    return (
+                        StatusCode::CONFLICT,
+                        "照片状态已在其他标签页或任务中变化，请刷新列表后重新确认",
+                    )
+                        .into_response();
+                }
+                if let (Some(filter), Some(flag_filter)) = (&req.filter, parsed_flag_filter) {
+                    let matched: Vec<(String, String, PathBuf, Option<String>)> = guard
+                        .photos
+                        .iter()
+                        .filter(|p| !p.is_raw && photo_matches_filter(p, filter, flag_filter))
+                        .map(|p| {
+                            (
+                                p.path.clone(),
+                                p.pair_id.clone(),
+                                state.root.join(&p.path),
+                                p.content_fingerprint.clone(),
+                            )
+                        })
+                        .collect();
+                    if let Some(req_paths) = &req.paths {
+                        let req_set: std::collections::HashSet<&str> =
+                            req_paths.iter().map(String::as_str).collect();
+                        let matched_set: std::collections::HashSet<&str> =
+                            matched.iter().map(|(path, _, _, _)| path.as_str()).collect();
+                        if req_set.len() != req_paths.len() || req_set != matched_set {
+                            return (
+                                StatusCode::CONFLICT,
+                                "当前筛选命中的照片已变化，请刷新列表后重新确认",
+                            )
+                                .into_response();
+                        }
+                    }
+                    matched
+                } else if let Some(req_paths) = &req.paths {
+                    let by_path: HashMap<&str, &snapshot::PhotoJson> = guard
+                        .photos
+                        .iter()
+                        .filter(|p| !p.is_raw)
+                        .map(|p| (p.path.as_str(), p))
+                        .collect();
+                    let mut seen = std::collections::HashSet::with_capacity(req_paths.len());
+                    let mut selected = Vec::with_capacity(req_paths.len());
+                    for path in req_paths {
+                        if !seen.insert(path.as_str()) {
+                            continue;
+                        }
+                        let Some(photo) = by_path.get(path.as_str()).copied() else {
+                            return (
+                                StatusCode::CONFLICT,
+                                "所选照片已不在当前快照中，请刷新后重新确认",
+                            )
+                                .into_response();
+                        };
+                        selected.push((
+                            photo.path.clone(),
+                            photo.pair_id.clone(),
+                            state.root.join(&photo.path),
+                            photo.content_fingerprint.clone(),
+                        ));
+                    }
+                    selected
+                } else {
+                    Vec::new()
+                }
             };
             let matched_count = targets.len();
             if targets.is_empty() {
+                let version = state.snapshot.read().unwrap().version;
                 return json_response(serde_json::json!({
                     "ok": true,
                     "flag": req.flag,
@@ -2093,9 +2331,22 @@ async fn set_flag_batch(
                     "updated_count": 0,
                     "failed_count": 0,
                     "updated": [],
+                    "snapshot_version": version,
                 }));
             }
-            let jpg_paths: Vec<PathBuf> = targets.iter().map(|(_, _, full)| full.clone()).collect();
+            let mut verified_fps: HashMap<String, String> = HashMap::with_capacity(targets.len());
+            for (rel, _, _, expected_fp) in &targets {
+                let actual_fp = match verify_jpg_identity_for_mutation(
+                    &state.source,
+                    rel,
+                    expected_fp.as_deref(),
+                ) {
+                    Ok(fp) => fp,
+                    Err(resp) => return resp,
+                };
+                verified_fps.insert(rel.clone(), actual_fp);
+            }
+            let jpg_paths: Vec<PathBuf> = targets.iter().map(|(_, _, full, _)| full.clone()).collect();
             let outcome = match crate::decision::set_flags_batch_in(
                 &state.paths.state_dir,
                 &state.root,
@@ -2109,15 +2360,22 @@ async fn set_flag_batch(
                 outcome.updated.iter().map(String::as_str).collect();
             let updated_pairs: std::collections::HashSet<String> = targets
                 .iter()
-                .filter(|(rel, _, _)| updated_set.contains(rel.as_str()))
-                .map(|(_, pair_id, _)| pair_id.clone())
+                .filter(|(rel, _, _, _)| updated_set.contains(rel.as_str()))
+                .map(|(_, pair_id, _, _)| pair_id.clone())
                 .collect();
             let mut guard = state.snapshot.write().unwrap();
+            guard.version = guard.version.saturating_add(1);
+            let version = guard.version;
             for photo in guard
                 .photos
                 .iter_mut()
                 .filter(|x| updated_pairs.contains(&x.pair_id))
             {
+                if !photo.is_raw && photo.content_fingerprint.is_none() {
+                    if let Some(fp) = verified_fps.get(&photo.path) {
+                        photo.content_fingerprint = Some(fp.clone());
+                    }
+                }
                 photo.flag = req.flag;
             }
             json_response(serde_json::json!({
@@ -2127,6 +2385,7 @@ async fn set_flag_batch(
                 "updated_count": outcome.updated.len(),
                 "failed_count": outcome.failed.len(),
                 "updated": outcome.updated,
+                "snapshot_version": version,
             }))
         },
     )
@@ -2146,23 +2405,46 @@ async fn rate(State(state): State<Arc<AppState>>,
         state,
         "评分任务进行中或服务正在关闭，暂不能改星",
         move |state| {
-            let (pair_id, jpg_path) = {
+            let (pair_id, rel_path, expected_fp) = {
                 let guard = state.snapshot.read().unwrap();
                 let Some(photo) = guard.photos.iter().find(|x| x.path == p.p && !x.is_raw) else {
                     return (StatusCode::NOT_FOUND, "照片不在快照中").into_response();
                 };
-                (photo.pair_id.clone(), state.root.join(&photo.path))
+                (
+                    photo.pair_id.clone(),
+                    photo.path.clone(),
+                    photo.content_fingerprint.clone(),
+                )
             };
+            let actual_fp = match verify_jpg_identity_for_mutation(
+                &state.source,
+                &rel_path,
+                expected_fp.as_deref(),
+            ) {
+                Ok(fp) => fp,
+                Err(resp) => return resp,
+            };
+            let jpg_path = state.root.join(&rel_path);
             if let Err(err) = crate::decision::set_in(&state.paths.state_dir, &state.root, &jpg_path, p.stars) {
                 return internal_error(err);
             }
             let mut guard = state.snapshot.write().unwrap();
+            guard.version = guard.version.saturating_add(1);
+            let version = guard.version;
             for photo in guard.photos.iter_mut().filter(|x| x.pair_id == pair_id) {
+                if !photo.is_raw && photo.content_fingerprint.is_none() {
+                    photo.content_fingerprint = Some(actual_fp.clone());
+                }
                 photo.stars = Some(p.stars);
                 photo.rating_source = Some("manual".into());
             }
             let warnings: Vec<String> = Vec::new();
-            json_response(serde_json::json!({ "ok": true, "stars": p.stars, "warnings": warnings }))
+            json_response(serde_json::json!({
+                "ok": true,
+                "stars": p.stars,
+                "warnings": warnings,
+                "snapshot_version": version,
+            }))
         },
     )
     .await
@@ -2441,7 +2723,7 @@ mod tests {
         std::fs::write(dir.join("scene/a.jpg"), b"dummy-a").unwrap();
         let photo = snapshot::PhotoJson {
             path: "scene/a.jpg".into(), filename: "a.jpg".into(), ext: "jpg".into(),
-            is_raw: false, has_pair: false, pair_id: "a".into(), datetime: String::new(),
+            is_raw: false, has_pair: false, pair_id: "a".into(), content_fingerprint: None, datetime: String::new(),
             iso: String::new(), f_number: String::new(), shutter: String::new(), focal: String::new(),
             scores: None, stars: None, rating_source: None, analysis_mode: None, faces: 0,
             scene_hint: snapshot::SceneHintJson { id: "unknown", label: "未识别", reason: String::new() },
@@ -2458,6 +2740,7 @@ mod tests {
             scene_feedback: RwLock::new(HashMap::new()), scene_feedback_path: scene_feedback::store_path(&dir),
             image_slots: Arc::new(Semaphore::new(2)), thumb_slots: Arc::new(Semaphore::new(1)),
             snapshot: RwLock::new(Snapshot {
+                version: 1,
                 root: dir.display().to_string(),
                 source_mode: "single".into(),
                 jpg_root: dir.display().to_string(),
@@ -2510,7 +2793,7 @@ mod tests {
         let feedback_path = scene_feedback::store_path(&dir);
         let photo = snapshot::PhotoJson {
             path: "a.jpg".into(), filename: "a.jpg".into(), ext: "jpg".into(),
-            is_raw: false, has_pair: false, pair_id: "a".into(), datetime: String::new(),
+            is_raw: false, has_pair: false, pair_id: "a".into(), content_fingerprint: None, datetime: String::new(),
             iso: String::new(), f_number: String::new(), shutter: String::new(), focal: String::new(),
             scores: Some(snapshot::ScoresJson { sharpness: 40.0, exposure: 60.0, noise: 80.0,
                 composition: 50.0, aesthetic: 70.0, total: 57.5, suggested_ev: None }),
@@ -2527,6 +2810,7 @@ mod tests {
             scene_feedback: RwLock::new(HashMap::new()), scene_feedback_path: feedback_path.clone(),
             image_slots: Arc::new(Semaphore::new(2)), thumb_slots: Arc::new(Semaphore::new(1)),
             snapshot: RwLock::new(Snapshot {
+                version: 1,
                 root: dir.display().to_string(),
                 source_mode: "single".into(),
                 jpg_root: dir.display().to_string(),
@@ -2573,7 +2857,7 @@ mod tests {
         std::fs::write(dir.join("a.jpg"), b"jpg").unwrap();
         let photo = snapshot::PhotoJson {
             path: "a.jpg".into(), filename: "a.jpg".into(), ext: "jpg".into(),
-            is_raw: false, has_pair: false, pair_id: "a".into(), datetime: String::new(),
+            is_raw: false, has_pair: false, pair_id: "a".into(), content_fingerprint: None, datetime: String::new(),
             iso: String::new(), f_number: String::new(), shutter: String::new(), focal: String::new(),
             scores: Some(snapshot::ScoresJson { sharpness: 70.0, exposure: 75.0, noise: 80.0,
                 composition: 60.0, aesthetic: 65.0, total: 70.5, suggested_ev: Some(0.33) }),
@@ -2592,6 +2876,7 @@ mod tests {
             scene_feedback: RwLock::new(HashMap::new()), scene_feedback_path: scene_feedback::store_path(&dir),
             image_slots: Arc::new(Semaphore::new(2)), thumb_slots: Arc::new(Semaphore::new(1)),
             snapshot: RwLock::new(Snapshot {
+                version: 1,
                 root: dir.display().to_string(),
                 source_mode: "single".into(),
                 jpg_root: dir.display().to_string(),
@@ -2659,7 +2944,7 @@ mod tests {
         std::fs::write(dir.join("a.xmp"), original_xmp).unwrap();
         let photo = snapshot::PhotoJson {
             path: "a.jpg".into(), filename: "a.jpg".into(), ext: "jpg".into(),
-            is_raw: false, has_pair: false, pair_id: "a".into(), datetime: String::new(),
+            is_raw: false, has_pair: false, pair_id: "a".into(), content_fingerprint: None, datetime: String::new(),
             iso: String::new(), f_number: String::new(), shutter: String::new(), focal: String::new(),
             scores: Some(snapshot::ScoresJson { sharpness: 70.0, exposure: 75.0, noise: 80.0,
                 composition: 60.0, aesthetic: 65.0, total: 70.5, suggested_ev: Some(0.33) }),
@@ -2678,6 +2963,7 @@ mod tests {
             scene_feedback: RwLock::new(HashMap::new()), scene_feedback_path: scene_feedback::store_path(&dir),
             image_slots: Arc::new(Semaphore::new(2)), thumb_slots: Arc::new(Semaphore::new(1)),
             snapshot: RwLock::new(Snapshot {
+                version: 1,
                 root: dir.display().to_string(),
                 source_mode: "single".into(),
                 jpg_root: dir.display().to_string(),
@@ -2705,7 +2991,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(dir.join("a.xmp")).unwrap(), original_xmp);
 
         // 导出时在内存中合并最新 5★ 到目标 XMP，同时保留原有 Lightroom 曝光
-        let (items, all_sources) = {
+        let (items, all_sources, _) = {
             let guard = state.snapshot.read().unwrap();
             build_export_items_from_snapshot(&state.root, &guard, &ExportFilterPayload::default(), crate::export::FlagFilter::All)
         };
@@ -2731,7 +3017,7 @@ mod tests {
         std::fs::write(dir.join("scene/b.jpg"), b"dummy-b").unwrap();
         let make_photo = |name: &str, pair: &str| snapshot::PhotoJson {
             path: format!("scene/{name}"), filename: name.into(), ext: "jpg".into(),
-            is_raw: false, has_pair: false, pair_id: pair.into(), datetime: String::new(),
+            is_raw: false, has_pair: false, pair_id: pair.into(), content_fingerprint: None, datetime: String::new(),
             iso: String::new(), f_number: String::new(), shutter: String::new(), focal: String::new(),
             scores: None, stars: None, rating_source: None, analysis_mode: None, faces: 0,
             scene_hint: snapshot::SceneHintJson { id: "unknown", label: "未识别", reason: String::new() },
@@ -2749,6 +3035,7 @@ mod tests {
             scene_feedback: RwLock::new(HashMap::new()), scene_feedback_path: scene_feedback::store_path(&dir),
             image_slots: Arc::new(Semaphore::new(2)), thumb_slots: Arc::new(Semaphore::new(1)),
             snapshot: RwLock::new(Snapshot {
+                version: 1,
                 root: dir.display().to_string(),
                 source_mode: "single".into(),
                 jpg_root: dir.display().to_string(),
@@ -2845,7 +3132,7 @@ mod tests {
 
         let make_photo = |rel: &str, name: &str, ext: &str, is_raw: bool, pair: &str, stars: u8, burst: Option<snapshot::BurstJson>| snapshot::PhotoJson {
             path: rel.into(), filename: name.into(), ext: ext.into(), is_raw, has_pair: true,
-            pair_id: pair.into(), datetime: String::new(), iso: String::new(), f_number: String::new(),
+            pair_id: pair.into(), content_fingerprint: None, datetime: String::new(), iso: String::new(), f_number: String::new(),
             shutter: String::new(), focal: String::new(),
             scores: Some(snapshot::ScoresJson {
                 sharpness: 80.0, exposure: 80.0, noise: 80.0, composition: 80.0, aesthetic: 80.0,
@@ -2884,6 +3171,7 @@ mod tests {
             scene_feedback: RwLock::new(HashMap::new()), scene_feedback_path: scene_feedback::store_path(&dir),
             image_slots: Arc::new(Semaphore::new(2)), thumb_slots: Arc::new(Semaphore::new(1)),
             snapshot: RwLock::new(Snapshot {
+                version: 1,
                 root: dir.display().to_string(),
                 source_mode: "single".into(),
                 jpg_root: dir.display().to_string(),
@@ -2985,6 +3273,7 @@ mod tests {
             image_slots: Arc::new(Semaphore::new(2)),
             thumb_slots: Arc::new(Semaphore::new(1)),
             snapshot: RwLock::new(Snapshot {
+                version: 1,
                 root: dir.display().to_string(),
                 source_mode: "single".into(),
                 jpg_root: dir.display().to_string(),
@@ -3003,6 +3292,7 @@ mod tests {
                     is_raw: false,
                     has_pair: false,
                     pair_id: "only".into(),
+                    content_fingerprint: None,
                     datetime: String::new(),
                     iso: String::new(),
                     f_number: String::new(),
@@ -3156,6 +3446,7 @@ mod tests {
             is_raw,
             has_pair: true,
             pair_id: pair.into(),
+            content_fingerprint: None,
             datetime: String::new(),
             iso: String::new(),
             f_number: String::new(),
@@ -3188,6 +3479,7 @@ mod tests {
             image_slots: Arc::new(Semaphore::new(2)),
             thumb_slots: Arc::new(Semaphore::new(1)),
             snapshot: RwLock::new(Snapshot {
+                version: 1,
                 root: dir.display().to_string(),
                 source_mode: "single".into(),
                 jpg_root: dir.display().to_string(),
@@ -3246,6 +3538,8 @@ mod tests {
         // 2) 按筛选批量将 5★ 照片设为留用（仅命中 JPG/a.jpg，同步到配对 RAW）
         let batch_req: BatchFlagParams = serde_json::from_value(serde_json::json!({
             "filter": { "stars": [5] },
+            "paths": ["JPG/a.jpg"],
+            "snapshot_version": 3,
             "flag": "pick"
         }))
         .unwrap();
@@ -3279,5 +3573,326 @@ mod tests {
         assert_eq!(preview_json["selected_photos"], 1);
         assert_eq!(preview_json["xmp_to_write"], 2);
         assert!(!dir.join(".firstcut").exists(), "源目录必须保持零写入");
+    }
+
+    #[tokio::test]
+    async fn export_preview_and_run_reject_replaced_picked_photo_with_conflict() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("album");
+        let state_dir = temp.path().join("local_state");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("sample.jpg"), b"photo-card-a-bytes").unwrap();
+
+        let source = WorkspaceSource::single(&dir).unwrap();
+        let paths = WorkspacePaths::in_state_dir(state_dir);
+        paths.ensure_state_dir().unwrap();
+        let cfg = ScoreConfig::default();
+        let snap = snapshot::build_snapshot_for_workspace(
+            &source,
+            &paths,
+            &cfg,
+            &paths.cache,
+            &HashMap::new(),
+            true,
+            true,
+            &|_, _, _| {},
+        )
+        .unwrap();
+        assert_eq!(snap.photos.len(), 1);
+        assert!(snap.photos[0].content_fingerprint.is_some());
+
+        let state = Arc::new(AppState {
+            source,
+            paths: paths.clone(),
+            root: dir.clone(),
+            cache_path: paths.cache.clone(),
+            config_path: paths.config.clone(),
+            config_explicit: false,
+            scene_feedback: RwLock::new(HashMap::new()),
+            scene_feedback_path: paths.scene_feedback.clone(),
+            image_slots: Arc::new(Semaphore::new(2)),
+            thumb_slots: Arc::new(Semaphore::new(1)),
+            snapshot: RwLock::new(snap),
+            job: Arc::new(JobState::new()),
+            write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            loading: AtomicBool::new(false),
+            load_error: Mutex::new(None),
+            load_progress: Mutex::new(LoadProgress {
+                phase: String::new(),
+                done: 0,
+                total: 0,
+            }),
+            include_raw: true,
+            local_desktop: false,
+            approved_export_dirs: Mutex::new(Vec::new()),
+            last_export_target: None,
+            control: None,
+        });
+
+        let flag_resp = set_flag(
+            State(Arc::clone(&state)),
+            axum::Json(FlagParams {
+                p: "sample.jpg".into(),
+                flag: crate::decision::CurationFlag::Pick,
+            }),
+        )
+        .await;
+        assert_eq!(flag_resp.status(), StatusCode::OK);
+
+        // 在同一挂载路径用同长度但不同内容的另一张照片替换 sample.jpg
+        std::fs::write(dir.join("sample.jpg"), b"photo-card-b-bytes").unwrap();
+
+        let preview_req: ExportRequest = serde_json::from_value(serde_json::json!({
+            "subdir": "Selected",
+            "filter": { "flag": "pick" }
+        }))
+        .unwrap();
+        let preview_resp = export_preview(State(Arc::clone(&state)), axum::Json(preview_req)).await;
+        assert_eq!(preview_resp.status(), StatusCode::CONFLICT);
+        let preview_msg = String::from_utf8(
+            axum::body::to_bytes(preview_resp.into_body(), 16 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(preview_msg.contains("重启服务") || preview_msg.contains("重新打开工作区"));
+
+        let run_req: ExportRequest = serde_json::from_value(serde_json::json!({
+            "subdir": "Selected",
+            "filter": { "flag": "pick" }
+        }))
+        .unwrap();
+        let run_resp = export_run(State(Arc::clone(&state)), axum::Json(run_req)).await;
+        assert_eq!(run_resp.status(), StatusCode::CONFLICT);
+        assert!(!dir.join("Selected").exists(), "源文件已被替换时不得导出任何文件");
+    }
+
+    #[tokio::test]
+    async fn batch_flag_rejects_stale_tab_when_filtered_targets_swap_with_same_count() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("album");
+        let state_dir = temp.path().join("local_state");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.jpg"), b"jpg-a").unwrap();
+        std::fs::write(dir.join("b.jpg"), b"jpg-b").unwrap();
+
+        let source = WorkspaceSource::single(&dir).unwrap();
+        let paths = WorkspacePaths::in_state_dir(state_dir);
+        paths.ensure_state_dir().unwrap();
+        let cfg = ScoreConfig::default();
+        let snap = snapshot::build_snapshot_for_workspace(
+            &source,
+            &paths,
+            &cfg,
+            &paths.cache,
+            &HashMap::new(),
+            true,
+            true,
+            &|_, _, _| {},
+        )
+        .unwrap();
+        let state = Arc::new(AppState {
+            source,
+            paths: paths.clone(),
+            root: dir.clone(),
+            cache_path: paths.cache.clone(),
+            config_path: paths.config.clone(),
+            config_explicit: false,
+            scene_feedback: RwLock::new(HashMap::new()),
+            scene_feedback_path: paths.scene_feedback.clone(),
+            image_slots: Arc::new(Semaphore::new(2)),
+            thumb_slots: Arc::new(Semaphore::new(1)),
+            snapshot: RwLock::new(snap),
+            job: Arc::new(JobState::new()),
+            write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            loading: AtomicBool::new(false),
+            load_error: Mutex::new(None),
+            load_progress: Mutex::new(LoadProgress {
+                phase: String::new(),
+                done: 0,
+                total: 0,
+            }),
+            include_raw: true,
+            local_desktop: false,
+            approved_export_dirs: Mutex::new(Vec::new()),
+            last_export_target: None,
+            control: None,
+        });
+
+        // 初始：a.jpg 为剔除（页签 1 看到 reject=[a.jpg]）
+        assert_eq!(
+            set_flag(
+                State(Arc::clone(&state)),
+                axum::Json(FlagParams {
+                    p: "a.jpg".into(),
+                    flag: crate::decision::CurationFlag::Reject,
+                }),
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        let tab1_version = state.snapshot.read().unwrap().version;
+
+        // 页签 2：清除 a.jpg 标记，改为剔除 b.jpg（reject 命中数仍为 1 张）
+        assert_eq!(
+            set_flag(
+                State(Arc::clone(&state)),
+                axum::Json(FlagParams {
+                    p: "a.jpg".into(),
+                    flag: crate::decision::CurationFlag::Unflagged,
+                }),
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            set_flag(
+                State(Arc::clone(&state)),
+                axum::Json(FlagParams {
+                    p: "b.jpg".into(),
+                    flag: crate::decision::CurationFlag::Reject,
+                }),
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+
+        // 页签 1 携带旧快照版本与旧路径集合提交批量留用，必须返回 409
+        let stale_with_version: BatchFlagParams = serde_json::from_value(serde_json::json!({
+            "filter": { "flag": "reject" },
+            "paths": ["a.jpg"],
+            "snapshot_version": tab1_version,
+            "flag": "pick"
+        }))
+        .unwrap();
+        assert_eq!(
+            set_flag_batch(State(Arc::clone(&state)), axum::Json(stale_with_version))
+                .await
+                .status(),
+            StatusCode::CONFLICT
+        );
+
+        // 即使不传 snapshot_version，只要提交了确认的 paths=["a.jpg"]，也因目标集合已变而返回 409
+        let stale_paths_only: BatchFlagParams = serde_json::from_value(serde_json::json!({
+            "filter": { "flag": "reject" },
+            "paths": ["a.jpg"],
+            "flag": "pick"
+        }))
+        .unwrap();
+        assert_eq!(
+            set_flag_batch(State(Arc::clone(&state)), axum::Json(stale_paths_only))
+                .await
+                .status(),
+            StatusCode::CONFLICT
+        );
+
+        let guard = state.snapshot.read().unwrap();
+        assert_eq!(guard.photos[0].flag, crate::decision::CurationFlag::Unflagged);
+        assert_eq!(guard.photos[1].flag, crate::decision::CurationFlag::Reject);
+    }
+
+    #[tokio::test]
+    async fn web_export_merges_manual_rating_into_self_closing_external_xmp_preserving_crs_exposure() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("album");
+        let state_dir = temp.path().join("local_state");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.jpg"), b"jpg-unscored").unwrap();
+        let external_xmp = concat!(
+            "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">",
+            "<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">",
+            "<rdf:Description rdf:about=\"\" ",
+            "xmlns:crs=\"http://ns.adobe.com/camera-raw-settings/1.0/\" ",
+            "crs:Exposure2012=\"+0.75\"/>",
+            "</rdf:RDF></x:xmpmeta>",
+        );
+        std::fs::write(dir.join("a.xmp"), external_xmp).unwrap();
+
+        let source = WorkspaceSource::single(&dir).unwrap();
+        let paths = WorkspacePaths::in_state_dir(state_dir);
+        paths.ensure_state_dir().unwrap();
+        let snap = snapshot::build_snapshot_for_workspace(
+            &source,
+            &paths,
+            &ScoreConfig::default(),
+            &paths.cache,
+            &HashMap::new(),
+            true,
+            true,
+            &|_, _, _| {},
+        )
+        .unwrap();
+        let state = Arc::new(AppState {
+            source,
+            paths: paths.clone(),
+            root: dir.clone(),
+            cache_path: paths.cache.clone(),
+            config_path: paths.config.clone(),
+            config_explicit: false,
+            scene_feedback: RwLock::new(HashMap::new()),
+            scene_feedback_path: paths.scene_feedback.clone(),
+            image_slots: Arc::new(Semaphore::new(2)),
+            thumb_slots: Arc::new(Semaphore::new(1)),
+            snapshot: RwLock::new(snap),
+            job: Arc::new(JobState::new()),
+            write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            loading: AtomicBool::new(false),
+            load_error: Mutex::new(None),
+            load_progress: Mutex::new(LoadProgress {
+                phase: String::new(),
+                done: 0,
+                total: 0,
+            }),
+            include_raw: true,
+            local_desktop: false,
+            approved_export_dirs: Mutex::new(Vec::new()),
+            last_export_target: None,
+            control: None,
+        });
+
+        let rate_resp = rate(
+            State(Arc::clone(&state)),
+            axum::Json(RateParams {
+                p: "a.jpg".into(),
+                stars: 5,
+            }),
+        )
+        .await;
+        assert_eq!(rate_resp.status(), StatusCode::OK);
+
+        let run_req: ExportRequest = serde_json::from_value(serde_json::json!({
+            "subdir": "Selected",
+            "filter": {}
+        }))
+        .unwrap();
+        let run_resp = export_run(State(Arc::clone(&state)), axum::Json(run_req)).await;
+        assert_eq!(run_resp.status(), StatusCode::ACCEPTED);
+        for _ in 0..100 {
+            if !state.job.is_running() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(matches!(state.job.status(), JobStatus::Done { .. }));
+
+        let exported_xmp = std::fs::read_to_string(dir.join("Selected/JPG/a.xmp")).unwrap();
+        let doc = roxmltree::Document::parse(&exported_xmp).unwrap();
+        let desc = doc
+            .descendants()
+            .find(|n| n.has_tag_name(("http://www.w3.org/1999/02/22-rdf-syntax-ns#", "Description")))
+            .unwrap();
+        assert_eq!(
+            desc.attribute(("http://ns.adobe.com/xap/1.0/", "Rating")),
+            Some("5")
+        );
+        assert_eq!(
+            desc.attribute(("http://ns.adobe.com/camera-raw-settings/1.0/", "Exposure2012")),
+            Some("+0.75")
+        );
+        assert_eq!(std::fs::read_to_string(dir.join("a.xmp")).unwrap(), external_xmp);
     }
 }

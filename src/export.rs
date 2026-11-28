@@ -2865,4 +2865,61 @@ mod tests {
         assert!(!root.join("JPG/DSC0001.xmp").exists());
         assert!(!root.join("RAW/DSC0001.xmp").exists());
     }
+
+    #[test]
+    fn cli_export_merges_manual_rating_into_self_closing_external_xmp_preserving_crs_exposure() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("album");
+        let out_dir = temp.path().join("exported");
+        std::fs::create_dir_all(root.join("JPG")).unwrap();
+        let jpg_path = root.join("JPG/DSC0001.JPG");
+        std::fs::write(&jpg_path, b"jpg-unscored").unwrap();
+        let external_xmp = concat!(
+            "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">",
+            "<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">",
+            "<rdf:Description rdf:about=\"\" ",
+            "xmlns:crs=\"http://ns.adobe.com/camera-raw-settings/1.0/\" ",
+            "crs:Exposure2012=\"+0.75\"/>",
+            "</rdf:RDF></x:xmpmeta>",
+        );
+        std::fs::write(root.join("JPG/DSC0001.xmp"), external_xmp).unwrap();
+
+        let source = WorkspaceSource::single(&root).unwrap();
+        let paths = WorkspacePaths::in_state_dir(temp.path().join("state"));
+        crate::decision::set_in(&paths.state_dir, &root, &jpg_path, 5).unwrap();
+
+        let (items, all_sources) = collect_items_for_cli_in_workspace(
+            &source,
+            &paths,
+            &ScoreConfig::default(),
+            &paths.cache,
+            &ExportFilter::default(),
+        )
+        .unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].manual_rating, Some(5));
+
+        let opts = ExportOptions {
+            target: ExportTarget::ExternalDir(out_dir.clone()),
+            ..Default::default()
+        };
+        let plan = plan_export_workspace(&source, &items, &all_sources, &opts).unwrap();
+        run_export(&plan, &AtomicBool::new(false), &|_| {}).unwrap();
+
+        let exported_xmp = std::fs::read_to_string(out_dir.join("JPG/DSC0001.xmp")).unwrap();
+        let doc = roxmltree::Document::parse(&exported_xmp).unwrap();
+        let desc = doc
+            .descendants()
+            .find(|n| n.has_tag_name(("http://www.w3.org/1999/02/22-rdf-syntax-ns#", "Description")))
+            .unwrap();
+        assert_eq!(
+            desc.attribute(("http://ns.adobe.com/xap/1.0/", "Rating")),
+            Some("5")
+        );
+        assert_eq!(
+            desc.attribute(("http://ns.adobe.com/camera-raw-settings/1.0/", "Exposure2012")),
+            Some("+0.75")
+        );
+        assert_eq!(std::fs::read_to_string(root.join("JPG/DSC0001.xmp")).unwrap(), external_xmp);
+    }
 }
