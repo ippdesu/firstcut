@@ -946,3 +946,130 @@ fn removing_another_photo_does_not_resurrect_cleared_legacy_burst_override() {
         "移走另一张照片后重开同一相册，已清除的旧连拍覆盖绝不得复活"
     );
 }
+
+#[test]
+fn curation_flags_and_unscored_rating_survive_rescore_and_drive_cli_export() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("album");
+    let state = temp.path().join("state");
+    let out_dir = temp.path().join("ExportPicked");
+    std::fs::create_dir_all(root.join("JPG")).unwrap();
+    std::fs::create_dir_all(root.join("RAW")).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+
+    let j1 = root.join("JPG/DSC00001.JPG");
+    let j2 = root.join("JPG/DSC00002.JPG");
+    let j3 = root.join("JPG/DSC00003.JPG");
+    save_jpeg_with_exif_datetime(&j1, [220, 200, 180], "2026:11:28 10:00:00");
+    save_jpeg_with_exif_datetime(&j2, [100, 120, 140], "2026:11:28 10:05:00");
+    save_jpeg_with_exif_datetime(&j3, [140, 160, 180], "2026:11:28 10:10:00");
+    std::fs::write(root.join("RAW/DSC00001.ARW"), b"raw-1").unwrap();
+    std::fs::write(root.join("RAW/DSC00002.ARW"), b"raw-2").unwrap();
+    std::fs::write(root.join("RAW/DSC00003.ARW"), b"raw-3").unwrap();
+
+    let source = pic_process::workspace::WorkspaceSource::single(&root).unwrap();
+    let paths = pic_process::workspace::WorkspacePaths::in_state_dir(state);
+
+    // 评分前先标记与打星：A=留用+5★，B=剔除
+    pic_process::decision::set_flag_in(&paths.state_dir, &root, &j1, pic_process::decision::CurationFlag::Pick).unwrap();
+    pic_process::decision::set_flag_in(&paths.state_dir, &root, &j2, pic_process::decision::CurationFlag::Reject).unwrap();
+    pic_process::decision::set_in(&paths.state_dir, &root, &j1, 5).unwrap();
+
+    // 跑一次评分：CSV 报告必须保留 curation_flag 与人工 5★
+    let cfg = ScoreConfig::default();
+    let opts = score::ScoreJobOptions {
+        output_csv: paths.report.clone(),
+        raw_csv: true,
+        cache_path: paths.cache.clone(),
+        no_cache: false,
+        no_ai: true,
+        xmp: false,
+        xmp_exposure: false,
+        gpu: false,
+        keep_override: None,
+        include_raw: true,
+        skip_processed: true,
+    };
+    score::run_score_job_in_workspace(&source, &paths, &cfg, &opts, &|_| {}).unwrap();
+    let report = std::fs::read_to_string(&paths.report).unwrap();
+    assert!(report.contains("curation_flag"));
+    assert!(report.contains(",5,manual,") && report.contains(",pick"));
+    assert!(report.contains(",reject"));
+
+    // CLI export --picked：仅导出 A（JPG + RAW + XMP）
+    let (picked_items, all_sources) = pic_process::export::collect_items_for_cli_in_workspace(
+        &source,
+        &paths,
+        &cfg,
+        &paths.cache,
+        &pic_process::export::ExportFilter {
+            flag_filter: pic_process::export::FlagFilter::PickedOnly,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(picked_items.len(), 1);
+    let plan = pic_process::export::plan_export_workspace(
+        &source,
+        &picked_items,
+        &all_sources,
+        &pic_process::export::ExportOptions {
+            target: pic_process::export::ExportTarget::ExternalDir(out_dir.clone()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    pic_process::export::run_export(&plan, &std::sync::atomic::AtomicBool::new(false), &|_| {}).unwrap();
+    assert!(out_dir.join("JPG/DSC00001.JPG").is_file());
+    assert!(out_dir.join("RAW/DSC00001.ARW").is_file());
+    assert!(!out_dir.join("JPG/DSC00002.JPG").exists());
+    assert!(!out_dir.join("JPG/DSC00003.JPG").exists());
+
+    // CLI export --flag exclude_reject：排除剔除的 B，保留 A 和未定的 C
+    let (active_items, _) = pic_process::export::collect_items_for_cli_in_workspace(
+        &source,
+        &paths,
+        &cfg,
+        &paths.cache,
+        &pic_process::export::ExportFilter {
+            flag_filter: pic_process::export::FlagFilter::ExcludeRejected,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(active_items.len(), 2);
+
+    // 验证旧目录带 manual_flag 的 decisions.sqlite 幂等迁移，清除后重开不复活
+    let legacy_album = temp.path().join("legacy_album");
+    let legacy_dir = legacy_album.join(".firstcut");
+    let migrated_state = temp.path().join("migrated_state");
+    std::fs::create_dir_all(&legacy_dir).unwrap();
+    std::fs::create_dir_all(&migrated_state).unwrap();
+    let lj = legacy_album.join("DSC00010.JPG");
+    save_jpeg_with_exif_datetime(&lj, [180, 180, 180], "2026:11:28 11:00:00");
+    pic_process::decision::set_flag_in(&legacy_dir, &legacy_album, &lj, pic_process::decision::CurationFlag::Pick).unwrap();
+
+    let legacy_source = pic_process::workspace::WorkspaceSource::single(&legacy_album).unwrap();
+    let legacy_paths = pic_process::workspace::WorkspacePaths::in_state_dir(migrated_state);
+    pic_process::workspace::import_legacy_state_if_needed(&legacy_source, &legacy_paths).unwrap();
+    assert_eq!(
+        pic_process::decision::load_flags_in(&legacy_paths.state_dir)
+            .unwrap()
+            .get("DSC00010.JPG"),
+        Some(&pic_process::decision::CurationFlag::Pick)
+    );
+    pic_process::decision::set_flag_in(
+        &legacy_paths.state_dir,
+        &legacy_album,
+        &lj,
+        pic_process::decision::CurationFlag::Unflagged,
+    )
+    .unwrap();
+    pic_process::workspace::import_legacy_state_if_needed(&legacy_source, &legacy_paths).unwrap();
+    assert!(
+        !pic_process::decision::load_flags_in(&legacy_paths.state_dir)
+            .unwrap()
+            .contains_key("DSC00010.JPG"),
+        "清除迁移过来的选片标记后，重开工作区绝不得复活"
+    );
+}

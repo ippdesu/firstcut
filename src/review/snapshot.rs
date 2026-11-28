@@ -37,6 +37,7 @@ pub struct PhotoJson {
     pub analysis_mode: Option<String>,
     pub faces: usize,
     pub burst: Option<BurstJson>,
+    pub flag: crate::decision::CurationFlag,
     pub scene_hint: SceneHintJson,
     pub scene_feedback: Option<SceneFeedbackRecord>,
 }
@@ -250,6 +251,7 @@ pub fn build_snapshot_for_workspace(
                     manual_keep: i.manual_keep,
                     pose_cluster: i.pose_cluster,
                 }),
+                flag: selection.flags.get(e.pair_id()).copied().unwrap_or_default(),
             }
         })
         .collect();

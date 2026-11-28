@@ -6,7 +6,7 @@ use std::path::Path;
 use anyhow::Result;
 
 use crate::config::ScoreConfig;
-use crate::decision::{self, EffectiveBurst, EffectiveRating};
+use crate::decision::{self, CurationFlag, EffectiveBurst, EffectiveRating};
 use crate::output::xmp;
 use crate::scan::PhotoEntry;
 use crate::score::{self, AnalysisResult};
@@ -15,6 +15,7 @@ use crate::score::{self, AnalysisResult};
 pub struct SelectionResult {
     pub bursts: HashMap<String, EffectiveBurst>,
     pub ratings: HashMap<String, EffectiveRating>,
+    pub flags: HashMap<String, CurationFlag>,
 }
 
 pub fn build(
@@ -51,5 +52,7 @@ pub fn build_in(
     let recommended = xmp::assign_ratings(&totals, &cfg.metric);
     let manual = decision::load_ratings_in(state_dir)?;
     let ratings = decision::effective_ratings_checked(jpg_root, entries, &recommended, &manual)?;
-    Ok(SelectionResult { bursts, ratings })
+    let manual_flags = decision::load_flag_map_in(state_dir)?;
+    let flags = decision::effective_flags_checked(jpg_root, entries, &manual_flags)?;
+    Ok(SelectionResult { bursts, ratings, flags })
 }

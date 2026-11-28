@@ -10,7 +10,7 @@ firstcut 是 Rust 编写的本地照片初筛与复核工具。支持单目录�
 | 能力 | 当前状态与边界 |
 |---|---|
 | 评分与复核 | CLI 和本地 Web UI 均已实现，共用评分与星级合成；Windows 可双击启动 |
-| 人工决定 | 人工星级持久化并统一导出；人工连拍保留覆盖目前仅作用于 review，尚未统一到 CLI/CSV |
+| 人工决定 | 人工星级、三态选片标记（留用/未定/剔除，含未评分照片）与连拍保留/舍弃覆盖均持久化在 `decisions.sqlite`，并统一作用于 review、CLI、CSV 与导出 |
 | 场景 | 有五份手动选择的评分预设；自动提示仅是基于人脸的“人像候选”，没有通用场景分类或自动调权 |
 | 图像 | 当前只支持 SDR JPEG 分析和直方图；RAW 不解码，仅配对与导出；HDR 增益图、PQ/HLG 未实现 |
 | Windows 发行 | `pic_process.exe`、`firstcut-ui.exe`、`pic_process-gallery.exe`、`pic_process-tune.exe` 与 SHA256 校验文件 |
@@ -28,9 +28,9 @@ firstcut 是 Rust 编写的本地照片初筛与复核工具。支持单目录�
 | 算法建议 | `selection::SelectionResult`；总分、算法星级、连拍簇/排名/保留建议 | 每次按当前配置和批次重新合成，CLI 与 review 共用 |
 | 人工决定 | `EffectiveRating` 与独立决定库；最终星级 = 人工值优先，否则算法值 | 重评分不覆盖用户决定，统一用于 review、CLI、CSV 与 XMP |
 
-人工星级与人工连拍覆盖同时记录相对路径与文件轻量内容指纹（文件大小 + 首尾各 64 KiB SHA-256），同一挂载点换卡后同路径的不同照片不会误继承旧卡的人工决定；首次导入旧版 `.firstcut/decisions.sqlite` 时会按原相册照片补齐指纹，无法确认来源的旧记录保留在库中但不自动应用；读取照片指纹失败时匹配阶段保留算法结果、保存阶段明确报错。移动或重命名照片、改变所选根目录后，相对路径可能变化，不承诺自动迁移。JPG 与其配对 RAW 使用同一最终星级。XMP 是导出结果，不是人工决定的唯一存储；旧版仅写进 XMP 的人工星级不会自动导入决定库。
+人工星级、三态选片标记（`manual_flag`）与人工连拍覆盖同时记录相对路径与文件轻量内容指纹（文件大小 + 首尾各 64 KiB SHA-256），同一挂载点换卡后同路径的不同照片不会误继承旧卡的人工决定；首次导入旧版 `.firstcut/decisions.sqlite` 时会按原相册照片补齐指纹，无法确认来源的旧记录保留在库中但不自动应用；读取照片指纹失败时匹配阶段保留算法结果、保存阶段明确报错。移动或重命名照片、改变所选根目录后，相对路径可能变化，不承诺自动迁移。JPG 与其配对 RAW 使用同一最终星级与选片标记。XMP 是导出结果，不是人工决定的唯一存储；旧版仅写进 XMP 的人工星级不会自动导入决定库。
 
-**已知一致性缺口**：人工连拍保留状态单独保存在 `burst-overrides.json`，目前只覆盖 review 中的建议，尚未通过 `selection` 统一导出。不能把“UI/CLI 共用算法建议”表述为“所有人工覆盖已完全一致”。后续应先统一决定模型再扩展相关操作。
+人工星级、三态选片标记与人工连拍保留覆盖统一保存在本机工作区 `decisions.sqlite`，并通过 `selection` 同步驱动 `review`、CLI `score`（CSV/XMP）与 `export`（包括 `export --picked` / `--flag` 及未评分照片的人工星级 XMP 导出）。
 
 `analysis_mode` 标明 `ai` / `pixel`；`rating_source` 标明 `algorithm` / `manual`。模型整体不可用时可显式降级；已进入 AI 分析的单张推理失败应报告分析失败，不伪装成正常中性分。CSV 的 `analysis_ok` 可用于过滤失败或无配对 RAW；review 缓存没有失败记录表，无法完整区分“尚未评分”和“之前分析失败”。
 
@@ -151,9 +151,9 @@ JPEG 使用 `jpeg-decoder` 快速路径、`image` 兜底，全解码后 box 块�
 
 选择 axum + 内嵌 vanilla JS，纯 Cargo 构建，无 npm/WebView 依赖。CLI `review` 与 Windows 启动器共用服务；启动后先显示页面，再异步读取快照，报告扫描阶段、计数与可确定总量时的进度，完成后自动刷新。评分缺失时提示选择原评分目录或继续未评分浏览，不强制重算。
 
-- 缩略图墙分页懒加载，筛选和排序自动记忆；默认按连拍组聚合，每组显示当前排序最靠前的一张，指定组后显示全部。照片右键可快速筛组及设置 review 保留覆盖。
+- 缩略图墙分页懒加载，筛选和排序自动记忆；默认按连拍组聚合，每组显示当前排序最靠前的一张，指定组后显示全部。卡片支持留用/剔除角标与快捷按钮，侧栏支持按选片标记筛选并一键将当前筛选批量设为留用；照片右键可快速设置选片标记、筛组及设置保留覆盖。
 - 星级、分数下限及说明可折叠，桌面侧栏可拖宽，双击边界复位，窄屏可收起。筛选、折叠状态及面板位置等部分设置保存在浏览器 localStorage。
-- 灯箱支持原图缩放/拖动、双击复位、组内切换、2–4 张并排对比与百分比显示；对比共用图像归一化锚点及缩放状态。EXIF 光圈/快门/焦段用 `f/`、`s`、`mm` 明确标识。
+- 灯箱支持原图缩放/拖动、双击复位、组内切换、2–4 张并排对比与百分比显示；对比共用图像归一化锚点及缩放状态；支持快捷键 `P`/`X`/`U` 标记留用/剔除/未定与 `1–5` 改星（未评分照片也可直接标记与打星）。EXIF 光圈/快门/焦段用 `f/`、`s`、`mm` 明确标识。
 - 评分面板跟随活动照片，可拖动和调整大小；列出子分、实际权重与贡献。人像候选只是规则线索；用户可保存真实场景与备注，供后续校准，不自动切换评分参数。
 - 配置表单提供说明、建议范围、滑块与输入框，不把 M9、M-UI2 等内部规划编号暴露在产品文案中。
 - UI 内跑批使用 `score::run_score_job`，全局单任务互斥；轮询进度与日志，完成后热替换快照。跑批期间限制改星和服务控制，避免竞争。
@@ -174,7 +174,7 @@ JPEG 使用 `jpeg-decoder` 快速路径、`image` 兜底，全解码后 box 块�
 HTTP 端点：
 - **公开与鉴权**：`/`（页面框架）、`/review.js`（内嵌脚本）、`/healthz`（启动器探活）、`POST /api/session`（凭据换会话）
 - **数据与图像（需会话）**：`GET /api/photos`、`GET /api/load`、`GET /thumb`、`GET /image`
-- **任务、标注与配置（需会话 + 写接口来源校验）**：`GET /api/job`、`POST /api/score/run`、`POST /api/export/pick-folder`、`POST /api/export/preview`、`POST /api/export/run`、`POST /api/export/cancel`、`POST /api/export/open`、`POST /api/rate`、`POST /api/burst/keep`、`POST /api/scene-feedback`、`GET/POST /api/config`、`GET/POST /api/ui-settings`、`GET/POST /api/control`
+- **任务、标注与配置（需会话 + 写接口来源校验）**：`GET /api/job`、`POST /api/score/run`、`POST /api/export/pick-folder`、`POST /api/export/preview`、`POST /api/export/run`、`POST /api/export/cancel`、`POST /api/export/open`、`POST /api/rate`、`POST /api/flag`、`POST /api/flag/batch`、`POST /api/burst/keep`、`POST /api/scene-feedback`、`GET/POST /api/config`、`GET/POST /api/ui-settings`、`GET/POST /api/control`
 
 ## 8. 安全、验证与发布
 

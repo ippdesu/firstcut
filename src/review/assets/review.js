@@ -235,18 +235,18 @@ const DIMS = ["sharpness","exposure","noise","composition","aesthetic"];
 const DIM_NAMES = {sharpness:"清晰",exposure:"曝光",noise:"噪点",composition:"构图",aesthetic:"美学"};
 
 const f = {
-  search: "", stars: new Set(), keep: "all", group: "all", aggregate: true, faces: false,
+  search: "", flag: "all", stars: new Set(), keep: "all", group: "all", aggregate: true, faces: false,
   min: {total:0, sharpness:0, exposure:0, noise:0, composition:0, aesthetic:0},
   sort: "total",
 };
+const VALID_FLAG_FILTERS = new Set(["all", "pick", "exclude_reject", "reject", "unflagged"]);
 
 // ---------- 初始化 ----------
 function ingest(){
   jpgs = SNAPSHOT.photos.filter(p => !p.is_raw);
   // 先刷新连拍组选项并校正失效的 f.group，再调用 apply() 渲染网格
   rebuildGroupOptions();
-  document.getElementById("info").textContent =
-    `${SNAPSHOT.root} — ${jpgs.length} 张（已评分 ${jpgs.filter(p=>p.scores).length}）`;
+  updateCurationCounts();
   apply();
 }
 async function boot(){
@@ -292,7 +292,7 @@ async function boot(){
   document.getElementById('loadPanel').hidden = true;
   ingest();
   buildFilters();
-  document.querySelectorAll("#fSearch, #fStars input, #fKeep, #fGroup, #fAggregate, #fFaces, #fDims input, #fSort")
+  document.querySelectorAll("#fSearch, #fFlag, #fStars input, #fKeep, #fGroup, #fAggregate, #fFaces, #fDims input, #fSort")
     .forEach(el => el.addEventListener("input", onFilter));
   await loadAppControls();
   if(uiSession !== null && jpgs.length && !jpgs.some(photo => photo.scores)){
@@ -356,6 +356,8 @@ function buildFilters(){
 }
 function onFilter(){
   f.search = document.getElementById("fSearch").value.trim().toLowerCase();
+  const flagVal = document.getElementById("fFlag").value;
+  f.flag = VALID_FLAG_FILTERS.has(flagVal) ? flagVal : "all";
   f.stars = new Set([...document.querySelectorAll("#fStars input:checked")].map(i=>+i.dataset.star));
   f.keep = document.getElementById("fKeep").value;
   f.group = document.getElementById("fGroup").value || "all";
@@ -368,11 +370,12 @@ function onFilter(){
   f.sort = document.getElementById("fSort").value;
   updateFilterCounts();
   page = 0;
-  localStorage.setItem("fc_filters", JSON.stringify({search:f.search,stars:[...f.stars],keep:f.keep,group:f.group,aggregate:f.aggregate,faces:f.faces,min:f.min,sort:f.sort}));
+  localStorage.setItem("fc_filters", JSON.stringify({search:f.search,flag:f.flag,stars:[...f.stars],keep:f.keep,group:f.group,aggregate:f.aggregate,faces:f.faces,min:f.min,sort:f.sort}));
   apply();
 }
 function resetFilters(){
   document.getElementById("fSearch").value = "";
+  document.getElementById("fFlag").value = "all";
   document.querySelectorAll("#fStars input").forEach(i=>i.checked=false);
   document.getElementById("fKeep").value = "all";
   document.getElementById("fGroup").value = "all";
@@ -387,6 +390,11 @@ function resetFilters(){
 function visible(){
   let list = jpgs.filter(p=>{
     if(f.search && !p.filename.toLowerCase().includes(f.search)) return false;
+    const flag = p.flag || "unflagged";
+    if(f.flag === "pick" && flag !== "pick") return false;
+    if(f.flag === "exclude_reject" && flag === "reject") return false;
+    if(f.flag === "reject" && flag !== "reject") return false;
+    if(f.flag === "unflagged" && flag !== "unflagged") return false;
     if(f.stars.size && !(p.stars && f.stars.has(p.stars))) return false;
     const group = p.burst && p.burst.group;
     if(f.keep === "keep" && group && !p.burst.keep) return false;
@@ -395,7 +403,7 @@ function visible(){
     if(f.group === "single" && group) return false;
     if(f.group.startsWith("group:") && String(group || "") !== f.group.slice(6)) return false;
     if(f.faces && !(p.faces > 0)) return false;
-    if(!p.scores) return !(f.min.total>0 || DIMS.some(d=>f.min[d]>0) || f.stars.size);
+    if(!p.scores) return !(f.min.total>0 || DIMS.some(d=>f.min[d]>0));
     if(p.scores.total < f.min.total) return false;
     for(const d of DIMS) if(p.scores[d] < f.min[d]) return false;
     return true;
@@ -428,6 +436,52 @@ function aggregatePhotos(list){
     return true;
   });
 }
+function cardTopLeftHtml(p){
+  const flag = p.flag || "unflagged";
+  const flagBadge = flag === "pick" ? `<span class="b flag pick">⚑ 留用</span>`
+    : flag === "reject" ? `<span class="b flag reject">✕ 剔除</span>` : "";
+  const starsBadge = p.stars ? `<span class="b stars">${"★".repeat(p.stars)}</span>` : "";
+  return flagBadge + starsBadge;
+}
+function syncCardEl(d, p){
+  const flag = p.flag || "unflagged";
+  d.classList.toggle("flag-pick", flag === "pick");
+  d.classList.toggle("flag-reject", flag === "reject");
+  const tl = d.querySelector(".card-top-left");
+  if(tl) tl.innerHTML = cardTopLeftHtml(p);
+  const pickBtn = d.querySelector(".act-pick");
+  const rejBtn = d.querySelector(".act-reject");
+  if(pickBtn) pickBtn.classList.toggle("on", flag === "pick");
+  if(rejBtn) rejBtn.classList.toggle("on", flag === "reject");
+}
+function updateCardVisual(photo){
+  const d = [...document.querySelectorAll("#grid .card")].find(el => el.dataset.path === photo.path);
+  if(d) syncCardEl(d, photo);
+}
+let batchFlagInFlight = false;
+function updateCurationCounts(matchedCount=null){
+  const picks = jpgs.filter(p => p.flag === "pick").length;
+  const rejects = jpgs.filter(p => p.flag === "reject").length;
+  const unflagged = jpgs.length - picks - rejects;
+  const summaryEl = document.getElementById("curationSummary");
+  if(summaryEl) summaryEl.textContent = `留用 ${picks} · 未定 ${unflagged} · 剔除 ${rejects}`;
+  if(SNAPSHOT){
+    const scored = jpgs.filter(p=>p.scores).length;
+    const curationNote = (picks || rejects) ? ` · 留用 ${picks} / 剔除 ${rejects}` : "";
+    document.getElementById("info").textContent =
+      `${SNAPSHOT.root} — ${jpgs.length} 张（已评分 ${scored}${curationNote}）`;
+  }
+  const n = matchedCount == null ? visible().length : matchedCount;
+  const pickBtn = document.getElementById("batchPickBtn");
+  const unflagBtn = document.getElementById("batchUnflagBtn");
+  const rejectBtn = document.getElementById("batchRejectBtn");
+  if(pickBtn){
+    pickBtn.textContent = `⚑ 将当前筛选设为留用 (${n})`;
+    pickBtn.disabled = batchFlagInFlight || jobIsRunning || n === 0;
+  }
+  if(unflagBtn) unflagBtn.disabled = batchFlagInFlight || jobIsRunning || n === 0;
+  if(rejectBtn) rejectBtn.disabled = batchFlagInFlight || jobIsRunning || n === 0;
+}
 function apply(){
   const matching = visible();
   const list = aggregatePhotos(matching);
@@ -439,13 +493,26 @@ function apply(){
   document.getElementById("empty").style.display = list.length ? "none" : "block";
   for(const p of slice){
     const d = document.createElement("div");
-    d.className = "card" + (p.scores ? "" : " noscore");
+    const flag = p.flag || "unflagged";
+    d.className = "card" + (p.scores ? "" : " noscore") + (flag === "pick" ? " flag-pick" : flag === "reject" ? " flag-reject" : "");
     d.dataset.path = p.path;
     d.innerHTML = `<img decoding="async">
-      ${p.stars ? `<span class="b stars">${"★".repeat(p.stars)}</span>` : ""}
+      <div class="card-top-left">${cardTopLeftHtml(p)}</div>
+      <div class="card-actions">
+        <button type="button" class="act-pick${flag==="pick"?" on":""}" title="标记为留用 (P)">✓</button>
+        <button type="button" class="act-reject${flag==="reject"?" on":""}" title="标记为剔除 (X)">✕</button>
+      </div>
       ${p.scores ? `<span class="b total">${p.scores.total.toFixed(1)}</span>` : `<span class="b total">未评分</span>`}
       ${p.burst && p.burst.group ? `<span class="b burst ${p.burst.keep?"":"drop"}">组${p.burst.group} #${p.burst.rank}/${p.burst.size} ${p.burst.manual_keep!=null?(p.burst.keep?"手动保留":"手动舍弃"):(p.burst.keep?"✓":"✗")}</span>` : ""}
       <span class="b name">${escapeHtml(p.filename)}</span>`;
+    d.querySelector(".act-pick").addEventListener("click", e=>{
+      e.stopPropagation();
+      setPhotoFlag(p, p.flag === "pick" ? "unflagged" : "pick");
+    });
+    d.querySelector(".act-reject").addEventListener("click", e=>{
+      e.stopPropagation();
+      setPhotoFlag(p, p.flag === "reject" ? "unflagged" : "reject");
+    });
     d.addEventListener("click", ()=> openLightbox(p, matching));
     d.addEventListener("contextmenu", e=>{
       e.preventDefault();
@@ -454,6 +521,7 @@ function apply(){
     grid.appendChild(d);
     thumbnail(d.querySelector('img'), p.path);
   }
+  updateCurationCounts(matching.length);
   const position = `${list.length ? page*PAGE+1 : 0}–${Math.min((page+1)*PAGE, list.length)} / ${list.length}`;
   document.getElementById("pgInfo").textContent = matching.length === list.length
     ? position : `${position} 项（符合条件 ${matching.length} 张）`;
@@ -485,6 +553,16 @@ function showPhotoContextMenu(photo, x, y){
     });
     menu.appendChild(button);
   };
+  const curFlag = photo.flag || "unflagged";
+  addAction(`⚑ 设为留用 (P)${curFlag === "pick" ? " ✓" : ""}`, ()=>setPhotoFlag(photo, "pick"));
+  addAction(`✕ 设为剔除 (X)${curFlag === "reject" ? " ✓" : ""}`, ()=>setPhotoFlag(photo, "reject"));
+  if(curFlag !== "unflagged"){
+    addAction("○ 取消标记 / 恢复未定 (U)", ()=>setPhotoFlag(photo, "unflagged"));
+  }
+  const hr = document.createElement("div");
+  hr.style.cssText = "height:1px;background:var(--line);margin:4px 2px";
+  menu.appendChild(hr);
+
   const group = photo.burst && photo.burst.group;
   if(group){
     const count = jpgs.filter(p=>p.burst && p.burst.group === group).length;
@@ -542,6 +620,89 @@ async function setBurstKeep(photo, keep){
     toast('连拍标记保存失败：'+error.message);
   }
 }
+async function setPhotoFlag(photo, flag){
+  if(!photo) return;
+  try{
+    const response = await apiFetch('/api/flag', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({p:photo.path, flag})
+    });
+    const text = await response.text();
+    if(!response.ok) throw new Error(text || response.statusText);
+    const result = JSON.parse(text);
+    const nextFlag = result.flag || flag;
+    const stem = photo.path.replace(/\.[^.]+$/,'').toLowerCase();
+    for(const item of (SNAPSHOT?.photos || jpgs)){
+      if(item.path === photo.path || item.path.replace(/\.[^.]+$/,'').toLowerCase() === stem){
+        item.flag = nextFlag;
+      }
+    }
+    if(LB){ renderLBActive(); syncLBCurationBadges(); }
+    if(f.flag !== 'all') apply();
+    else { updateCardVisual(photo); updateCurationCounts(); }
+    toast(nextFlag === 'pick' ? '已标记为留用' : nextFlag === 'reject' ? '已标记为剔除' : '已取消标记');
+  }catch(error){
+    toast('选片标记保存失败：'+error.message);
+  }
+}
+async function batchSetFlag(targetFlag){
+  const matched = visible();
+  if(!matched.length) return;
+  if(targetFlag === 'pick'){
+    const alreadyPick = matched.filter(p => p.flag === 'pick').length;
+    const toChange = matched.length - alreadyPick;
+    if(toChange === 0){
+      toast(`当前筛选中的 ${matched.length} 张照片均已为留用`);
+      return;
+    }
+    const rejectCount = matched.filter(p => p.flag === 'reject').length;
+    if(rejectCount > 0 || toChange >= 100){
+      const extra = rejectCount > 0 ? `（其中 ${rejectCount} 张当前为「剔除」将被改为留用）` : '';
+      if(!window.confirm(`确认将当前筛选命中的 ${matched.length} 张照片全部设为「留用」？${extra}`)) return;
+    }
+  } else if(targetFlag === 'reject'){
+    if(!window.confirm(`确认将当前筛选命中的 ${matched.length} 张照片全部设为「剔除」？`)) return;
+  } else {
+    const flagged = matched.filter(p => (p.flag || 'unflagged') !== 'unflagged').length;
+    if(flagged === 0){
+      toast('当前筛选中的照片均未设置标记');
+      return;
+    }
+    if(!window.confirm(`确认清除当前筛选命中的 ${matched.length} 张照片的选片标记（共 ${flagged} 张已标记）？`)) return;
+  }
+
+  batchFlagInFlight = true;
+  updateCurationCounts(matched.length);
+  try{
+    const response = await apiFetch('/api/flag/batch', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({filter: currentFilterPayload(), flag: targetFlag})
+    });
+    const text = await response.text();
+    if(!response.ok) throw new Error(text || response.statusText);
+    const result = JSON.parse(text);
+    const updatedSet = new Set(result.updated || []);
+    const updatedStems = new Set([...updatedSet].map(p => p.replace(/\.[^.]+$/,'').toLowerCase()));
+    for(const item of (SNAPSHOT?.photos || jpgs)){
+      if(updatedSet.has(item.path) || updatedStems.has(item.path.replace(/\.[^.]+$/,'').toLowerCase())){
+        item.flag = result.flag || targetFlag;
+      }
+    }
+    if(LB){ renderLBActive(); syncLBCurationBadges(); }
+    apply();
+    const label = targetFlag === 'pick' ? '设为留用' : targetFlag === 'reject' ? '设为剔除' : '清除标记';
+    const failNote = result.failed_count > 0 ? `，${result.failed_count} 张跳过` : '';
+    toast(`已将 ${result.updated_count} 张照片${label}${failNote}`);
+  }catch(error){
+    toast('批量标记失败：'+error.message);
+  }finally{
+    batchFlagInFlight = false;
+    updateCurationCounts();
+  }
+}
+document.getElementById('batchPickBtn').addEventListener('click', ()=>batchSetFlag('pick'));
+document.getElementById('batchUnflagBtn').addEventListener('click', ()=>batchSetFlag('unflagged'));
+document.getElementById('batchRejectBtn').addEventListener('click', ()=>batchSetFlag('reject'));
 document.addEventListener("click", e=>{
   if(!e.target.closest("#contextMenu")) hidePhotoContextMenu();
 });
@@ -643,18 +804,65 @@ function renderLBActive(){
     cur.iso ? (/^ISO\s*/i.test(cur.iso) ? cur.iso : `ISO ${cur.iso}`) : '',
     apertureLabel(cur.f_number), shutterLabel(cur.shutter), focalLabel(cur.focal)
   ].filter(Boolean);
+  const flagLabel = cur.flag === "pick" ? "⚑ 留用 · " : cur.flag === "reject" ? "✕ 剔除 · " : "";
   const metadata =
-    `${cur.stars ? "★".repeat(cur.stars)+" " : ""}${cur.scores ? "总分 "+cur.scores.total.toFixed(1) : "未评分"}`
+    `${flagLabel}${cur.stars ? "★".repeat(cur.stars)+" " : ""}${cur.scores ? "总分 "+cur.scores.total.toFixed(1) : "未评分"}`
     + (cur.burst && cur.burst.group ? ` · 组${cur.burst.group} 第${cur.burst.rank}/${cur.burst.size}名（姿势簇${cur.burst.pose_cluster}）${cur.burst.manual_keep!=null?" 手动":""}${cur.burst.keep?" ✓保留":" ✗舍弃"}` : "")
     + (exif.length ? ` · ${exif.join(' · ')}` : '');
   document.getElementById("lbMeta").textContent = metadata;
   document.getElementById("lbMeta").title = metadata;
   document.querySelectorAll("#panes .pane").forEach(pane=>pane.classList.toggle("active", pane.dataset.path===cur.path));
   document.querySelectorAll("#strip .st").forEach(item=>item.classList.toggle("cur", item.dataset.path===cur.path));
+  renderLbFlags();
   renderLbStars();
   renderLBDetails();
   renderLBHistogram();
 }
+function renderLbFlags(){
+  const cur = activePhoto();
+  const flag = cur?.flag || "unflagged";
+  const pickBtn = document.getElementById("lbFlagPick");
+  const unflagBtn = document.getElementById("lbFlagUnflag");
+  const rejectBtn = document.getElementById("lbFlagReject");
+  if(!pickBtn || !unflagBtn || !rejectBtn) return;
+  pickBtn.className = flag === "pick" ? "pick-on" : "";
+  unflagBtn.className = flag === "unflagged" ? "unflag-on" : "";
+  rejectBtn.className = flag === "reject" ? "reject-on" : "";
+  pickBtn.disabled = !cur;
+  unflagBtn.disabled = !cur;
+  rejectBtn.disabled = !cur;
+}
+function syncLBCurationBadges(){
+  if(!LB) return;
+  document.querySelectorAll("#panes .pane").forEach(pane=>{
+    const photo = jpgs.find(x=>x.path===pane.dataset.path);
+    if(!photo) return;
+    const flag = photo.flag || "unflagged";
+    const pickBtn = pane.querySelector(".pane-actions .act-pick");
+    const rejBtn = pane.querySelector(".pane-actions .act-reject");
+    if(pickBtn) pickBtn.classList.toggle("on", flag === "pick");
+    if(rejBtn) rejBtn.classList.toggle("on", flag === "reject");
+  });
+  document.querySelectorAll("#strip .st").forEach(st=>{
+    const photo = jpgs.find(x=>x.path===st.dataset.path);
+    if(!photo) return;
+    const flag = photo.flag || "unflagged";
+    let badge = st.querySelector(".st-flag");
+    if(flag === "unflagged"){
+      if(badge) badge.remove();
+    } else {
+      if(!badge){
+        badge = document.createElement("span");
+        st.appendChild(badge);
+      }
+      badge.className = `st-flag ${flag}`;
+      badge.textContent = flag === "pick" ? "⚑" : "✕";
+    }
+  });
+}
+document.getElementById("lbFlagPick").addEventListener("click", ()=>{ const c = activePhoto(); if(c) setPhotoFlag(c, "pick"); });
+document.getElementById("lbFlagUnflag").addEventListener("click", ()=>{ const c = activePhoto(); if(c) setPhotoFlag(c, "unflagged"); });
+document.getElementById("lbFlagReject").addEventListener("click", ()=>{ const c = activePhoto(); if(c) setPhotoFlag(c, "reject"); });
 
 function renderLB(){
   const cur = LB.list[LB.idx];
@@ -667,10 +875,23 @@ function renderLB(){
   if(!shown.some(p=>p.path===LB.activePath)) LB.activePath = shown[0].path;
   for(const p of shown){
     const pane = document.createElement("div");
+    const flag = p.flag || "unflagged";
     pane.className = "pane"; pane.dataset.path = p.path;
     pane.innerHTML = `<img>
       <span class="tag">${escapeHtml(p.filename)}${p.scores ? " · "+p.scores.total.toFixed(1) : ""}</span>
+      <div class="pane-actions">
+        <button type="button" class="act-pick${flag==="pick"?" on":""}" title="标记为留用 (P)">⚑</button>
+        <button type="button" class="act-reject${flag==="reject"?" on":""}" title="标记为剔除 (X)">✕</button>
+      </div>
       <span class="hint">${LB.compare ? "点击查看评分 · " : ""}滚轮缩放 · 拖拽平移 · 双击复位</span>`;
+    pane.querySelector(".pane-actions .act-pick").addEventListener("click", e=>{
+      e.stopPropagation();
+      setPhotoFlag(p, p.flag === "pick" ? "unflagged" : "pick");
+    });
+    pane.querySelector(".pane-actions .act-reject").addEventListener("click", e=>{
+      e.stopPropagation();
+      setPhotoFlag(p, p.flag === "reject" ? "unflagged" : "reject");
+    });
     const img = pane.querySelector('img');
     for(const eventName of ['load','error']) img.addEventListener(eventName, ()=>{
       if(pane.isConnected && LB){
@@ -692,8 +913,10 @@ function renderLB(){
     d.className = "st";
     d.dataset.path = m.path;
     const checked = LB.sel.has(m.path) ? "checked" : "";
+    const mFlag = m.flag || "unflagged";
     d.innerHTML = `<img decoding="async">
       ${LB.compare ? `<input type="checkbox" ${checked}>` : ""}
+      ${mFlag !== "unflagged" ? `<span class="st-flag ${mFlag}">${mFlag==="pick"?"⚑":"✕"}</span>` : ""}
       ${m.burst ? `<span class="r">#${m.burst.rank}${m.burst.keep?"✓":"✗"}</span>` : ""}`;
     d.addEventListener("click", e=>{
       if(LB.compare && e.target.type === "checkbox"){
@@ -1027,7 +1250,7 @@ function bindPane(pane){
   }, {passive:false});
   let drag = null;
   pane.addEventListener("pointerdown", e=>{
-    if(e.button !== 0) return;
+    if(e.button !== 0 || e.target.closest(".pane-actions")) return;
     selectPane(pane.dataset.path);
     drag = {id:e.pointerId, x:e.clientX, y:e.clientY, ax:LB.view.ax, ay:LB.view.ay};
     pane.setPointerCapture(e.pointerId);
@@ -1050,7 +1273,8 @@ function bindPane(pane){
   pane.addEventListener("pointerup", endPaneDrag);
   pane.addEventListener("pointercancel", endPaneDrag);
   pane.addEventListener("lostpointercapture", endPaneDrag);
-  pane.addEventListener("dblclick", ()=>{
+  pane.addEventListener("dblclick", e=>{
+    if(e.target.closest(".pane-actions")) return;
     LB.view = {s:1, ax:.5, ay:.5, fx:.5, fy:.5};
     layoutPanes();
   });
@@ -1194,6 +1418,7 @@ function pollJob(){
       expOpen.hidden = true;
     }
     syncExportStartButton();
+    updateCurationCounts();
 
     // 运行中持续轮询；结束后停止
     if(j.state === 'running'){ schedulePoll(); }
@@ -1241,17 +1466,27 @@ function syncExportStartButton(){
   const ok = !jobIsRunning && !needsExternal && exportPreviewData && exportPreviewData.selected_photos > 0;
   startBtn.disabled = !ok;
 }
+function currentFilterPayload(){
+  return {
+    search: f.search,
+    stars: [...f.stars],
+    keep: f.keep,
+    group: f.group,
+    faces: f.faces,
+    flag: f.flag,
+    min: {...f.min},
+  };
+}
+function isPickedExportScope(){
+  return document.getElementById('exportScopePicked')?.checked === true;
+}
 function buildExportRequestPayload(){
   const xmp = exportXmpEl.checked;
+  const filter = isPickedExportScope()
+    ? {search:"", stars:[], keep:"all", group:"all", faces:false, flag:"pick", min:{total:0,sharpness:0,exposure:0,noise:0,composition:0,aesthetic:0}}
+    : currentFilterPayload();
   return {
-    filter: {
-      search: f.search,
-      stars: [...f.stars],
-      keep: f.keep,
-      group: f.group,
-      faces: f.faces,
-      min: {...f.min},
-    },
+    filter,
     subdir: exportExternalTargetId ? null : (exportSubdirEl.value.trim() || 'Selected'),
     external_target_id: exportExternalTargetId,
     layout: exportLayoutEl.value,
@@ -1292,8 +1527,20 @@ async function refreshExportPreview(){
   const seq = ++exportPreviewSeq;
   const box = document.getElementById('exportPreviewBox');
   const matched = visible();
-  document.getElementById('exportFilterSummary').textContent =
-    `基于当前左侧筛选命中的全部 ${matched.length} 张照片（不受“按连拍组聚合”折叠影响）。`;
+  const totalPicked = jpgs.filter(p => p.flag === 'pick').length;
+  const filterScopeEl = document.getElementById('exportScopeFilter');
+  const pickedScopeEl = document.getElementById('exportScopePicked');
+  document.getElementById('exportScopeFilterLabel').textContent = `按当前左侧筛选（${matched.length} 张）`;
+  document.getElementById('exportScopePickedLabel').textContent = `仅导出全部「留用」照片（${totalPicked} 张）`;
+  if(pickedScopeEl){
+    pickedScopeEl.disabled = totalPicked === 0;
+    if(totalPicked === 0 && pickedScopeEl.checked && filterScopeEl){
+      filterScopeEl.checked = true;
+    }
+  }
+  document.getElementById('exportFilterSummary').textContent = isPickedExportScope()
+    ? `将导出当前工作区中全部已标记为「留用」的 ${totalPicked} 张照片（忽略左侧其他筛选）。`
+    : `基于当前左侧筛选命中的全部 ${matched.length} 张照片（不受“按连拍组聚合”折叠影响）。`;
   exportPreviewData = null;
   syncExportStartButton();
   if(sourceMode === 'dual' && !exportExternalTargetId){
@@ -1318,6 +1565,7 @@ async function refreshExportPreview(){
     exportPreviewData = data;
     renderExportPreview(data);
     syncExportStartButton();
+    updateCurationCounts();
   } catch (err) {
     if(seq !== exportPreviewSeq) return;
     box.innerHTML = `<div class="err">预览失败：${escapeHtml(err.message || String(err))}</div>`;
@@ -1329,8 +1577,8 @@ function scheduleExportPreview(delay=220){
 }
 exportXmpEl.addEventListener('change', ()=>{ syncExportXmpExposure(); scheduleExportPreview(0); });
 syncExportXmpExposure();
-for(const el of [exportJpgEl, exportRawEl, exportXmpExposureEl, exportLayoutEl]){
-  el.addEventListener('change', ()=> scheduleExportPreview(0));
+for(const el of [exportJpgEl, exportRawEl, exportXmpExposureEl, exportLayoutEl, document.getElementById('exportScopeFilter'), document.getElementById('exportScopePicked')]){
+  if(el) el.addEventListener('change', ()=> scheduleExportPreview(0));
 }
 exportSubdirEl.addEventListener('input', ()=> scheduleExportPreview(260));
 document.getElementById('exportBtn').addEventListener('click', ()=>{
@@ -1390,6 +1638,7 @@ document.getElementById('exportStart').addEventListener('click', async ()=>{
     if(!response.ok){
       toast(await response.text() || `无法开始导出（${response.status}）`);
       syncExportStartButton();
+    updateCurationCounts();
       return;
     }
     document.getElementById('exportJobGroup').hidden = false;
@@ -1397,6 +1646,7 @@ document.getElementById('exportStart').addEventListener('click', async ()=>{
   } catch (err) {
     toast('无法开始导出：' + err);
     syncExportStartButton();
+    updateCurationCounts();
   }
 });
 document.getElementById('exportCancelJob').addEventListener('click', async ()=>{
@@ -1444,7 +1694,7 @@ function renderLbStars(){
   const cur = activePhoto();
   const box = document.getElementById('lbStars');
   box.innerHTML = '';
-  if(!cur || !cur.scores){ box.innerHTML = '<span class="dim" style="font-size:11px">未评分</span>'; return; }
+  if(!cur) return;
   for(let s2=1; s2<=5; s2++){
     const b = document.createElement('button');
     b.textContent = s2 <= (cur.stars||0) ? '★' : '☆';
@@ -1471,19 +1721,27 @@ function setStars(photo, n){
         }
       }
       if(LB) renderLBActive();
-      apply();
+      if(f.stars.size > 0) apply();
+      else updateCardVisual(photo);
     } else {
       toast(j.error || text || r.statusText || '写入失败');
     }
   }).catch(err=> toast('写入失败：' + err));
 }
-// 快捷键 1~5（灯箱打开时）
+// 快捷键 1~5 / P / X / U（灯箱打开时）
 window.addEventListener('keydown', e=>{
   if(lbEl.style.display !== 'flex' || isTypingTarget(e.target)) return;
+  if(e.ctrlKey || e.metaKey || e.altKey) return;
+  const cur = activePhoto();
+  if(!cur) return;
   if(e.key >= '1' && e.key <= '5'){
-    const cur = activePhoto();
-    if(cur && cur.scores) setStars(cur, +e.key);
+    setStars(cur, +e.key);
+    return;
   }
+  const low = e.key.toLowerCase();
+  if(low === 'p') setPhotoFlag(cur, 'pick');
+  else if(low === 'x') setPhotoFlag(cur, 'reject');
+  else if(low === 'u') setPhotoFlag(cur, 'unflagged');
 });
 
 // 配置对话框
@@ -1622,7 +1880,9 @@ document.getElementById('cfgSave').addEventListener('click', ()=>{
 try{
   const saved = JSON.parse(localStorage.getItem("fc_filters") || "null");
   if(saved){
-    f.search = saved.search || ""; f.keep = saved.keep || "all";
+    f.search = saved.search || "";
+    f.flag = VALID_FLAG_FILTERS.has(saved.flag) ? saved.flag : "all";
+    f.keep = saved.keep || "all";
     f.group = saved.group || "all";
     f.aggregate = saved.aggregate !== false;
     f.faces = !!saved.faces; f.sort = saved.sort || "total";
@@ -1837,6 +2097,7 @@ startReview().then(ready=>{
   loadHistogramSettings();
   pollJob();
   document.getElementById("fSearch").value = f.search;
+  document.getElementById("fFlag").value = f.flag;
   document.getElementById("fKeep").value = f.keep;
   document.getElementById("fGroup").value = f.group;
   document.getElementById("fAggregate").checked = f.aggregate;

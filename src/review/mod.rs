@@ -831,6 +831,8 @@ fn router(state: Arc<AppState>, access: Arc<access::Access>) -> Router {
         .route("/api/export/cancel", post(export_cancel))
         .route("/api/export/open", post(export_open))
         .route("/api/rate", post(rate))
+        .route("/api/flag", post(set_flag))
+        .route("/api/flag/batch", post(set_flag_batch))
         .route("/api/burst/keep", post(burst_keep))
         .route("/api/scene-feedback", post(scene_feedback_save))
         .route("/api/config", get(config_get).post(config_save))
@@ -1404,6 +1406,8 @@ struct ExportFilterPayload {
     group: String,
     #[serde(default)]
     faces: bool,
+    #[serde(default = "default_all")]
+    flag: String,
     #[serde(default)]
     min: ExportMinScores,
 }
@@ -1468,10 +1472,82 @@ fn resolve_export_options(
     })
 }
 
+fn photo_matches_filter(
+    photo: &snapshot::PhotoJson,
+    filter: &ExportFilterPayload,
+    flag_filter: crate::export::FlagFilter,
+) -> bool {
+    let search = filter.search.trim().to_lowercase();
+    if !search.is_empty() && !photo.filename.to_lowercase().contains(&search) {
+        return false;
+    }
+    if !flag_filter.matches(photo.flag) {
+        return false;
+    }
+    if !filter.stars.is_empty() && !photo.stars.is_some_and(|s| filter.stars.contains(&s)) {
+        return false;
+    }
+    let group = photo.burst.as_ref().map(|b| b.group).unwrap_or(0);
+    match filter.keep.as_str() {
+        "keep" => {
+            // 非连拍单张（group == 0）始终视为保留；连拍组仅保留有效 keep == true 的帧
+            if group > 0 && !photo.burst.as_ref().is_some_and(|b| b.keep) {
+                return false;
+            }
+        }
+        "drop" => {
+            if !(group > 0 && photo.burst.as_ref().is_some_and(|b| !b.keep)) {
+                return false;
+            }
+        }
+        _ => {}
+    }
+    if filter.group == "burst" && group == 0 {
+        return false;
+    }
+    if filter.group == "single" && group != 0 {
+        return false;
+    }
+    if let Some(target_gid) = filter.group.strip_prefix("group:") {
+        if group == 0 || group.to_string() != target_gid {
+            return false;
+        }
+    }
+    if filter.faces && photo.faces == 0 {
+        return false;
+    }
+    match &photo.scores {
+        None => {
+            let has_score_floor = filter.min.total > 0.0
+                || filter.min.sharpness > 0.0
+                || filter.min.exposure > 0.0
+                || filter.min.noise > 0.0
+                || filter.min.composition > 0.0
+                || filter.min.aesthetic > 0.0;
+            if has_score_floor {
+                return false;
+            }
+        }
+        Some(s) => {
+            if s.total < filter.min.total
+                || s.sharpness < filter.min.sharpness
+                || s.exposure < filter.min.exposure
+                || s.noise < filter.min.noise
+                || s.composition < filter.min.composition
+                || s.aesthetic < filter.min.aesthetic
+            {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 fn build_export_items_from_snapshot(
     root: &Path,
     snap: &Snapshot,
     filter: &ExportFilterPayload,
+    flag_filter: crate::export::FlagFilter,
 ) -> (Vec<crate::export::ExportPhotoItem>, Vec<String>) {
     let all_sources: Vec<String> = snap.photos.iter().map(|p| p.path.clone()).collect();
     let mut raw_by_pair: HashMap<&str, &snapshot::PhotoJson> = HashMap::new();
@@ -1479,68 +1555,10 @@ fn build_export_items_from_snapshot(
         raw_by_pair.entry(p.pair_id.as_str()).or_insert(p);
     }
 
-    let search = filter.search.trim().to_lowercase();
     let mut items = Vec::new();
     for photo in snap.photos.iter().filter(|p| !p.is_raw) {
-        if !search.is_empty() && !photo.filename.to_lowercase().contains(&search) {
+        if !photo_matches_filter(photo, filter, flag_filter) {
             continue;
-        }
-        if !filter.stars.is_empty() && !photo.stars.is_some_and(|s| filter.stars.contains(&s)) {
-            continue;
-        }
-        let group = photo.burst.as_ref().map(|b| b.group).unwrap_or(0);
-        match filter.keep.as_str() {
-            "keep" => {
-                // 非连拍单张（group == 0）始终视为保留；连拍组仅保留有效 keep == true 的帧
-                if group > 0 && !photo.burst.as_ref().is_some_and(|b| b.keep) {
-                    continue;
-                }
-            }
-            "drop" => {
-                if !(group > 0 && photo.burst.as_ref().is_some_and(|b| !b.keep)) {
-                    continue;
-                }
-            }
-            _ => {}
-        }
-        if filter.group == "burst" && group == 0 {
-            continue;
-        }
-        if filter.group == "single" && group != 0 {
-            continue;
-        }
-        if let Some(target_gid) = filter.group.strip_prefix("group:") {
-            if group == 0 || group.to_string() != target_gid {
-                continue;
-            }
-        }
-        if filter.faces && photo.faces == 0 {
-            continue;
-        }
-        match &photo.scores {
-            None => {
-                let has_score_floor = filter.min.total > 0.0
-                    || filter.min.sharpness > 0.0
-                    || filter.min.exposure > 0.0
-                    || filter.min.noise > 0.0
-                    || filter.min.composition > 0.0
-                    || filter.min.aesthetic > 0.0
-                    || !filter.stars.is_empty();
-                if has_score_floor {
-                    continue;
-                }
-            }
-            Some(s) => {
-                if s.total < filter.min.total
-                    || s.sharpness < filter.min.sharpness
-                    || s.exposure < filter.min.exposure
-                    || s.noise < filter.min.noise
-                    || s.composition < filter.min.composition
-                    || s.aesthetic < filter.min.aesthetic
-                {
-                    continue;
-                }
-            }
         }
 
         let raw_rel = raw_by_pair.get(photo.pair_id.as_str()).map(|r| r.path.clone());
@@ -1598,6 +1616,7 @@ fn build_export_items_from_snapshot(
             jpg_rel: Some(photo.path.clone()),
             raw_rel,
             xmp_meta,
+            manual_rating: if photo.scores.is_none() { photo.stars } else { None },
         });
     }
     (items, all_sources)
@@ -1692,13 +1711,16 @@ async fn export_preview(
     if state.loading.load(Ordering::Acquire) {
         return (StatusCode::CONFLICT, "照片仍在加载，请稍后再预览导出").into_response();
     }
+    let Some(flag_filter) = crate::export::FlagFilter::parse(&req.filter.flag) else {
+        return (StatusCode::BAD_REQUEST, "无效的选片标记筛选条件").into_response();
+    };
     let opts = match resolve_export_options(&state, &req) {
         Ok(o) => o,
         Err(resp) => return resp,
     };
     let (items, all_sources) = {
         let guard = state.snapshot.read().unwrap();
-        build_export_items_from_snapshot(&state.root, &guard, &req.filter)
+        build_export_items_from_snapshot(&state.root, &guard, &req.filter, flag_filter)
     };
     let source = state.source.clone();
     match tokio::task::spawn_blocking(move || {
@@ -1721,6 +1743,9 @@ async fn export_run(
     if state.loading.load(Ordering::Acquire) {
         return (StatusCode::CONFLICT, "照片仍在加载，请稍后再导出").into_response();
     }
+    let Some(flag_filter) = crate::export::FlagFilter::parse(&req.filter.flag) else {
+        return (StatusCode::BAD_REQUEST, "无效的选片标记筛选条件").into_response();
+    };
     let opts = match resolve_export_options(&state, &req) {
         Ok(o) => o,
         Err(resp) => return resp,
@@ -1731,7 +1756,7 @@ async fn export_run(
     };
     let (items, all_sources) = {
         let guard = state.snapshot.read().unwrap();
-        build_export_items_from_snapshot(&state.root, &guard, &req.filter)
+        build_export_items_from_snapshot(&state.root, &guard, &req.filter, flag_filter)
     };
     if items.is_empty() {
         state.job.abort_start();
@@ -1981,11 +2006,141 @@ async fn scene_feedback_save(State(state): State<Arc<AppState>>,
     .await
 }
 
+#[derive(Deserialize)]
+struct FlagParams {
+    p: String,
+    flag: crate::decision::CurationFlag,
+}
+
+#[derive(Deserialize)]
+struct BatchFlagParams {
+    #[serde(default)]
+    filter: ExportFilterPayload,
+    flag: crate::decision::CurationFlag,
+}
+
+/// POST /api/flag：保存单张照片的人工选片标记（留用 / 未定 / 剔除）。
+async fn set_flag(
+    State(state): State<Arc<AppState>>,
+    axum::Json(p): axum::Json<FlagParams>,
+) -> Response {
+    if state.loading.load(Ordering::Acquire) {
+        return (StatusCode::CONFLICT, "照片仍在加载，请稍后再标记").into_response();
+    }
+    run_serialized_mutation(
+        state,
+        "评分任务进行中或服务正在关闭，暂不能修改选片标记",
+        move |state| {
+            let (pair_id, jpg_path) = {
+                let guard = state.snapshot.read().unwrap();
+                let Some(photo) = guard.photos.iter().find(|x| x.path == p.p && !x.is_raw) else {
+                    return (StatusCode::NOT_FOUND, "照片不在快照中").into_response();
+                };
+                (photo.pair_id.clone(), state.root.join(&photo.path))
+            };
+            if let Err(err) = crate::decision::set_flag_in(
+                &state.paths.state_dir,
+                &state.root,
+                &jpg_path,
+                p.flag,
+            ) {
+                return internal_error(err);
+            }
+            let mut guard = state.snapshot.write().unwrap();
+            for photo in guard.photos.iter_mut().filter(|x| x.pair_id == pair_id) {
+                photo.flag = p.flag;
+            }
+            json_response(serde_json::json!({
+                "ok": true,
+                "path": p.p,
+                "flag": p.flag,
+            }))
+        },
+    )
+    .await
+}
+
+/// POST /api/flag/batch：将当前筛选命中的全部照片（不受连拍聚合折叠影响）批量设为指定选片标记。
+async fn set_flag_batch(
+    State(state): State<Arc<AppState>>,
+    axum::Json(req): axum::Json<BatchFlagParams>,
+) -> Response {
+    if state.loading.load(Ordering::Acquire) {
+        return (StatusCode::CONFLICT, "照片仍在加载，请稍后再批量标记").into_response();
+    }
+    let Some(flag_filter) = crate::export::FlagFilter::parse(&req.filter.flag) else {
+        return (StatusCode::BAD_REQUEST, "无效的选片标记筛选条件").into_response();
+    };
+    run_serialized_mutation(
+        state,
+        "评分任务进行中或服务正在关闭，暂不能批量修改选片标记",
+        move |state| {
+            let targets: Vec<(String, String, PathBuf)> = {
+                let guard = state.snapshot.read().unwrap();
+                guard
+                    .photos
+                    .iter()
+                    .filter(|p| !p.is_raw && photo_matches_filter(p, &req.filter, flag_filter))
+                    .map(|p| (p.path.clone(), p.pair_id.clone(), state.root.join(&p.path)))
+                    .collect()
+            };
+            let matched_count = targets.len();
+            if targets.is_empty() {
+                return json_response(serde_json::json!({
+                    "ok": true,
+                    "flag": req.flag,
+                    "matched_count": 0,
+                    "updated_count": 0,
+                    "failed_count": 0,
+                    "updated": [],
+                }));
+            }
+            let jpg_paths: Vec<PathBuf> = targets.iter().map(|(_, _, full)| full.clone()).collect();
+            let outcome = match crate::decision::set_flags_batch_in(
+                &state.paths.state_dir,
+                &state.root,
+                &jpg_paths,
+                req.flag,
+            ) {
+                Ok(out) => out,
+                Err(err) => return internal_error(err),
+            };
+            let updated_set: std::collections::HashSet<&str> =
+                outcome.updated.iter().map(String::as_str).collect();
+            let updated_pairs: std::collections::HashSet<String> = targets
+                .iter()
+                .filter(|(rel, _, _)| updated_set.contains(rel.as_str()))
+                .map(|(_, pair_id, _)| pair_id.clone())
+                .collect();
+            let mut guard = state.snapshot.write().unwrap();
+            for photo in guard
+                .photos
+                .iter_mut()
+                .filter(|x| updated_pairs.contains(&x.pair_id))
+            {
+                photo.flag = req.flag;
+            }
+            json_response(serde_json::json!({
+                "ok": true,
+                "flag": req.flag,
+                "matched_count": matched_count,
+                "updated_count": outcome.updated.len(),
+                "failed_count": outcome.failed.len(),
+                "updated": outcome.updated,
+            }))
+        },
+    )
+    .await
+}
+
 /// POST /api/rate：UI 内改星——持久化到本机工作区 `decisions.sqlite`（源目录零写入；导出时合并进目标 XMP）。
 async fn rate(State(state): State<Arc<AppState>>,
     axum::Json(p): axum::Json<RateParams>) -> Response {
     if !(1..=5).contains(&p.stars) {
         return (StatusCode::BAD_REQUEST, "星级必须是 1~5").into_response();
+    }
+    if state.loading.load(Ordering::Acquire) {
+        return (StatusCode::CONFLICT, "照片仍在加载，请稍后再改星").into_response();
     }
     run_serialized_mutation(
         state,
@@ -1996,14 +2151,7 @@ async fn rate(State(state): State<Arc<AppState>>,
                 let Some(photo) = guard.photos.iter().find(|x| x.path == p.p && !x.is_raw) else {
                     return (StatusCode::NOT_FOUND, "照片不在快照中").into_response();
                 };
-                if photo.scores.is_none() {
-                    return (StatusCode::BAD_REQUEST, "该照片未评分，先跑一次评分再改星").into_response();
-                }
-                let jpg_path = match guard.photos.iter().find(|x| x.pair_id == photo.pair_id && !x.is_raw) {
-                    Some(jpg) => state.root.join(&jpg.path),
-                    None => return (StatusCode::BAD_REQUEST, "该照片没有可评分 JPG").into_response(),
-                };
-                (photo.pair_id.clone(), jpg_path)
+                (photo.pair_id.clone(), state.root.join(&photo.path))
             };
             if let Err(err) = crate::decision::set_in(&state.paths.state_dir, &state.root, &jpg_path, p.stars) {
                 return internal_error(err);
@@ -2217,6 +2365,8 @@ mod tests {
             "/api/export/cancel",
             "/api/export/open",
             "/api/rate",
+            "/api/flag",
+            "/api/flag/batch",
             "/api/burst/keep",
             "/api/config",
             "/api/scene-feedback",
@@ -2296,6 +2446,7 @@ mod tests {
             scores: None, stars: None, rating_source: None, analysis_mode: None, faces: 0,
             scene_hint: snapshot::SceneHintJson { id: "unknown", label: "未识别", reason: String::new() },
             scene_feedback: None,
+            flag: crate::decision::CurationFlag::Unflagged,
             burst: Some(snapshot::BurstJson { group: 7, size: 1, rank: 1, keep: true,
                 suggested_keep: true, manual_keep: None, pose_cluster: 1 }),
         };
@@ -2366,6 +2517,7 @@ mod tests {
             stars: Some(3), rating_source: None, analysis_mode: Some("ai".into()), faces: 1,
             burst: None, scene_hint: snapshot::SceneHintJson { id: "portrait", label: "人像候选",
                 reason: "检测到 1 张人脸".into() }, scene_feedback: None,
+            flag: crate::decision::CurationFlag::Unflagged,
         };
         let state = Arc::new(AppState {
             source: WorkspaceSource::Single { root: dir.clone() },
@@ -2429,6 +2581,7 @@ mod tests {
             analysis_mode: Some("pixel".into()), faces: 0, burst: None,
             scene_hint: snapshot::SceneHintJson { id: "unknown", label: "未识别", reason: String::new() },
             scene_feedback: None,
+            flag: crate::decision::CurationFlag::Unflagged,
         };
         let state = Arc::new(AppState {
             source: WorkspaceSource::Single { root: dir.clone() },
@@ -2514,6 +2667,7 @@ mod tests {
             analysis_mode: Some("pixel".into()), faces: 0, burst: None,
             scene_hint: snapshot::SceneHintJson { id: "unknown", label: "未识别", reason: String::new() },
             scene_feedback: None,
+            flag: crate::decision::CurationFlag::Unflagged,
         };
         let state = Arc::new(AppState {
             source: WorkspaceSource::Single { root: dir.clone() },
@@ -2553,7 +2707,7 @@ mod tests {
         // 导出时在内存中合并最新 5★ 到目标 XMP，同时保留原有 Lightroom 曝光
         let (items, all_sources) = {
             let guard = state.snapshot.read().unwrap();
-            build_export_items_from_snapshot(&state.root, &guard, &ExportFilterPayload::default())
+            build_export_items_from_snapshot(&state.root, &guard, &ExportFilterPayload::default(), crate::export::FlagFilter::All)
         };
         let opts = crate::export::ExportOptions {
             target: crate::export::ExportTarget::ExternalDir(export_dir.clone()),
@@ -2582,6 +2736,7 @@ mod tests {
             scores: None, stars: None, rating_source: None, analysis_mode: None, faces: 0,
             scene_hint: snapshot::SceneHintJson { id: "unknown", label: "未识别", reason: String::new() },
             scene_feedback: None,
+            flag: crate::decision::CurationFlag::Unflagged,
             burst: Some(snapshot::BurstJson { group: 1, size: 2, rank: 1, keep: true,
                 suggested_keep: true, manual_keep: None, pose_cluster: 1 }),
         };
@@ -2700,6 +2855,7 @@ mod tests {
             analysis_mode: Some("pixel".into()), faces: 0, burst,
             scene_hint: snapshot::SceneHintJson { id: "unknown", label: "未识别", reason: String::new() },
             scene_feedback: None,
+            flag: crate::decision::CurationFlag::Unflagged,
         };
 
         let photos = vec![
@@ -2864,6 +3020,7 @@ mod tests {
                         reason: String::new(),
                     },
                     scene_feedback: None,
+                    flag: crate::decision::CurationFlag::Unflagged,
                 }],
             }),
             job: Arc::new(JobState::new()),
@@ -2979,5 +3136,148 @@ mod tests {
             std::fs::read_to_string(&legacy_prefs).unwrap(),
             r#"{"include_raw":true,"histogram_sample_percent":22}"#
         );
+    }
+
+    #[tokio::test]
+    async fn flag_and_batch_flag_endpoints_persist_update_snapshot_and_filter_export() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("album");
+        std::fs::create_dir_all(dir.join("JPG")).unwrap();
+        std::fs::create_dir_all(dir.join("RAW")).unwrap();
+        std::fs::write(dir.join("JPG/a.jpg"), b"jpg-a").unwrap();
+        std::fs::write(dir.join("RAW/a.ARW"), b"raw-a").unwrap();
+        std::fs::write(dir.join("JPG/b.jpg"), b"jpg-b").unwrap();
+        std::fs::write(dir.join("RAW/b.ARW"), b"raw-b").unwrap();
+
+        let make_photo = |rel: &str, name: &str, ext: &str, is_raw: bool, pair: &str| snapshot::PhotoJson {
+            path: rel.into(),
+            filename: name.into(),
+            ext: ext.into(),
+            is_raw,
+            has_pair: true,
+            pair_id: pair.into(),
+            datetime: String::new(),
+            iso: String::new(),
+            f_number: String::new(),
+            shutter: String::new(),
+            focal: String::new(),
+            scores: None,
+            stars: None,
+            rating_source: None,
+            analysis_mode: None,
+            faces: 0,
+            burst: None,
+            flag: crate::decision::CurationFlag::Unflagged,
+            scene_hint: snapshot::SceneHintJson {
+                id: "unknown",
+                label: "未识别",
+                reason: String::new(),
+            },
+            scene_feedback: None,
+        };
+
+        let state = Arc::new(AppState {
+            source: WorkspaceSource::Single { root: dir.clone() },
+            paths: WorkspacePaths::in_state_dir(temp.path().join("local_state")),
+            root: dir.clone(),
+            cache_path: temp.path().join("local_state/cache.sqlite"),
+            config_path: temp.path().join("local_state/config.toml"),
+            config_explicit: false,
+            scene_feedback: RwLock::new(HashMap::new()),
+            scene_feedback_path: temp.path().join("local_state/scene-feedback.jsonl"),
+            image_slots: Arc::new(Semaphore::new(2)),
+            thumb_slots: Arc::new(Semaphore::new(1)),
+            snapshot: RwLock::new(Snapshot {
+                root: dir.display().to_string(),
+                source_mode: "single".into(),
+                jpg_root: dir.display().to_string(),
+                raw_root: None,
+                weights: snapshot::WeightsJson {
+                    sharpness: 0.3,
+                    exposure: 0.25,
+                    noise: 0.15,
+                    composition: 0.15,
+                    aesthetic: 0.15,
+                },
+                photos: vec![
+                    make_photo("JPG/a.jpg", "a.jpg", "jpg", false, "pa"),
+                    make_photo("RAW/a.ARW", "a.ARW", "arw", true, "pa"),
+                    make_photo("JPG/b.jpg", "b.jpg", "jpg", false, "pb"),
+                    make_photo("RAW/b.ARW", "b.ARW", "arw", true, "pb"),
+                ],
+            }),
+            job: Arc::new(JobState::new()),
+            write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            loading: AtomicBool::new(false),
+            load_error: Mutex::new(None),
+            load_progress: Mutex::new(LoadProgress {
+                phase: String::new(),
+                done: 0,
+                total: 0,
+            }),
+            include_raw: true,
+            local_desktop: false,
+            approved_export_dirs: Mutex::new(Vec::new()),
+            last_export_target: None,
+            control: None,
+        });
+
+        // 1) 未评分照片可直接打星与单张标记
+        let rate_resp = rate(
+            State(Arc::clone(&state)),
+            axum::Json(RateParams {
+                p: "JPG/a.jpg".into(),
+                stars: 5,
+            }),
+        )
+        .await;
+        assert_eq!(rate_resp.status(), StatusCode::OK);
+
+        let flag_resp = set_flag(
+            State(Arc::clone(&state)),
+            axum::Json(FlagParams {
+                p: "JPG/b.jpg".into(),
+                flag: crate::decision::CurationFlag::Reject,
+            }),
+        )
+        .await;
+        assert_eq!(flag_resp.status(), StatusCode::OK);
+
+        // 2) 按筛选批量将 5★ 照片设为留用（仅命中 JPG/a.jpg，同步到配对 RAW）
+        let batch_req: BatchFlagParams = serde_json::from_value(serde_json::json!({
+            "filter": { "stars": [5] },
+            "flag": "pick"
+        }))
+        .unwrap();
+        let batch_resp = set_flag_batch(State(Arc::clone(&state)), axum::Json(batch_req)).await;
+        assert_eq!(batch_resp.status(), StatusCode::OK);
+        let batch_body = axum::body::to_bytes(batch_resp.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let batch_json: serde_json::Value = serde_json::from_slice(&batch_body).unwrap();
+        assert_eq!(batch_json["updated_count"], 1);
+        {
+            let snap = state.snapshot.read().unwrap();
+            assert_eq!(snap.photos[0].flag, crate::decision::CurationFlag::Pick);
+            assert_eq!(snap.photos[1].flag, crate::decision::CurationFlag::Pick);
+            assert_eq!(snap.photos[2].flag, crate::decision::CurationFlag::Reject);
+            assert_eq!(snap.photos[3].flag, crate::decision::CurationFlag::Reject);
+        }
+
+        // 3) 导出预览按 flag="pick" 仅命中 a，且为未评分但已打星的 a 生成 XMP
+        let preview_req: ExportRequest = serde_json::from_value(serde_json::json!({
+            "subdir": "Selected",
+            "filter": { "flag": "pick" }
+        }))
+        .unwrap();
+        let preview_resp = export_preview(State(Arc::clone(&state)), axum::Json(preview_req)).await;
+        assert_eq!(preview_resp.status(), StatusCode::OK);
+        let preview_body = axum::body::to_bytes(preview_resp.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let preview_json: serde_json::Value = serde_json::from_slice(&preview_body).unwrap();
+        assert_eq!(preview_json["selected_photos"], 1);
+        assert_eq!(preview_json["xmp_to_write"], 2);
+        assert!(!dir.join(".firstcut").exists(), "源目录必须保持零写入");
     }
 }

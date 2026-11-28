@@ -189,6 +189,22 @@ pub fn render_xmp_with_crs(
     )
 }
 
+/// 生成仅包含人工星级的最小 XMP 侧车（用于尚未评分但已手动打星的照片；不含 `xmlns:firstcut`）。
+pub fn render_rating_only_xmp(rating: u8) -> String {
+    format!(
+        "<?xpacket begin=\"\u{feff}\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\n\
+         <x:xmpmeta xmlns:x=\"adobe:ns:meta/\">\n\
+         \x20<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n\
+         \x20\x20<rdf:Description rdf:about=\"\"\n\
+         \x20\x20\x20 xmlns:xmp=\"{NS_XMP}\">\n\
+         \x20\x20\x20\x20<xmp:Rating>{rating}</xmp:Rating>\n\
+         \x20\x20</rdf:Description>\n\
+         \x20</rdf:RDF>\n\
+         </x:xmpmeta>\n\
+         <?xpacket end=\"w\"?>"
+    )
+}
+
 /// 写出侧车（默认 `MetadataOnly`）；他人侧车（无 firstcut 命名空间）不覆盖。
 /// 返回 Ok(true) 表示已写入，Ok(false) 表示跳过（他人侧车/无分数）。
 pub fn write_sidecar(
@@ -266,7 +282,19 @@ pub fn merge_xmp_for_export(
         };
         return merge_xmp(existing_content, e, s, total, rating, suggested_ev, mode);
     }
+    update_external_xmp_rating(existing_content, rating)
+}
 
+/// 导出专用：对尚未评分但已有人工星级的照片，仅在内存中更新或补充 `xmp:Rating`
+/// （保留原有 `crs:Exposure2012` 与任何现有 `firstcut:*` 字段）。
+pub fn merge_xmp_rating_only_for_export(
+    existing_content: &str,
+    rating: u8,
+) -> anyhow::Result<String> {
+    update_external_xmp_rating(existing_content, rating)
+}
+
+fn update_external_xmp_rating(existing_content: &str, rating: u8) -> anyhow::Result<String> {
     use anyhow::{anyhow, Context};
     use roxmltree::{Document, NodeType};
     let doc = Document::parse(existing_content).context("现有 XMP 无法解析")?;
@@ -303,6 +331,7 @@ pub fn merge_xmp_for_export(
         for (range, replacement) in edits {
             output.replace_range(range, &replacement);
         }
+        Document::parse(&output).context("合并后的 XMP 无效")?;
         return Ok(output);
     }
 
@@ -325,6 +354,7 @@ pub fn merge_xmp_for_export(
         at,
         &format!("    <xmp:Rating{ns_attr}>{rating}</xmp:Rating>\n  "),
     );
+    Document::parse(&output).context("合并后的 XMP 无效")?;
     Ok(output)
 }
 
@@ -569,6 +599,7 @@ mod tests {
             burst_rank: "1".into(),
             burst_keep: "true".into(),
             burst_pose: "1".into(),
+            curation_flag: String::new(),
         }
     }
 
@@ -861,5 +892,24 @@ mod tests {
         assert!(merged_no_exp.contains("crs:HasSettings=\"True\""));
         assert_eq!(merged_no_exp.matches("ProcessVersion").count(), 1);
         assert!(merged_no_exp.contains("crs:ProcessVersion=\"15.4\""));
+    }
+
+    #[test]
+    fn rating_only_xmp_and_export_merge_preserve_crs_exposure() {
+        let minimal = render_rating_only_xmp(4);
+        assert!(minimal.contains("<xmp:Rating>4</xmp:Rating>"));
+        assert!(!minimal.contains("xmlns:firstcut"));
+        roxmltree::Document::parse(&minimal).unwrap();
+
+        let lr_xmp = "<?xpacket begin=\"\u{feff}\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\n\
+            <x:xmpmeta xmlns:x=\"adobe:ns:meta/\">\n\
+             <rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n\
+              <rdf:Description rdf:about=\"\" xmlns:xmp=\"http://ns.adobe.com/xap/1.0/\" xmlns:crs=\"http://ns.adobe.com/camera-raw-settings/1.0/\" xmp:Rating=\"2\" crs:Exposure2012=\"+0.75\"/>\n\
+             </rdf:RDF>\n\
+            </x:xmpmeta>\n\
+            <?xpacket end=\"w\"?>";
+        let merged = merge_xmp_rating_only_for_export(lr_xmp, 5).unwrap();
+        assert!(merged.contains("xmp:Rating=\"5\""));
+        assert!(merged.contains("crs:Exposure2012=\"+0.75\""));
     }
 }

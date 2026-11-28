@@ -363,6 +363,7 @@ mod tests {
             burst_rank: String::new(),
             burst_keep: String::new(),
             burst_pose: String::new(),
+            curation_flag: String::new(),
         }
     }
 
