@@ -20,7 +20,7 @@
 ## 核心架构概览
 
 ```text
-扫描 / EXIF / JPG+ARW 配对 (scan)
+扫描 / EXIF / JPG+RAW 配对 (scan)
         ↓  [cap-std 安全目录句柄边界: storage]
 增量分析缓存匹配 (cache.sqlite, CACHE_VERSION = 15)
         ↓  未命中时
@@ -28,7 +28,7 @@ JPEG 解码 + 像素指标 (decode / metrics) + ONNX AI 推理 (ai: SCRFD / YOLO
         ↓
 统一结果合成 (selection / dedup / decision: 当前权重、相对星级、连拍簇、人工决定覆盖)
         ↓
-CSV 报告 / XMP 侧车 (output)  &  本地 Web 复核台 (review: axum + 内嵌前端)
+CSV 报告 / XMP 侧车 / 非破坏导出 (output / export)  &  本地 Web 复核台 (review: axum + 内嵌前端)
 ```
 
 - **四层数据分离与零写入源目录**：原始照片/存储卡（只读资产）→ 可重建分析缓存（`cache.sqlite`）→ 运行期算法建议（`selection` 共用逻辑）→ 持久化人工决定（`decisions.sqlite`，重评分不覆盖）。所有运行态数据统一存放在本机应用数据目录（Windows 默认 `%LOCALAPPDATA%\firstcut\workspaces\<工作区ID>\`，Linux 默认 `${XDG_DATA_HOME:-$HOME/.local/share}/firstcut/workspaces/<工作区ID>/`，可通过 `FIRSTCUT_DATA_DIR` 覆盖）；单目录模式下首次打开会自动只读导入旧版 `<照片目录>/.firstcut/` 历史数据。
@@ -78,10 +78,10 @@ pic_process export <照片目录> --stars 4,5 --keep-only --layout flat --dry-ru
 
 # 6. 生成评分配置模板或场景预设（portrait / stage / highkey / sports / lowlight）
 pic_process config-template
-pic_process config-template --preset stage -o <照片目录>/.firstcut/config.toml
+pic_process config-template --preset stage -o stage.toml
 
 # 7. 辅助工具
-pic_process-gallery <照片目录>/.firstcut/report.csv   # 生成静态 HTML 联系表（默认输出到报告同目录）
+pic_process-gallery <report.csv>                      # 生成静态 HTML 联系表（报告默认位于本机工作区状态目录）
 pic_process-tune <照片目录>                            # 导出原始指标（默认 <照片目录>/.firstcut/metrics.csv）
 ```
 
@@ -89,7 +89,7 @@ pic_process-tune <照片目录>                            # 导出原始指标�
 - `--xmp`：写出 `<stem>.xmp` 侧车（默认仅写 `xmp:Rating`、`firstcut:*` 与信息字段 `firstcut:suggestedEV`，不触碰 Adobe `crs:*` 开发参数）
 - `--xmp-exposure`：配合 `--xmp` 显式将建议曝光写入 Adobe `crs:Exposure2012`（亦可在配置中设 `[metric] exposure_write_crs = true`）；绝不覆盖或删除侧车中已有的 Lightroom 人工曝光
 - `-k <N>`：每个连拍保留单元（姿态簇 / dHash 子簇）保留前 N 张（默认读取 `[dedup] keep_k = 3`）
-- `--config <file>`：指定评分配置 TOML（默认自动读取 `<照片目录>/.firstcut/config.toml`）
+- `--config <file>`：指定评分配置 TOML（默认自动读取本机工作区状态目录的 `config.toml`）
 - `--cache <file>` / `--no-cache`：指定旧版/自定义缓存路径，或禁用缓存
 - `--no-ai`：跳过 AI 推理，仅跑纯像素模式
 - `--raw-csv`：输出不做表格公式转义的原始 CSV（仅限脚本读取，勿直接用电子表格打开不可信来源）
@@ -165,7 +165,7 @@ docker compose up -d
 
 ### 内置场景预设
 
-通过 `pic_process config-template --preset <名称>` 生成，或在复核界面直接编辑 `.firstcut/config.toml`：
+通过 `pic_process config-template --preset <名称>` 生成，或在复核界面直接编辑工作区评分配置（保存于本机工作区状态目录的 `config.toml`）：
 
 | 预设 | 适用场景 | 主要调整 |
 |---|---|---|
@@ -187,11 +187,11 @@ docker compose up -d
 
 ## 本地复核界面（`review`）
 
-- **缩略图墙与筛选侧栏**：分页懒加载、筛选排序自动记忆；默认按连拍组折叠显示代表帧，卡片角标与悬停快捷按钮支持一键**留用 / 剔除**，侧栏支持按**选片标记**筛选并一键**将当前筛选设为留用** / 批量清除 / 批量剔除；“连拍保留”支持「保留（含非连拍单张）」，点击或右键可展开整组、设置选片标记与保留覆盖。侧栏筛选区可折叠并拖动调宽。
-- **1:1 原图灯箱与连拍并排对比**：按需流式直读原图并预加载同组/邻近原图，支持滚轮缩放、拖拽平移、双击复位、`←/→` 切换（支持在灯箱顶部或界面设置切换「跨组切换 / 锁定连拍组」）、缩放百分比与带单位 EXIF（`f/`、`s`、`mm`）；支持勾选同组 2–4 张**同步缩放平移**对比合焦，并在灯箱顶部与并排窗格直接切换选片标记（快捷键 `P` 留用 / `X` 剔除 / `U` 取消标记）。侧栏排序支持总分、拍摄时间（新→旧 / 旧→新）与文件名（A→Z / Z→A）。
+- **缩略图墙、筛选与即时落盘**：分页懒加载、筛选排序自动记忆；默认按连拍组折叠显示代表帧，卡片角标与悬停快捷按钮支持一键**留用 / 剔除**，侧栏支持按**选片标记**筛选并一键**将当前筛选设为留用** / 批量清除 / 批量剔除；“连拍保留”支持「保留（含非连拍单张）」，点击或右键可展开整组、设置选片标记与保留覆盖。所有选片标记（`P`/`X`/`U`）、改星（`1–5`）与连拍保留覆盖均在每次操作时**立即同步持久化**到本机 `decisions.sqlite`（异常退出不丢进度）。侧栏筛选区可折叠并拖动调宽。
+- **1:1 原图灯箱与连拍并排对比**：按需流式直读原图并使用有界内存 LRU 预加载同组/邻近原图，支持滚轮缩放、拖拽平移（屏蔽浏览器原生拖拽与文本选中干扰）、双击复位、循环 `←/→` 切换（可在灯箱顶部工具栏与界面设置切换「跨组切换 / 锁定连拍组」，偏好保存在 `localStorage`）、底部同组胶片条与当前筛选排序保持一致、缩放百分比与带单位 EXIF（`f/`、`s`、`mm`）；支持勾选同组 2–4 张**同步缩放平移**对比合焦，并在灯箱顶部与并排窗格直接切换选片标记（快捷键 `P` 留用 / `X` 剔除 / `U` 取消标记）。侧栏排序支持总分、拍摄时间（新→旧 / 旧→新）与文件名（A→Z / Z→A）。
 - **RGBW 直方图**：可拖动悬浮面板，支持 W/R/G/B 通道独立开关，基于解码后 SDR JPEG 做网格抽样（默认 10%，可在设置中调为 1%–25%，仅内存缓存）。
 - **评分解释与场景反馈**：展示活动照片的五维子分、实际权重与贡献；支持记录真实场景纠正与备注至本机工作区状态目录的 `scene-feedback.jsonl`。
-- **界面内改星、跑批、调参与导出**：灯箱内 `1–5` 快捷改星并保存在本机（未评分照片也可直接打星，导出时自动合并或生成 `xmp:Rating` 侧车）；侧栏一键重评分与表单化调参；支持**“导出筛选结果”弹窗**（可切换按当前筛选或一键仅导出全部「留用」照片，导出前预览张数/体积/磁盘余量/重名改名，支持增量跳过、保护 PS/ACR 已编辑 XMP、中途取消，Windows 桌面端支持原生选目录与完成后一键打开导出文件夹）。
+- **界面内改星、跑批、调参与导出**：灯箱内 `1–5` 快捷改星并即时保存在本机（未评分照片也可直接打星，导出时自动合并或生成 `xmp:Rating` 侧车）；侧栏一键重评分与表单化调参；支持**“导出筛选结果”弹窗**（可切换按当前筛选或一键仅导出全部「留用」照片，导出前预览张数/体积/磁盘余量/重名改名，支持增量跳过、保护 PS/ACR 已编辑 XMP、中途取消，Windows 桌面端支持原生选目录与完成后一键打开导出文件夹）。
 
 ---
 
@@ -218,7 +218,7 @@ docker compose up -d
 
 | 列 | 含义 |
 |---|---|
-| `path, filename, extension, is_raw, has_pair` | 文件路径标识与 JPG/ARW 配对状态 |
+| `path, filename, extension, is_raw, has_pair` | 文件路径标识与 JPG/RAW 配对状态 |
 | `date_time_original` | EXIF 拍摄时间（连拍聚类依据） |
 | `camera_make, camera_model, lens_model` | 相机与镜头型号 |
 | `iso, f_number, shutter_speed, focal_length` | 曝光参数 |
@@ -228,7 +228,7 @@ docker compose up -d
 | `rating_source` | `algorithm`（算法建议）或 `manual`（人工星级） |
 | `analysis_mode` | `ai`（完整模型）或 `pixel`（纯像素/降级） |
 | `faces` | SCRFD 检测到的人脸数 |
-| `analysis_ok` | 分析数据是否可用（解码失败或无配对 ARW 为 `false`） |
+| `analysis_ok` | 分析数据是否可用（解码失败或无配对 RAW 为 `false`） |
 | `burst_group, burst_size, burst_rank, burst_keep, burst_pose` | 连拍组号、保留单元张数、单元内排名、建议保留标记、姿态簇号 |
 | `curation_flag` | 人工三态选片标记（`pick` 留用 / `reject` 剔除 / 空串未定） |
 
@@ -250,7 +250,7 @@ cargo build --release --features gpu
 
 | 二进制 | 用途 | 是否进入 Release |
 |---|---|---|
-| `pic_process` | 主命令行工具（`scan` / `score` / `config-template` / `review`） | 是 |
+| `pic_process` | 主命令行工具（`scan` / `score` / `export` / `config-template` / `review`） | 是 |
 | `firstcut-ui` | Windows 无控制台双击启动器 | 是 |
 | `pic_process-gallery` | 静态 HTML 联系表生成器 | 是 |
 | `pic_process-tune` | 原始指标 CSV 导出（调参用） | 是 |
@@ -260,17 +260,19 @@ cargo build --release --features gpu
 
 ```text
 src/
-├── main.rs            # CLI 入口（scan / score / config-template / review）
+├── main.rs            # CLI 入口（scan / score / export / config-template / review）
 ├── lib.rs             # 库模块导出
+├── workspace.rs       # 工作区身份、单/双目录源、本机状态目录与最近工作区管理
 ├── storage.rs         # 基于 cap-std 的安全目录/文件访问与防链接逃逸边界
-├── scan.rs            # 目录扫描、EXIF 解析与 JPG/ARW 配对
+├── scan.rs            # 目录扫描、EXIF 解析与多品牌 JPG/RAW 配对
 ├── decode.rs          # JPEG 快速解码（box 降采样）、EXIF 方向与灰度安全路径
 ├── score.rs           # 并行评分管线与 CLI/UI 共用跑批入口
 ├── config.rs          # 配置加载、严格校验、指纹计算与内置场景预设
 ├── cache.rs           # SQLite 增量分析缓存（CACHE_VERSION = 15）
 ├── dedup.rs           # 连拍时间分组、dHash 子簇与 SCRFD 姿态聚类
-├── decision.rs        # 独立人工星级存储与最终星级合并
-├── selection.rs       # CLI / review 共用的总分、星级与连拍结果合成
+├── decision.rs        # 统一人工决定库（人工星级、三态选片标记、连拍保留覆盖与内容指纹校验）
+├── selection.rs       # CLI / review / export 共用的总分、星级、选片标记与连拍结果合成
+├── export.rs          # 非破坏增量导出、XMP 合并与导出清单/冲突校验
 ├── metrics/           # sharpness / exposure / noise / composition
 ├── ai/                # CLIPIQA+ / SCRFD / YOLOv8-pose 推理与 SHA-256 校验
 ├── output/            # CSV（公式防护）与 XMP 侧车读写合并
@@ -278,7 +280,7 @@ src/
 │   ├── mod.rs         # HTTP 路由与服务生命周期
 │   ├── access.rs      # 访问凭据兑换、会话与 Host/Origin 校验中间件
 │   ├── snapshot.rs    # 快照构建与加载状态
-│   ├── job.rs         # 后台跑批任务与 256 KiB 有界日志
+│   ├── job.rs         # 后台跑批/导出互斥任务与 256 KiB 有界日志
 │   ├── config_edit.rs # 保留注释的 TOML 配置编辑
 │   ├── scene_feedback.rs # 场景反馈追加与大小上限保护
 │   ├── thumb.rs       # 固定槽位缩略图缓存
@@ -314,8 +316,9 @@ python .github/scripts/check-review.py --binary target/release/pic_process.exe
 
 ## 后续方向
 
-当前优先推进：
-1. 建立真实选片标注集，评估好片排除率与连拍最佳帧覆盖率。
-2. 完成 Lightroom / Camera Raw 实际导入验证（星级、JPG/ARW 配对与 `crs:Exposure2012` 效果）。
+目前三态选片标记（留用/剔除/未定）、批量标记、未评分直接打星、非破坏导出、Web 欢迎入口与双目录/多品牌 RAW、以及灯箱连拍切换/缩放平移/邻近预加载体验优化已落地。当前优先推进：
+1. 选片手感与人像工作流深化（一键 1:1 居中定焦人脸/眼睛查合焦、粘贴文件名清单反选 RAW、闭眼/表情废片过滤）。
+2. 建立真实选片标注集，评估好片排除率与连拍最佳帧覆盖率。
+3. 完成 Lightroom / Camera Raw 实际导入验证（JPG/RAW 配对、星级、导出目录布局与 `crs:Exposure2012` 效果）。
 
 完整路线与未验收项见 [`docs/DESIGN.md`](docs/DESIGN.md#9-后续工作与未验收项)。

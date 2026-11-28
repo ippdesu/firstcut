@@ -8,7 +8,7 @@
 |---|---|
 | [`../README.md`](../README.md) | 项目首页：快速上手、Windows 启动器 / CLI / Docker 用法、模型准备、目录结构与测试入口 |
 | [`DESIGN.md`](DESIGN.md) | **唯一现行设计与实现约定**：产品边界、四层数据模型、目录/缓存/配置语义、五维评分与连拍算法、Web UI、安全模型与后续计划 |
-| [`RELEASE_NOTES.md`](RELEASE_NOTES.md) | 面向用户的版本变更说明（v1.1 – v1.4.2） |
+| [`RELEASE_NOTES.md`](RELEASE_NOTES.md) | 面向用户的版本变更说明（v1.1 – v1.4.2 及 Unreleased 开发进度） |
 | [`../SECURITY.md`](../SECURITY.md) | 安全支持版本范围与私密漏洞报告渠道 |
 
 ## 历史与过期评审归档（[`history/`](history/README.md)）

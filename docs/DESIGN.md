@@ -1,6 +1,6 @@
 # firstcut — 当前设计与实现约定
 
-> 当前设计对应 **v1.4.2**。
+> 当前设计对应 **v1.4.2** 及其后续主干演进（非破坏导出、Web 欢迎入口与双目录/多品牌 RAW 工作区、三态选片标记与灯箱体验优化）。
 > 本文件是当前架构设计与实现约定的唯一维护入口；使用方法见 [README](../README.md)，版本变化见 [版本说明](RELEASE_NOTES.md)，漏洞报告见 [安全政策](../SECURITY.md)，历史评审、旧里程碑与已停止路线研究见 [历史归档](history/README.md)。
 
 ## 1. 产品边界与交付状态
@@ -9,7 +9,7 @@ firstcut 是 Rust 编写的本地照片初筛与复核工具。支持单目录�
 
 | 能力 | 当前状态与边界 |
 |---|---|
-| 评分与复核 | CLI 和本地 Web UI 均已实现，共用评分与星级合成；Windows 可双击启动 |
+| 评分与复核 | CLI 和本地 Web UI 均已实现，共用评分与星级合成；Windows 可双击打开 Web 欢迎页，支持单/双目录、多品牌 RAW、非破坏导出与即时 SQLite 持久化 |
 | 人工决定 | 人工星级、三态选片标记（留用/未定/剔除，含未评分照片）与连拍保留/舍弃覆盖均持久化在 `decisions.sqlite`，并统一作用于 review、CLI、CSV 与导出 |
 | 场景 | 有五份手动选择的评分预设；自动提示仅是基于人脸的“人像候选”，没有通用场景分类或自动调权 |
 | 图像 | 当前只支持 SDR JPEG 分析和直方图；RAW 不解码，仅配对与导出；HDR 增益图、PQ/HLG 未实现 |
@@ -23,12 +23,12 @@ firstcut 是 Rust 编写的本地照片初筛与复核工具。支持单目录�
 
 | 层 | 内容与身份 | 责任 |
 |---|---|---|
-| 照片资产 | `PhotoEntry`；扫描时生成批次内 `pair_id`；人工星级以根目录下 JPG 的相对路径为键 | 扫描、EXIF、配对、CSV 行数据 |
+| 照片资产 | `PhotoEntry`；扫描时生成批次内 `pair_id`；人工决定（星级/选片标记/连拍覆盖）以根目录下 JPG 的相对路径 + 文件内容指纹联合校验 | 扫描、EXIF、配对、CSV 行数据 |
 | 分析结果 | `AnalysisResult`；五维子分、dHash、姿态描述子及曝光建议 | 可重建缓存，区分分析模式、曲线参数和模型文件来源 |
 | 算法建议 | `selection::SelectionResult`；总分、算法星级、连拍簇/排名/保留建议 | 每次按当前配置和批次重新合成，CLI 与 review 共用 |
-| 人工决定 | `EffectiveRating` 与独立决定库；最终星级 = 人工值优先，否则算法值 | 重评分不覆盖用户决定，统一用于 review、CLI、CSV 与 XMP |
+| 人工决定 | `EffectiveRating` / `CurationFlag` 与统一决定库（`decisions.sqlite`）；最终星级 = 人工值优先，否则算法值 | 重评分不覆盖用户决定，每次 UI 标记/改星/覆盖即时同步落盘，统一用于 review、CLI、CSV 与 XMP |
 
-人工星级、三态选片标记（`manual_flag`）与人工连拍覆盖同时记录相对路径与文件轻量内容指纹（文件大小 + 首尾各 64 KiB SHA-256），同一挂载点换卡后同路径的不同照片不会误继承旧卡的人工决定；首次导入旧版 `.firstcut/decisions.sqlite` 时会按原相册照片补齐指纹，无法确认来源的旧记录保留在库中但不自动应用；读取照片指纹失败时匹配阶段保留算法结果、保存阶段明确报错。移动或重命名照片、改变所选根目录后，相对路径可能变化，不承诺自动迁移。JPG 与其配对 RAW 使用同一最终星级与选片标记。XMP 是导出结果，不是人工决定的唯一存储；旧版仅写进 XMP 的人工星级不会自动导入决定库。
+人工星级、三态选片标记（`manual_flag`）与人工连拍覆盖同时记录相对路径与文件轻量内容指纹（文件大小 + 首尾各 64 KiB SHA-256），同一挂载点换卡后同路径的不同照片不会误继承旧卡的人工决定；首次导入旧版 `.firstcut/decisions.sqlite` 时会按原相册照片补齐指纹，通过 `imported_legacy_decision` 按条目记录迁移与清除状态（删移其他照片后不会复活已清除的旧覆盖），无法确认来源的旧记录保留在库中但不自动应用；读取照片指纹失败时匹配阶段保留算法结果、保存阶段明确报错。移动或重命名照片、改变所选根目录后，相对路径可能变化，不承诺自动迁移。JPG 与其配对 RAW 使用同一最终星级与选片标记。XMP 是导出结果，不是人工决定的唯一存储；旧版仅写进 XMP 的人工星级不会自动导入决定库。
 
 人工星级、三态选片标记与人工连拍保留覆盖统一保存在本机工作区 `decisions.sqlite`，并通过 `selection` 同步驱动 `review`、CLI `score`（CSV/XMP）与 `export`（包括 `export --picked` / `--flag` 及未评分照片的人工星级 XMP 导出）。
 
@@ -55,7 +55,7 @@ firstcut 是 Rust 编写的本地照片初筛与复核工具。支持单目录�
 | 本机工作区状态目录下路径 | 用途 / 保留方式 |
 |---|---|
 | `cache.sqlite` | 可重建的分析缓存 |
-| `decisions.sqlite` | 统一人工决定库（人工星级 + 人工连拍保留/舍弃覆盖）；自动兼容并迁移旧版 `burst-overrides.json` |
+| `decisions.sqlite` | 统一人工决定库（人工星级 + 三态选片标记（留用/剔除） + 人工连拍保留/舍弃覆盖，含内容指纹与逐条旧库迁移记录）；自动兼容并迁移旧版 `burst-overrides.json` |
 | `scene-feedback.jsonl` | 场景纠正、备注与当时评分线索，需保留 |
 | `config.toml` | 当前评分配置；不存在时使用内置默认值 |
 | `ui-preferences.json` | RAW 关联和直方图抽样比例等工作区级偏好 |
@@ -110,7 +110,7 @@ CLI 显式 `--cache`、`--output`、`--config` 可覆盖对应路径；旧工作
 
 按 EXIF 时间排序，非负且 ≤2s 的相邻间隔聚为连拍组；组内 dHash（9×8 → 64 bit，汉明距离 ≤10）分近似子簇，再按 SCRFD 五关键点归一化的 10 维姿态描述子贪心聚类。姿态距离阈值默认 0.25；每个姿态簇按实际加权总分保留 top-K，默认 3 张，单组总保留上限 20。
 
-无有效姿态描述子的帧共用伪簇；`adaptive_keep = false` 回退到 dHash 子簇保留；`-k` 显式值优先于配置。`burst_size` / `burst_rank` 对应保留单元，不一定是整组张数。姿态只影响候选，不改变五维分数和星级。保留/舍弃是建议或人工标记，不是文件删除操作；人工连拍保留覆盖统一存放在 `.firstcut/decisions.sqlite`（兼容迁移旧 `.firstcut/burst-overrides.json`），经 `selection.rs` 同步驱动 `score`（CSV/XMP）、`export` 与 `review`。
+无有效姿态描述子的帧共用伪簇；`adaptive_keep = false` 回退到 dHash 子簇保留；`-k` 显式值优先于配置。`burst_size` / `burst_rank` 对应保留单元，不一定是整组张数。姿态只影响候选，不改变五维分数和星级。保留/舍弃是建议或人工标记，不是文件删除操作；人工连拍保留覆盖统一存放在本机工作区状态目录的 `decisions.sqlite`（单目录模式自动兼容迁移旧版 `<照片目录>/.firstcut/burst-overrides.json`），经 `selection.rs` 同步驱动 `score`（CSV/XMP）、`export` 与 `review`。
 
 ## 5. 处理链路与模块职责
 
@@ -123,12 +123,13 @@ CLI 显式 `--cache`、`--output`、`--config` 可覆盖对应路径；旧工作
 
 | 模块 | 职责 |
 |---|---|
-| `main.rs`、`bin/firstcut_ui.rs` | CLI 参数解析（`scan`/`score`/`export`/`config-template`/`review`）与 Windows 无控制台选目录启动器 |
+| `main.rs`、`bin/firstcut_ui.rs` | CLI 参数解析（`scan`/`score`/`export`/`config-template`/`review`）与 Windows 无控制台启动器（直接打开浏览器 Web 欢迎页，支持单实例唤醒重开） |
+| `workspace.rs` | 工作区身份标识、单/双目录源描述、本机状态目录与最近工作区管理、旧版 `.firstcut/` 只读导入 |
 | `storage.rs` | 基于 `cap-std` 句柄的安全目录与文件访问边界，逐级拒绝符号链接、重解析点、硬链接逃逸与未关闭数据库旁路日志，提供流式分块原子复制与卷剩余空间查询 |
-| `scan.rs`、`decode.rs` | 目录扫描（跳过 `.firstcut`、`Processed/` 与含 `.firstcut-export` 的导出目录）、JPG/ARW 配对、EXIF 解析、JPEG 快速解码与安全兜底、EXIF 方向变换 |
+| `scan.rs`、`decode.rs` | 目录扫描（跳过 `.firstcut`、`Processed/` 与含 `.firstcut-export` 的导出目录）、多品牌 JPG/RAW 配对、EXIF 解析、JPEG 快速解码与安全兜底、EXIF 方向变换 |
 | `metrics/`、`ai/`、`score.rs` | 五维像素指标、ONNX Runtime 推理（含固定 SHA-256 校验）、并行分析调度与 CLI/UI 共用跑批入口 |
 | `cache.rs`、`config.rs` | SQLite 增量缓存匹配/写入、配置加载与严格校验、配置指纹与 5 份内置预设 |
-| `dedup.rs`、`selection.rs`、`decision.rs` | 连拍分组与姿态聚类、最终星级与有效连拍决定合成、统一人工星级与连拍覆盖持久化 |
+| `dedup.rs`、`selection.rs`、`decision.rs` | 连拍分组与姿态聚类、最终星级与有效连拍决定合成、统一人工星级/三态选片标记/连拍覆盖及内容指纹持久化 |
 | `output/`、`export.rs` | CSV（默认表格公式防护 / `--raw-csv`）、XMP 侧车渲染/合并，以及筛选结果非破坏增量导出（分类型/扁平/保结构布局、索尼回绕冲突防覆盖、PS/ACR 侧车修改保护与取消安全） |
 | `review/` | 本地 Web 复核服务（`mod.rs` 路由、`access.rs` 会话与来源鉴权、`snapshot.rs` 快照、`job.rs` 评分/导出单任务互斥与日志、`config_edit.rs`、`scene_feedback.rs`、`thumb.rs` 缩略图槽位缓存、`assets/` 内嵌前端） |
 | `bin/tune.rs`、`gallery.rs`、`debug_*`、`probe.rs` | 调参指标导出、HTML 联系表生成与模型/像素诊断工具 |
@@ -139,7 +140,7 @@ JPEG 使用 `jpeg-decoder` 快速路径、`image` 兜底，全解码后 box 块�
 
 ## 6. XMP 与曝光建议
 
-侧车命名固定为 `<stem>.xmp`。同目录 JPG/ARW 共用侧车，跨目录配对则两端各写一份同名侧车，星级一致。导出包含 `xmp:Rating`、firstcut 五维子分与连拍信息；曝光容差带外才给建议，按 1/3 EV 取整、默认钳位 ±2 EV，`exposure_suggest_cap = 0` 关闭建议。
+侧车命名固定为 `<stem>.xmp`。同目录 JPG/RAW 共用侧车，跨目录配对则两端各写一份同名侧车，星级一致。导出包含 `xmp:Rating`、firstcut 五维子分与连拍信息（未评分照片仅存在人工星级时，通过 `export` 也可导出仅含 `xmp:Rating` 的侧车，同时保护已有 Adobe 曝光设置）；曝光容差带外才给建议，按 1/3 EV 取整、默认钳位 ±2 EV，`exposure_suggest_cap = 0` 关闭建议。
 
 `firstcut:suggestedEV` 是信息元数据，常规 `score --xmp` 与 UI 默认跑批仅写入该字段，不触碰 Adobe `crs:*` 开发参数。只有当用户显式开启 `--xmp-exposure`、`[metric] exposure_write_crs = true` 或在 UI 勾选“写入建议曝光到 Adobe 开发参数”时，才会在尚无已有 `crs:Exposure2012` / `crs:Exposure` 的侧车中写入 `crs:Exposure2012`（搭配 `crs:HasSettings="True"` 与 `crs:ProcessVersion="11.0"`，且不降级已有更新的 `ProcessVersion`）；程序不修改照片像素。`POST /api/rate` 改星对已有 firstcut 侧车仅更新 `xmp:Rating`，不改动 `firstcut:suggestedEV` 或任何 `crs:*` 字段。
 
@@ -149,15 +150,15 @@ JPEG 使用 `jpeg-decoder` 快速路径、`image` 兜底，全解码后 box 块�
 
 ## 7. 本地 Web UI 与交互约定
 
-选择 axum + 内嵌 vanilla JS，纯 Cargo 构建，无 npm/WebView 依赖。CLI `review` 与 Windows 启动器共用服务；启动后先显示页面，再异步读取快照，报告扫描阶段、计数与可确定总量时的进度，完成后自动刷新。评分缺失时提示选择原评分目录或继续未评分浏览，不强制重算。
+选择 axum + 内嵌 vanilla JS，纯 Cargo 构建，无 npm/WebView 依赖。CLI `review` 与 Windows 启动器共用服务；`firstcut-ui` 启动后直接打开浏览器 Web 欢迎页（支持单目录 / 双目录模式选择与最近工作区切换），打开工作区后先显示页面，再异步读取快照，报告扫描阶段、计数与可确定总量时的进度，完成后自动刷新。评分缺失时提示选择原评分目录或继续未评分浏览，不强制重算。
 
 - 缩略图墙分页懒加载，筛选和排序（总分、拍摄时间新→旧/旧→新、文件名 A→Z/Z→A）自动记忆；默认按连拍组聚合，每组显示当前排序最靠前的一张，指定组后显示全部。卡片支持留用/剔除角标与快捷按钮，侧栏支持按选片标记筛选并一键将当前筛选批量设为留用；照片右键可快速设置选片标记、筛组及设置保留覆盖。
 - 星级、分数下限及说明可折叠，桌面侧栏可拖宽，双击边界复位，窄屏可收起。筛选、折叠状态及面板位置等部分设置保存在浏览器 localStorage。
-- 灯箱支持原图缩放/拖动、双击复位、`←/→` 切换（支持顶部工具栏与界面设置切换「跨组切换 / 锁定连拍组」，默认跨组）、有界内存 LRU 预加载同组/邻近原图、2–4 张并排对比与百分比显示；对比共用图像归一化锚点及缩放状态；支持快捷键 `P`/`X`/`U` 标记留用/剔除/未定与 `1–5` 改星（未评分照片也可直接标记与打星）。EXIF 光圈/快门/焦段用 `f/`、`s`、`mm` 明确标识。
+- 灯箱支持原图缩放/拖拽平移（屏蔽图片原生 `dragstart`/`selectstart` 与文本选中干扰）、双击复位、循环 `←/→` 切换（顶部工具栏与界面设置可切换「跨组切换 / 锁定连拍组」，偏好保存在 `localStorage`）、底部同组胶片条与当前筛选排序（`comparePhotos()`）一致、有界内存 LRU 预加载同组/邻近原图（上限 10 张 / 180 MiB，并发 2）、2–4 张并排对比与百分比显示；对比共用图像归一化锚点及缩放状态；支持快捷键 `P`/`X`/`U` 标记留用/剔除/未定与 `1–5` 改星（未评分照片也可直接标记与打星），所有标记、改星与连拍保留覆盖操作均即时同步落盘到 `decisions.sqlite`。EXIF 光圈/快门/焦段用 `f/`、`s`、`mm` 明确标识。
 - 评分面板跟随活动照片，可拖动和调整大小；列出子分、实际权重与贡献。人像候选只是规则线索；用户可保存真实场景与备注，供后续校准，不自动切换评分参数。
 - 配置表单提供说明、建议范围、滑块与输入框，不把 M9、M-UI2 等内部规划编号暴露在产品文案中。
 - UI 内跑批使用 `score::run_score_job`，全局单任务互斥；轮询进度与日志，完成后热替换快照。跑批期间限制改星和服务控制，避免竞争。
-- Windows 启动器页面提供选目录、RAW 关联、重启与退出；关闭浏览器不等于停止服务，再次双击可打开仍在运行的页面。CLI review 使用 Ctrl+C 退出。
+- Windows 启动器通过 Web 欢迎页提供单/双目录选择、最近工作区切换，并在侧栏/顶栏提供 RAW 关联、重启与退出；关闭浏览器不等于停止服务，再次双击可唤醒打开仍在运行的页面。CLI review 使用 Ctrl+C 退出。
 
 ### 7.1 直方图与性能边界
 
@@ -169,18 +170,18 @@ JPEG 使用 `jpeg-decoder` 快速路径、`image` 兜底，全解码后 box 块�
 
 ### 7.2 日志与接口
 
-任务日志带本地时间，页面显示有界缓冲，落盘仅 `.firstcut/review.log`；上限 256 KiB，超限保留最近约 128 KiB，超长单行截断，不无限叠加轮转文件。
+任务日志带本地时间，页面显示有界缓冲，落盘仅本机工作区状态目录的 `review.log`；上限 256 KiB，超限保留最近约 128 KiB，超长单行截断，不无限叠加轮转文件。
 
 HTTP 端点：
 - **公开与鉴权**：`/`（页面框架）、`/review.js`（内嵌脚本）、`/healthz`（启动器探活）、`POST /api/session`（凭据换会话）
-- **数据与图像（需会话）**：`GET /api/photos`、`GET /api/load`、`GET /thumb`、`GET /image`
-- **任务、标注与配置（需会话 + 写接口来源校验）**：`GET /api/job`、`POST /api/score/run`、`POST /api/export/pick-folder`、`POST /api/export/preview`、`POST /api/export/run`、`POST /api/export/cancel`、`POST /api/export/open`、`POST /api/rate`、`POST /api/flag`、`POST /api/flag/batch`、`POST /api/burst/keep`、`POST /api/scene-feedback`、`GET/POST /api/config`、`GET/POST /api/ui-settings`、`GET/POST /api/control`
+- **数据与图像（需会话）**：`GET /api/workspace/status`、`GET /api/photos`、`GET /api/load`、`GET /thumb`、`GET /image`
+- **任务、工作区、标注与配置（需会话 + 写接口来源校验）**：`POST /api/workspace/pick-folder`、`POST /api/workspace/open`、`POST /api/workspace/recent/remove`、`GET /api/job`、`POST /api/score/run`、`POST /api/export/pick-folder`、`POST /api/export/preview`、`POST /api/export/run`、`POST /api/export/cancel`、`POST /api/export/open`、`POST /api/rate`、`POST /api/flag`、`POST /api/flag/batch`、`POST /api/burst/keep`、`POST /api/scene-feedback`、`GET/POST /api/config`、`GET/POST /api/ui-settings`、`GET/POST /api/control`
 
 ## 8. 安全、验证与发布
 
 默认只监听 `127.0.0.1:8787`。复核链接中的访问凭据位于 URL fragment，不进入普通 HTTP 请求地址；页面兑换服务会话后清除链接片段。`POST /api/session` 具备滑动窗口失败限速（60 秒内连续失败 5 次返回 `429 Too Many Requests` 与 `Retry-After`）。会话按浏览器的协议、主机名和端口保存，由请求头显式发送，完整进程退出后失效。Windows 双击启动器通过当前登录会话内命名事件（`Local\firstcut-ui-reopen-8787`）唤起已有进程重开带凭据链接，不在磁盘或 HTTP 暴露凭据。访问校验在路由统一处理：公开页只返回页面框架与脚本，图片与照片元数据需要有效会话；写接口还要求匹配服务地址的 Origin 和 JSON 请求体，并通过统一的取消安全执行器将异步写互斥锁（`OwnedMutexGuard`）、`JobState` 写守卫（与跑批、导出及服务关闭互斥）及 `AppState` 一并移入 `spawn_blocking` 任务——即使客户端中途断连取消 HTTP 请求，后台任务仍会持锁并持有守卫直到落盘、内存状态与快照全部更新完成。Web UI 导出相册外目录仅允许本机 Windows 桌面回环模式通过原生文件夹弹窗授权并由服务端颁发不透明 `target_id`（不接受浏览器任意外部路径，且打开资源管理器仅限服务端记录的最近导出目录）；容器/远程监听模式（`--bind 0.0.0.0`）仅允许相册内独立子目录（且拒绝相册根、`.firstcut` 与已有原片目录）。响应禁止第三方站点加载；原图只按当前快照的 JPG 身份读取并流式传输。
 
-`.firstcut/`、自动导出的 XMP 与相册照片通过打开的目录句柄定位（`storage.rs`，Windows 上对相册前缀按大小写不敏感归属判定），逐级拒绝符号链接、Windows 重解析点（含 OneDrive 云占位目录）与有多条硬链接的文件。数据库从安全打开的文件读入，SQLite 不直接操作相册内的文件名；拒绝未关闭或有待恢复日志的库，保留原件。普通状态以新文件完整写入后原子替换；日志与场景反馈受大小和文件身份约束。场景反馈达到 16 MiB 时拒绝继续追加并提示归档。分析限制为单图 128 MiB、1.1 亿像素和进程内最多两次并行解码；原图接口发送体积同样上限 128 MiB。
+本机工作区状态目录、兼容迁移的旧版 `.firstcut/`、导出的 XMP 与相册照片通过打开的目录句柄定位（`storage.rs`，Windows 上对相册前缀按大小写不敏感归属判定），逐级拒绝符号链接、Windows 重解析点（含 OneDrive 云占位目录）与有多条硬链接的文件。数据库从安全打开的文件读入，SQLite 不直接操作相册内的文件名；拒绝未关闭或有待恢复日志的库，保留原件。普通状态以新文件完整写入后原子替换；日志与场景反馈受大小和文件身份约束。场景反馈达到 16 MiB 时拒绝继续追加并提示归档。分析限制为单图 128 MiB、1.1 亿像素和进程内最多两次并行解码；原图接口发送体积同样上限 128 MiB。
 
 HTML 联系表转义所有元数据，只允许运行固定的排序脚本；读取的 JPG 必须位于选定照片根内。面向表格使用的 CSV 默认保护可能被当作公式的文本，显式 `--raw-csv` 留给程序读取。推理仅加载 [README](../README.md#模型准备一次性) 中固定 SHA‑256 的模型。
 
@@ -199,11 +200,20 @@ HTML 联系表转义所有元数据，只允许运行固定的排序脚本；读
 
 ## 9. 后续工作与未验收项
 
+### 9.1 近期已完成演进（v1.4.2 之后）
+
+- **基线安全与可靠性加固（PR #14）**：保护 Lightroom 已有 `crs:Exposure2012`、取消安全写执行器、可移植相对路径缓存与固定模型哈希指纹、登录失败限速及 Windows 单实例重开唤起。
+- **统一连拍人工覆盖与非破坏导出（PR #16）**：连拍保留覆盖并入 `decisions.sqlite` 并统一作用于 CLI/CSV/XMP；新增 `pic_process export` 与 Web UI 导出弹窗（`split`/`flat`/`tree` 布局、预览、增量跳过、PS/ACR 侧车保护、中途取消与冲突防护）。
+- **Web 欢迎入口、双目录/多品牌 RAW 与零写入源目录（PR #17）**：`firstcut-ui` 直接打开 Web 欢迎页，支持单/双目录、多品牌 RAW 三级配对、最近工作区与本机状态隔离；引入照片内容指纹与 `imported_legacy_decision` 逐条迁移记录，防止换卡误继承及删移照片复活旧覆盖。
+- **三态选片标记、未评分打星与灯箱体验优化（当前分支）**：落地留用 (`P`) / 未定 (`U`) / 剔除 (`X`) 即时落盘、批量标记、未评分直接打星及导出星级 XMP、`export --picked` / `--flag`；并修复灯箱跨组/锁定循环切换、放大拖拽平移、时间正序/文件名倒序排序、胶片条排序一致与有界 LRU 邻近原图预加载。
+
+### 9.2 后续待办与未验收项
+
 | 优先顺序 | 方向 | 理由与验收重点 |
 |---|---|---|
 | 1 | 选片手感与人像工作流 | 一键 1:1 居中定焦人脸/眼睛查合焦、粘贴文件名清单反选 RAW、闭眼/表情废片过滤 |
 | 2 | 建立真实选片标注集 | 检查好片被排除率、每组最佳帧候选覆盖率，再决定权重/阈值优化；单次“界面可用”不能代表算法质量验收 |
-| 3 | Lightroom / ACR 实际导入 | 核对 JPG/ARW 配对、星级、firstcut 字段、导出目录布局和 `crs:Exposure2012` 的实际显示及效果 |
+| 3 | Lightroom / ACR 实际导入 | 核对 JPG/RAW 配对、星级、firstcut 字段、导出目录布局和 `crs:Exposure2012` 的实际显示及效果 |
 | 4 | 模型输入和主体可靠性 | letterbox/坐标反算、遮挡和超大脸、主体分策略均需检出率与选片回归，不能无验证直接替换 |
 | 待单独设计 | 原生 macOS / HDR | Apple Silicon 原生需验证 CoreML 与发行链路；HDR 需设计色彩管理、亮度域及增益图语义，不能把 SDR 直方图直接当 HDR 支持 |
 
