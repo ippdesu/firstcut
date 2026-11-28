@@ -502,6 +502,10 @@ function loadData(){
     SNAPSHOT = j;
     if(sessionChanged){
       if(LB) closeLightbox();
+      if(exportModal) exportModal.style.display = 'none';
+      exportExternalTargetId = null;
+      exportExternalDisplay = '';
+      exportPreviewData = null;
       clearFullImageCache();
       ingest();
       loadAppControls();
@@ -811,9 +815,14 @@ async function setBurstKeep(photo, keep){
   try{
     const response = await apiFetch('/api/burst/keep', {
       method:'POST', headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({p:photo.path, keep})
+      body:JSON.stringify({p:photo.path, keep, snapshot_session: SNAPSHOT?.session_id})
     });
     const text = await response.text();
+    if(response.status === 409){
+      await loadData();
+      toast(text || '工作区或照片状态已变化，已自动刷新，请确认后重试');
+      return;
+    }
     if(!response.ok) throw new Error(text || response.statusText);
     const result = JSON.parse(text);
     if(typeof result.snapshot_version === 'number' && SNAPSHOT) SNAPSHOT.version = result.snapshot_version;
@@ -835,9 +844,14 @@ async function setPhotoFlag(photo, flag){
   try{
     const response = await apiFetch('/api/flag', {
       method:'POST', headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({p:photo.path, flag})
+      body:JSON.stringify({p:photo.path, flag, snapshot_session: SNAPSHOT?.session_id})
     });
     const text = await response.text();
+    if(response.status === 409){
+      await loadData();
+      toast(text || '工作区或照片状态已变化，已自动刷新，请确认后重试');
+      return;
+    }
     if(!response.ok) throw new Error(text || response.statusText);
     const result = JSON.parse(text);
     if(typeof result.snapshot_version === 'number' && SNAPSHOT) SNAPSHOT.version = result.snapshot_version;
@@ -1450,9 +1464,14 @@ async function saveSceneFeedback(photo){
   try{
     const response = await apiFetch('/api/scene-feedback', {
       method:'POST', headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({p:photo.path, selected_scene, note})
+      body:JSON.stringify({p:photo.path, selected_scene, note, snapshot_session: SNAPSHOT?.session_id})
     });
     const text = await response.text();
+    if(response.status === 409){
+      await loadData();
+      toast(text || '工作区或照片状态已变化，已自动刷新，请确认后重试');
+      return;
+    }
     if(!response.ok) throw new Error(text || response.statusText);
     const saved = JSON.parse(text);
     if(typeof saved.snapshot_version === 'number' && SNAPSHOT) SNAPSHOT.version = saved.snapshot_version;
@@ -1792,6 +1811,7 @@ function buildExportRequestPayload(){
     include_raw: serverIncludeRaw && exportRawEl.checked,
     include_xmp: xmp,
     xmp_exposure: xmp && exportXmpExposureEl.checked,
+    snapshot_session: SNAPSHOT?.session_id,
   };
 }
 function renderExportPreview(p){
@@ -1856,6 +1876,10 @@ async function refreshExportPreview(){
     if(!response.ok){
       const reason = await response.text();
       box.innerHTML = `<div class="err">${escapeHtml(reason || `预览失败（${response.status}）`)}</div>`;
+      if(response.status === 409){
+        toast(reason || '工作区或照片状态已变化，已自动刷新');
+        await loadData();
+      }
       return;
     }
     const data = await response.json();
@@ -1938,7 +1962,8 @@ document.getElementById('exportStart').addEventListener('click', async ()=>{
       toast(reason || `无法开始导出（${response.status}）`);
       if(response.status === 409){
         exportPreviewData = null;
-        document.getElementById('exportPreviewBox').innerHTML = `<div class="err">${escapeHtml(reason || '照片已变化，请刷新工作区后再导出')}</div>`;
+        document.getElementById('exportPreviewBox').innerHTML = `<div class="err">${escapeHtml(reason || '照片或工作区已变化，已自动刷新')}</div>`;
+        await loadData();
       }
       syncExportStartButton();
       updateCurationCounts();
@@ -2008,11 +2033,16 @@ function renderLbStars(){
 }
 function setStars(photo, n){
   apiFetch('/api/rate', {method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({p: photo.path, stars: n})
+    body: JSON.stringify({p: photo.path, stars: n, snapshot_session: SNAPSHOT?.session_id})
   }).then(async r=>{
     const text = await r.text();
     let j = {};
     try { j = JSON.parse(text); } catch (_) {}
+    if(r.status === 409){
+      await loadData();
+      toast(j.error || text || '工作区或照片状态已变化，已自动刷新，请确认后重试');
+      return;
+    }
     if(r.ok && j.ok){
       if(typeof j.snapshot_version === 'number' && SNAPSHOT) SNAPSHOT.version = j.snapshot_version;
       toast(j.warnings?.length ? `已保存 ${n} 星；${j.warnings.length} 个侧车未同步` : `已保存 ${n} 星`);

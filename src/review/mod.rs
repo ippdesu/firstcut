@@ -1434,6 +1434,8 @@ struct ExportRequest {
     include_xmp: bool,
     #[serde(default)]
     xmp_exposure: bool,
+    #[serde(default)]
+    snapshot_session: Option<String>,
 }
 
 #[cfg(any(windows, test))]
@@ -1552,6 +1554,27 @@ fn replace_snapshot(slot: &RwLock<Snapshot>, mut next: Snapshot) {
     next.session_id = guard.session_id.clone();
     next.version = snapshot::next_snapshot_version();
     *guard = next;
+}
+
+fn check_snapshot_session(
+    provided: Option<&str>,
+    current_session: &str,
+) -> std::result::Result<(), Response> {
+    let Some(session) = provided.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "请求缺少工作区会话标识，请刷新页面后重试",
+        )
+            .into_response());
+    };
+    if session != current_session {
+        return Err((
+            StatusCode::CONFLICT,
+            "工作区已切换或服务已重启，已过期页面无法操作，请刷新后重试",
+        )
+            .into_response());
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -1813,12 +1836,21 @@ async fn export_preview(
     let Some(flag_filter) = crate::export::FlagFilter::parse(&req.filter.flag) else {
         return (StatusCode::BAD_REQUEST, "无效的选片标记筛选条件").into_response();
     };
+    {
+        let guard = state.snapshot.read().unwrap();
+        if let Err(resp) = check_snapshot_session(req.snapshot_session.as_deref(), &guard.session_id) {
+            return resp;
+        }
+    }
     let opts = match resolve_export_options(&state, &req) {
         Ok(o) => o,
         Err(resp) => return resp,
     };
     let (items, all_sources, expected_identities) = {
         let guard = state.snapshot.read().unwrap();
+        if let Err(resp) = check_snapshot_session(req.snapshot_session.as_deref(), &guard.session_id) {
+            return resp;
+        }
         build_export_items_from_snapshot(&state.root, &guard, &req.filter, flag_filter)
     };
     let source = state.source.clone();
@@ -1884,6 +1916,12 @@ where
     let Some(flag_filter) = crate::export::FlagFilter::parse(&req.filter.flag) else {
         return (StatusCode::BAD_REQUEST, "无效的选片标记筛选条件").into_response();
     };
+    {
+        let guard = state.snapshot.read().unwrap();
+        if let Err(resp) = check_snapshot_session(req.snapshot_session.as_deref(), &guard.session_id) {
+            return resp;
+        }
+    }
     let opts = match resolve_export_options(&state, &req) {
         Ok(o) => o,
         Err(resp) => return resp,
@@ -1895,6 +1933,9 @@ where
     let start_guard = ExportStartGuard::new(Arc::clone(&state.job));
     let (items, all_sources, expected_identities) = {
         let guard = state.snapshot.read().unwrap();
+        if let Err(resp) = check_snapshot_session(req.snapshot_session.as_deref(), &guard.session_id) {
+            return resp;
+        }
         build_export_items_from_snapshot(&state.root, &guard, &req.filter, flag_filter)
     };
     if items.is_empty() {
@@ -2070,6 +2111,8 @@ struct RateParams {
     p: String,
     /// 1~5 星
     stars: u8,
+    #[serde(default)]
+    snapshot_session: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -2077,6 +2120,8 @@ struct BurstKeepParams {
     p: String,
     /// true=手动保留，false=手动舍弃，null=恢复自动建议
     keep: Option<bool>,
+    #[serde(default)]
+    snapshot_session: Option<String>,
 }
 
 /// POST /api/burst/keep：保存单张照片的手动连拍保留决定（统一持久化到 decisions.sqlite）。
@@ -2088,6 +2133,9 @@ async fn burst_keep(State(state): State<Arc<AppState>>,
         move |state| {
             let (pair_id, rel_path, expected_fp) = {
                 let guard = state.snapshot.read().unwrap();
+                if let Err(resp) = check_snapshot_session(p.snapshot_session.as_deref(), &guard.session_id) {
+                    return resp;
+                }
                 let Some(photo) = guard.photos.iter().find(|x| x.path == p.p && !x.is_raw) else {
                     return (StatusCode::NOT_FOUND, "照片不在快照中").into_response();
                 };
@@ -2146,6 +2194,8 @@ struct SceneFeedbackParams {
     selected_scene: String,
     #[serde(default)]
     note: String,
+    #[serde(default)]
+    snapshot_session: Option<String>,
 }
 
 /// POST /api/scene-feedback：记录场景纠错与当前评分线索，供后续校准。
@@ -2163,6 +2213,9 @@ async fn scene_feedback_save(State(state): State<Arc<AppState>>,
         move |state| {
             let record = {
                 let guard = state.snapshot.read().unwrap();
+                if let Err(resp) = check_snapshot_session(p.snapshot_session.as_deref(), &guard.session_id) {
+                    return resp;
+                }
                 let Some(photo) = guard.photos.iter().find(|x| x.path == p.p && !x.is_raw) else {
                     return (StatusCode::NOT_FOUND, "照片不在快照中").into_response();
                 };
@@ -2206,6 +2259,8 @@ async fn scene_feedback_save(State(state): State<Arc<AppState>>,
 struct FlagParams {
     p: String,
     flag: crate::decision::CurationFlag,
+    #[serde(default)]
+    snapshot_session: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -2235,6 +2290,9 @@ async fn set_flag(
         move |state| {
             let (pair_id, rel_path, expected_fp) = {
                 let guard = state.snapshot.read().unwrap();
+                if let Err(resp) = check_snapshot_session(p.snapshot_session.as_deref(), &guard.session_id) {
+                    return resp;
+                }
                 let Some(photo) = guard.photos.iter().find(|x| x.path == p.p && !x.is_raw) else {
                     return (StatusCode::NOT_FOUND, "照片不在快照中").into_response();
                 };
@@ -2483,6 +2541,9 @@ async fn rate(State(state): State<Arc<AppState>>,
         move |state| {
             let (pair_id, rel_path, expected_fp) = {
                 let guard = state.snapshot.read().unwrap();
+                if let Err(resp) = check_snapshot_session(p.snapshot_session.as_deref(), &guard.session_id) {
+                    return resp;
+                }
                 let Some(photo) = guard.photos.iter().find(|x| x.path == p.p && !x.is_raw) else {
                     return (StatusCode::NOT_FOUND, "照片不在快照中").into_response();
                 };
@@ -2838,8 +2899,9 @@ mod tests {
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
             control: None,
         });
+        let session_id = state.snapshot.read().unwrap().session_id.clone();
         let response = burst_keep(State(Arc::clone(&state)), axum::Json(BurstKeepParams {
-            p: "scene/a.jpg".into(), keep: Some(false),
+            p: "scene/a.jpg".into(), keep: Some(false), snapshot_session: Some(session_id.clone()),
         })).await;
         assert_eq!(response.status(), StatusCode::OK);
         let saved = crate::decision::load_burst_overrides(&dir).unwrap();
@@ -2852,7 +2914,7 @@ mod tests {
         }
 
         let response = burst_keep(State(Arc::clone(&state)), axum::Json(BurstKeepParams {
-            p: "scene/a.jpg".into(), keep: None,
+            p: "scene/a.jpg".into(), keep: None, snapshot_session: Some(session_id),
         })).await;
         assert_eq!(response.status(), StatusCode::OK);
         assert!(!crate::decision::load_burst_overrides(&dir).unwrap().contains_key("scene/a.jpg"));
@@ -2909,9 +2971,10 @@ mod tests {
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
             control: None,
         });
+        let session_id = state.snapshot.read().unwrap().session_id.clone();
         let response = scene_feedback_save(State(Arc::clone(&state)),
             axum::Json(SceneFeedbackParams { p: "a.jpg".into(), selected_scene: "stage".into(),
-                note: "舞台灯光".into() })).await;
+                note: "舞台灯光".into(), snapshot_session: Some(session_id.clone()) })).await;
         assert_eq!(response.status(), StatusCode::OK);
         let saved = scene_feedback::load_latest(&dir, &feedback_path).unwrap();
         assert_eq!(saved["a.jpg"].predicted_scene, "portrait");
@@ -2921,7 +2984,7 @@ mod tests {
 
         let response = scene_feedback_save(State(state),
             axum::Json(SceneFeedbackParams { p: "a.jpg".into(), selected_scene: "invalid".into(),
-                note: String::new() })).await;
+                note: String::new(), snapshot_session: Some(session_id) })).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_eq!(std::fs::read_to_string(&feedback_path).unwrap().lines().count(), 1);
         let _ = std::fs::remove_dir_all(dir);
@@ -2976,11 +3039,13 @@ mod tests {
             last_export_target: None,
             control: None,
         });
+        let session_id = state.snapshot.read().unwrap().session_id.clone();
         let mut tasks = Vec::new();
         for stars in 1u8..=5 {
             let st = Arc::clone(&state);
+            let sid = session_id.clone();
             tasks.push(tokio::spawn(async move {
-                rate(State(st), axum::Json(RateParams { p: "a.jpg".into(), stars })).await.status()
+                rate(State(st), axum::Json(RateParams { p: "a.jpg".into(), stars, snapshot_session: Some(sid) })).await.status()
             }));
         }
         for task in tasks {
@@ -3065,8 +3130,9 @@ mod tests {
             control: None,
         });
 
+        let session_id = state.snapshot.read().unwrap().session_id.clone();
         let response = rate(State(Arc::clone(&state)), axum::Json(RateParams {
-            p: "a.jpg".into(), stars: 5,
+            p: "a.jpg".into(), stars: 5, snapshot_session: Some(session_id),
         })).await;
         assert_eq!(response.status(), StatusCode::OK);
         // 源目录 XMP 保持只读零写入
@@ -3175,9 +3241,10 @@ mod tests {
         assert!(state.write_lock.try_lock().is_err(), "后台写入未完成时写锁必须仍被持有");
 
         // 紧接着发起第二次真实 burst_keep 请求：它必须等第一次写完并更新内存/快照后再执行
+        let session_id = state.snapshot.read().unwrap().session_id.clone();
         let second_req = tokio::spawn(burst_keep(
             State(Arc::clone(&state)),
-            axum::Json(BurstKeepParams { p: "scene/b.jpg".into(), keep: Some(false) }),
+            axum::Json(BurstKeepParams { p: "scene/b.jpg".into(), keep: Some(false), snapshot_session: Some(session_id) }),
         ));
         tokio::task::yield_now().await;
         assert!(!second_req.is_finished(), "后续写入必须等待已取消请求的落盘与快照更新完成");
@@ -3274,6 +3341,7 @@ mod tests {
             control: None,
         });
 
+        let session_id = state.snapshot.read().unwrap().session_id.clone();
         // 1) 非桌面模式拒绝原生目录选择器、外部 target_id 与打开目录
         assert_eq!(
             export_pick_folder(State(Arc::clone(&state)), axum::Json(serde_json::json!({}))).await.status(),
@@ -3285,6 +3353,7 @@ mod tests {
         );
         let ext_req: ExportRequest = serde_json::from_value(serde_json::json!({
             "external_target_id": "forged-token",
+            "snapshot_session": &session_id,
             "filter": {}
         })).unwrap();
         assert_eq!(
@@ -3299,6 +3368,7 @@ mod tests {
             "include_jpg": true,
             "include_raw": true,
             "include_xmp": true,
+            "snapshot_session": &session_id,
             "filter": { "stars": [4, 5], "keep": "keep" }
         })).unwrap();
         let resp = export_preview(State(Arc::clone(&state)), axum::Json(preview_req)).await;
@@ -3317,6 +3387,7 @@ mod tests {
             "include_jpg": true,
             "include_raw": true,
             "include_xmp": true,
+            "snapshot_session": &session_id,
             "filter": { "stars": [4, 5], "keep": "keep" }
         })).unwrap();
         let run_resp = export_run(State(Arc::clone(&state)), axum::Json(run_req)).await;
@@ -3414,11 +3485,13 @@ mod tests {
             control: None,
         });
 
+        let session_id = state.snapshot.read().unwrap().session_id.clone();
         let req: ExportRequest = serde_json::from_value(serde_json::json!({
             "subdir": "RAW",
             "include_jpg": true,
             "include_raw": false,
             "include_xmp": false,
+            "snapshot_session": session_id,
             "filter": {}
         }))
         .unwrap();
@@ -3600,12 +3673,14 @@ mod tests {
             control: None,
         });
 
+        let snap_session = state.snapshot.read().unwrap().session_id.clone();
         // 1) 未评分照片可直接打星与单张标记
         let rate_resp = rate(
             State(Arc::clone(&state)),
             axum::Json(RateParams {
                 p: "JPG/a.jpg".into(),
                 stars: 5,
+                snapshot_session: Some(snap_session.clone()),
             }),
         )
         .await;
@@ -3616,6 +3691,7 @@ mod tests {
             axum::Json(FlagParams {
                 p: "JPG/b.jpg".into(),
                 flag: crate::decision::CurationFlag::Reject,
+                snapshot_session: Some(snap_session.clone()),
             }),
         )
         .await;
@@ -3652,6 +3728,7 @@ mod tests {
         // 3) 导出预览按 flag="pick" 仅命中 a，且为未评分但已打星的 a 生成 XMP
         let preview_req: ExportRequest = serde_json::from_value(serde_json::json!({
             "subdir": "Selected",
+            "snapshot_session": snap_session,
             "filter": { "flag": "pick" }
         }))
         .unwrap();
@@ -3720,11 +3797,13 @@ mod tests {
             control: None,
         });
 
+        let snap_session = state.snapshot.read().unwrap().session_id.clone();
         let flag_resp = set_flag(
             State(Arc::clone(&state)),
             axum::Json(FlagParams {
                 p: "sample.jpg".into(),
                 flag: crate::decision::CurationFlag::Pick,
+                snapshot_session: Some(snap_session.clone()),
             }),
         )
         .await;
@@ -3735,6 +3814,7 @@ mod tests {
 
         let preview_req: ExportRequest = serde_json::from_value(serde_json::json!({
             "subdir": "Selected",
+            "snapshot_session": &snap_session,
             "filter": { "flag": "pick" }
         }))
         .unwrap();
@@ -3751,6 +3831,7 @@ mod tests {
 
         let run_req: ExportRequest = serde_json::from_value(serde_json::json!({
             "subdir": "Selected",
+            "snapshot_session": &snap_session,
             "filter": { "flag": "pick" }
         }))
         .unwrap();
@@ -3811,6 +3892,7 @@ mod tests {
             control: None,
         });
 
+        let snap_session = state.snapshot.read().unwrap().session_id.clone();
         // 初始：a.jpg 为剔除（页签 1 看到 reject=[a.jpg]）
         assert_eq!(
             set_flag(
@@ -3818,6 +3900,7 @@ mod tests {
                 axum::Json(FlagParams {
                     p: "a.jpg".into(),
                     flag: crate::decision::CurationFlag::Reject,
+                    snapshot_session: Some(snap_session.clone()),
                 }),
             )
             .await
@@ -3833,6 +3916,7 @@ mod tests {
                 axum::Json(FlagParams {
                     p: "a.jpg".into(),
                     flag: crate::decision::CurationFlag::Unflagged,
+                    snapshot_session: Some(snap_session.clone()),
                 }),
             )
             .await
@@ -3845,6 +3929,7 @@ mod tests {
                 axum::Json(FlagParams {
                     p: "b.jpg".into(),
                     flag: crate::decision::CurationFlag::Reject,
+                    snapshot_session: Some(snap_session),
                 }),
             )
             .await
@@ -3945,11 +4030,13 @@ mod tests {
             control: None,
         });
 
+        let snap_session = state.snapshot.read().unwrap().session_id.clone();
         let rate_resp = rate(
             State(Arc::clone(&state)),
             axum::Json(RateParams {
                 p: "a.jpg".into(),
                 stars: 5,
+                snapshot_session: Some(snap_session.clone()),
             }),
         )
         .await;
@@ -3957,6 +4044,7 @@ mod tests {
 
         let run_req: ExportRequest = serde_json::from_value(serde_json::json!({
             "subdir": "Selected",
+            "snapshot_session": snap_session,
             "filter": {}
         }))
         .unwrap();
@@ -4203,8 +4291,10 @@ mod tests {
         let entered_task = Arc::clone(&entered);
         let release_task = Arc::clone(&release);
         let st = Arc::clone(&state);
+        let session_id = state.snapshot.read().unwrap().session_id.clone();
         let req: ExportRequest = serde_json::from_value(serde_json::json!({
             "subdir": "Selected",
+            "snapshot_session": session_id,
             "filter": {}
         }))
         .unwrap();
@@ -4232,5 +4322,230 @@ mod tests {
         assert!(state.job.begin(), "取消预检后应允许重新启动评分/导出任务");
         state.job.abort_start();
         assert!(state.job.begin_shutdown(), "取消预检后应允许关闭服务");
+    }
+
+    #[tokio::test]
+    async fn single_actions_and_export_reject_stale_session_after_workspace_switch() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let dir_a = temp.path().join("workspace_a");
+        let dir_b = temp.path().join("workspace_b");
+        let state_a_dir = temp.path().join("state_a");
+        let state_b_dir = temp.path().join("state_b");
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+        std::fs::write(dir_a.join("DSC0001.JPG"), b"workspace-a-photo").unwrap();
+        std::fs::write(dir_b.join("DSC0001.JPG"), b"workspace-b-photo").unwrap();
+
+        let make_state = |dir: &PathBuf, state_dir: &PathBuf| {
+            let source = WorkspaceSource::single(dir).unwrap();
+            let paths = WorkspacePaths::in_state_dir(state_dir.clone());
+            paths.ensure_state_dir().unwrap();
+            let mut snap = snapshot::build_snapshot_for_workspace(
+                &source,
+                &paths,
+                &ScoreConfig::default(),
+                &paths.cache,
+                &HashMap::new(),
+                true,
+                true,
+                &|_, _, _| {},
+            )
+            .unwrap();
+            snap.photos[0].burst = Some(snapshot::BurstJson {
+                group: 1,
+                size: 2,
+                rank: 1,
+                keep: true,
+                suggested_keep: true,
+                manual_keep: None,
+                pose_cluster: 1,
+            });
+            Arc::new(AppState {
+                source,
+                paths: paths.clone(),
+                root: dir.clone(),
+                cache_path: paths.cache.clone(),
+                config_path: paths.config.clone(),
+                config_explicit: false,
+                scene_feedback: RwLock::new(HashMap::new()),
+                scene_feedback_path: paths.scene_feedback.clone(),
+                image_slots: Arc::new(Semaphore::new(2)),
+                thumb_slots: Arc::new(Semaphore::new(1)),
+                snapshot: RwLock::new(snap),
+                job: Arc::new(JobState::new()),
+                write_lock: Arc::new(tokio::sync::Mutex::new(())),
+                loading: AtomicBool::new(false),
+                load_error: Mutex::new(None),
+                load_progress: Mutex::new(LoadProgress {
+                    phase: String::new(),
+                    done: 0,
+                    total: 0,
+                }),
+                include_raw: true,
+                local_desktop: false,
+                approved_export_dirs: Mutex::new(Vec::new()),
+                last_export_target: None,
+                control: None,
+            })
+        };
+
+        let access = Arc::new(
+            access::Access::new(
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                8787,
+                None,
+                Some("shared-session-secret-key-for-single-test"),
+            )
+            .unwrap(),
+        );
+        let state_a = make_state(&dir_a, &state_a_dir);
+        let state_b = make_state(&dir_b, &state_b_dir);
+        let app_a = router(Arc::clone(&state_a), Arc::clone(&access));
+        let app_b = router(Arc::clone(&state_b), Arc::clone(&access));
+
+        // 1) 登录获取共享会话（模拟切换工作区或重启后复用同一认证会话）
+        let sign_in_resp = app_a
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/session")
+                    .header("Host", "127.0.0.1:8787")
+                    .header("Origin", access.origin())
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(r#"{"key":"shared-session-secret-key-for-single-test"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(sign_in_resp.status(), StatusCode::OK);
+        let sign_in_bytes = axum::body::to_bytes(sign_in_resp.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let session_token = serde_json::from_slice::<serde_json::Value>(&sign_in_bytes).unwrap()["session"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // 2) 获取工作区 A 的快照会话标识
+        let snap_a_resp = app_a
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/photos")
+                    .header("Host", "127.0.0.1:8787")
+                    .header("Authorization", format!("Bearer {session_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(snap_a_resp.status(), StatusCode::OK);
+        let snap_a_bytes = axum::body::to_bytes(snap_a_resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let snap_a: serde_json::Value = serde_json::from_slice(&snap_a_bytes).unwrap();
+        let session_a = snap_a["session_id"].as_str().unwrap().to_string();
+
+        let post_b = |uri: &str, payload: serde_json::Value| {
+            let app_b = app_b.clone();
+            let origin = access.origin().to_string();
+            let token = session_token.clone();
+            let uri = uri.to_string();
+            async move {
+                app_b
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri(uri)
+                            .header("Host", "127.0.0.1:8787")
+                            .header("Origin", origin)
+                            .header("Authorization", format!("Bearer {token}"))
+                            .header("Content-Type", "application/json")
+                            .body(Body::from(payload.to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+                    .status()
+            }
+        };
+
+        // 3) 用停留在 A 的旧页签发起单张留用、5 星、连拍覆盖、场景反馈及导出预览/执行，全部必须返回 409 Conflict
+        assert_eq!(
+            post_b(
+                "/api/flag",
+                serde_json::json!({"p": "DSC0001.JPG", "flag": "pick", "snapshot_session": &session_a}),
+            )
+            .await,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            post_b(
+                "/api/rate",
+                serde_json::json!({"p": "DSC0001.JPG", "stars": 5, "snapshot_session": &session_a}),
+            )
+            .await,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            post_b(
+                "/api/burst/keep",
+                serde_json::json!({"p": "DSC0001.JPG", "keep": false, "snapshot_session": &session_a}),
+            )
+            .await,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            post_b(
+                "/api/scene-feedback",
+                serde_json::json!({"p": "DSC0001.JPG", "selected_scene": "stage", "note": "", "snapshot_session": &session_a}),
+            )
+            .await,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            post_b(
+                "/api/export/preview",
+                serde_json::json!({"subdir": "Selected", "filter": {"flag": "pick"}, "snapshot_session": &session_a}),
+            )
+            .await,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            post_b(
+                "/api/export/run",
+                serde_json::json!({"subdir": "Selected", "filter": {}, "snapshot_session": &session_a}),
+            )
+            .await,
+            StatusCode::CONFLICT
+        );
+
+        // 4) 缺少 snapshot_session 时必须拒绝（400 Bad Request）
+        assert_eq!(
+            post_b("/api/flag", serde_json::json!({"p": "DSC0001.JPG", "flag": "pick"})).await,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            post_b("/api/rate", serde_json::json!({"p": "DSC0001.JPG", "stars": 5})).await,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            post_b("/api/export/run", serde_json::json!({"subdir": "Selected", "filter": {}})).await,
+            StatusCode::BAD_REQUEST
+        );
+
+        // 工作区 B 数据、决定库与磁盘导出目录均保持未受影响
+        assert!(crate::decision::load_flags_in(&state_b_dir).unwrap().is_empty());
+        assert!(crate::decision::load_in(&state_b_dir).unwrap().is_empty());
+        let b_snap = state_b.snapshot.read().unwrap();
+        assert_eq!(b_snap.photos[0].flag, crate::decision::CurationFlag::Unflagged);
+        assert_eq!(b_snap.photos[0].stars, None);
+        assert!(!state_b.job.is_running());
+        assert!(!dir_b.join("Selected").exists());
     }
 }

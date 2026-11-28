@@ -75,15 +75,24 @@ def check(port, token, album, data_dir):
     session = json.loads(body)["session"]
     assert isinstance(session, str) and len(session) >= 32, "missing review session"
     _, body = request("/api/photos", 200, session=session)
-    photos = json.loads(body)["photos"]
+    initial_snap = json.loads(body)
+    photos = initial_snap["photos"]
+    initial_session = initial_snap["session_id"]
     assert len(photos) == 1 and photos[0]["path"] == "sample.jpg"
     assert photos[0]["scores"] is None
     assert photos[0]["flag"] == "unflagged"
 
+    # Stale snapshot_session from another workspace/restart must be rejected with 409.
+    request("/api/flag", 409, data=b'{"p":"sample.jpg","flag":"pick","snapshot_session":"stale-session"}', session=session)
+    request("/api/rate", 409, data=b'{"p":"sample.jpg","stars":4,"snapshot_session":"stale-session"}', session=session)
+    request("/api/export/preview", 409, data=b'{"subdir":"Selected","filter":{},"snapshot_session":"stale-session"}', session=session)
+
     # Unscored photo can be flagged and manually rated without touching the source album.
-    _, body = request("/api/flag", 200, data=b'{"p":"sample.jpg","flag":"pick"}', session=session)
+    flag_payload = json.dumps({"p": "sample.jpg", "flag": "pick", "snapshot_session": initial_session}).encode()
+    _, body = request("/api/flag", 200, data=flag_payload, session=session)
     assert json.loads(body)["flag"] == "pick"
-    _, body = request("/api/rate", 200, data=b'{"p":"sample.jpg","stars":4}', session=session)
+    rate_payload = json.dumps({"p": "sample.jpg", "stars": 4, "snapshot_session": initial_session}).encode()
+    _, body = request("/api/rate", 200, data=rate_payload, session=session)
     assert json.loads(body)["stars"] == 4
 
     query = urlencode({"p": "sample.jpg"})
