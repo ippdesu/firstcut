@@ -187,16 +187,16 @@ function desiredPreloadPaths(){
     if(!lbLockBurstNav && LB.list.length > 1){
       const lIdx = LB.list.findIndex(p=>p.path===cur.path);
       if(lIdx >= 0){
-        pushUnique(LB.list[(lIdx + 1) % LB.list.length]);
-        pushUnique(LB.list[(lIdx - 1 + LB.list.length) % LB.list.length]);
+        if(lIdx + 1 < LB.list.length) pushUnique(LB.list[lIdx + 1]);
+        if(lIdx - 1 >= 0) pushUnique(LB.list[lIdx - 1]);
       }
     }
   } else if(LB.list.length > 1){
     const lIdx = LB.list.findIndex(p=>p.path===cur.path);
     if(lIdx >= 0){
       for(const off of [1,-1,2,-2]){
-        const j = (lIdx + off + LB.list.length) % LB.list.length;
-        pushUnique(LB.list[j]);
+        const j = lIdx + off;
+        if(j >= 0 && j < LB.list.length) pushUnique(LB.list[j]);
       }
     }
   }
@@ -579,6 +579,23 @@ function resetFilters(){
 }
 
 // ---------- 过滤/排序/分页 ----------
+function comparePhotos(a, b){
+  const by = f.sort;
+  const key = by.replace("-","");
+  const descending = key === "path" ? by.startsWith("-") : !by.startsWith("-");
+  if(key === "time"){
+    const da = a.datetime || "", db = b.datetime || "";
+    if(!da && db) return 1;
+    if(da && !db) return -1;
+    if(da !== db) return da < db ? (descending ? 1 : -1) : (descending ? -1 : 1);
+    return a.path < b.path ? (descending ? 1 : -1) : a.path > b.path ? (descending ? -1 : 1) : 0;
+  }
+  let va, vb;
+  if(key === "total"){ va = a.scores?a.scores.total:-1; vb = b.scores?b.scores.total:-1; }
+  else { va = a.path; vb = b.path; }
+  if(va !== vb) return va < vb ? (descending ? 1 : -1) : (descending ? -1 : 1);
+  return a.path < b.path ? -1 : a.path > b.path ? 1 : 0;
+}
 function visible(){
   let list = jpgs.filter(p=>{
     if(f.search && !p.filename.toLowerCase().includes(f.search)) return false;
@@ -600,23 +617,7 @@ function visible(){
     for(const d of DIMS) if(p.scores[d] < f.min[d]) return false;
     return true;
   });
-  const by = f.sort;
-  const key = by.replace("-","");
-  const descending = key === "path" ? by.startsWith("-") : !by.startsWith("-");
-  list.sort((a,b)=>{
-    if(key === "time"){
-      const da = a.datetime || "", db = b.datetime || "";
-      if(!da && db) return 1;
-      if(da && !db) return -1;
-      if(da !== db) return da < db ? (descending ? 1 : -1) : (descending ? -1 : 1);
-      return a.path < b.path ? (descending ? 1 : -1) : a.path > b.path ? (descending ? -1 : 1) : 0;
-    }
-    let va, vb;
-    if(key === "total"){ va = a.scores?a.scores.total:-1; vb = b.scores?b.scores.total:-1; }
-    else { va = a.path; vb = b.path; }
-    if(va !== vb) return va < vb ? (descending ? 1 : -1) : (descending ? -1 : 1);
-    return a.path < b.path ? -1 : a.path > b.path ? 1 : 0;
-  });
+  list.sort(comparePhotos);
   return list;
 }
 function updateFilterCounts(){
@@ -934,7 +935,7 @@ function setLockBurstNav(locked){
 syncLockBurstNavUi();
 document.getElementById('lbLockBurst').addEventListener('click', ()=>{
   setLockBurstNav(!lbLockBurstNav);
-  toast(lbLockBurstNav ? '已开启：←/→ 仅在当前连拍组内循环' : '已关闭：←/→ 可跨连拍组自由浏览');
+  toast(lbLockBurstNav ? '已开启：←/→ 仅在当前连拍组内切换' : '已关闭：←/→ 可跨连拍组自由浏览');
 });
 document.getElementById('uiLockBurstNav')?.addEventListener('change', e=>{
   setLockBurstNav(e.target.checked);
@@ -1007,7 +1008,7 @@ function groupMembers(){
   const cur = LB.current || LB.list[LB.idx];
   if(cur && cur.burst && cur.burst.group){
     const g = cur.burst.group;
-    return jpgs.filter(p => p.burst && p.burst.group === g);
+    return jpgs.filter(p => p.burst && p.burst.group === g).sort(comparePhotos);
   }
   return cur ? [cur] : [];
 }
@@ -1568,9 +1569,10 @@ window.addEventListener("keydown", e=>{
   else if(e.key === "ArrowRight" || e.key === "ArrowLeft"){
     if(LB.compare){
       const shown = shownPhotos();
-      let i = shown.findIndex(p=>p.path===LB.activePath);
-      i = e.key === "ArrowRight" ? (i+1) % shown.length : (i-1+shown.length) % shown.length;
-      selectPane(shown[i].path);
+      const i = shown.findIndex(p=>p.path===LB.activePath);
+      const nextIdx = e.key === "ArrowRight" ? Math.min(shown.length - 1, i + 1) : Math.max(0, i - 1);
+      if(nextIdx === i || nextIdx < 0) return;
+      selectPane(shown[nextIdx].path);
       return;
     }
     const set = lbNavSet();
@@ -1578,7 +1580,19 @@ window.addEventListener("keydown", e=>{
     const cur = LB.current || LB.list[LB.idx];
     let i = cur ? set.findIndex(p => p.path === cur.path) : -1;
     if(i < 0) i = Math.min(set.length - 1, Math.max(0, LB.idx));
-    i = e.key === "ArrowRight" ? (i+1) % set.length : (i-1+set.length) % set.length;
+    if(e.key === "ArrowLeft"){
+      if(i <= 0){
+        toast(lbLockBurstNav && cur?.burst?.group ? '已是当前连拍组第一张' : '已是第一张');
+        return;
+      }
+      i -= 1;
+    } else {
+      if(i >= set.length - 1){
+        toast(lbLockBurstNav && cur?.burst?.group ? '已是当前连拍组最后一张' : '已是最后一张');
+        return;
+      }
+      i += 1;
+    }
     const next = set[i];
     const listIdx = LB.list.findIndex(p => p.path === next.path);
     if(listIdx >= 0) LB.idx = listIdx;
