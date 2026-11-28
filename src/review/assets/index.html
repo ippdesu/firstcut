@@ -139,16 +139,17 @@
   #lbDetails textarea{min-height:60px;resize:vertical}
   #lbDetails .detail-save{margin-top:8px;background:#2e6b30;border:0;border-radius:4px;color:#fff;padding:7px 12px;cursor:pointer}
   #panes{flex:1;display:flex;gap:2px;min-height:0}
-  .pane{flex:1;position:relative;overflow:hidden;background:#000;cursor:grab;touch-action:none}
+  .pane{flex:1;position:relative;overflow:hidden;background:#000;cursor:grab;touch-action:none;user-select:none;-webkit-user-select:none}
   .pane.dragging{cursor:grabbing}
+  body.dragging-pane{user-select:none;cursor:grabbing!important}
   .pane.active::after{content:"";position:absolute;inset:0;border:2px solid var(--acc);pointer-events:none;z-index:2}
   .pane img{position:absolute;transform-origin:0 0;user-select:none;-webkit-user-drag:none;pointer-events:none}
-  .pane .tag{position:absolute;top:6px;left:8px;font-size:12px;background:rgba(0,0,0,.7);padding:2px 8px;border-radius:4px;pointer-events:none}
+  .pane .tag{position:absolute;top:6px;left:8px;font-size:12px;background:rgba(0,0,0,.7);padding:2px 8px;border-radius:4px;pointer-events:none;user-select:none;-webkit-user-select:none}
   .pane-actions{position:absolute;top:6px;right:8px;display:flex;gap:4px;z-index:3;pointer-events:auto}
   .pane-actions button{background:rgba(0,0,0,.78);border:1px solid rgba(255,255,255,.25);color:#ddd;padding:3px 8px;border-radius:4px;font-size:12px;cursor:pointer}
   .pane-actions button.act-pick:hover,.pane-actions button.act-pick.on{background:#2e7d32;border-color:#4caf50;color:#fff}
   .pane-actions button.act-reject:hover,.pane-actions button.act-reject.on{background:#b71c1c;border-color:#ef5350;color:#fff}
-  .pane .hint{position:absolute;bottom:8px;left:50%;transform:translateX(-50%);font-size:11px;color:var(--dim);pointer-events:none}
+  .pane .hint{position:absolute;bottom:8px;left:50%;transform:translateX(-50%);font-size:11px;color:var(--dim);pointer-events:none;user-select:none;-webkit-user-select:none}
   #strip{display:flex;gap:6px;padding:8px 12px;overflow-x:auto;background:var(--panel);border-top:1px solid var(--line)}
   #strip .st{position:relative;flex:none;width:86px;cursor:pointer;border:2px solid transparent;border-radius:4px}
   #strip .st img{width:100%;aspect-ratio:4/3;object-fit:cover;display:block;border-radius:2px}
@@ -339,7 +340,9 @@
       <option value="total">总分 高→低</option>
       <option value="-total">总分 低→高</option>
       <option value="time">拍摄时间 新→旧</option>
-      <option value="path">文件名</option>
+      <option value="-time">拍摄时间 旧→新</option>
+      <option value="path">文件名 A→Z</option>
+      <option value="-path">文件名 Z→A</option>
     </select>
     <h3>评分</h3>
     <div id="runBlock">
@@ -397,6 +400,7 @@
     </span>
     <span class="starbtns" id="lbStars" title="点击改星（快捷键 1~5），保存在本机并在导出时合并进 XMP"></span>
     <button id="lbCompare">并排对比</button>
+    <button type="button" id="lbLockBurst" aria-pressed="false" title="开启后 ←/→ 方向键仅在当前连拍组内循环；关闭后可自由跨组浏览全部筛选照片">🔓 跨组切换</button>
     <span id="lbZoom" role="status" aria-live="polite" title="相对于照片适配窗格尺寸的缩放倍率">缩放 100%</span>
     <button id="lbHistogramToggle" aria-expanded="true">直方图</button>
     <button id="lbDetailsToggle" aria-expanded="false">评分说明</button>
@@ -435,6 +439,10 @@
         <div class="cfg-line"><span class="cfg-name">直方图抽样比例</span><input class="cfg-number" id="histogramSampleNumber" type="number" min="1" max="25" step="1" value="10"></div>
         <div class="cfg-range"><span>1%</span><input id="histogramSampleRange" type="range" min="1" max="25" step="1" value="10" aria-label="直方图抽样比例滑块"><span>25%</span></div>
         <div class="cfg-help">比例越高，曲线统计越细，计算时间和临时内存也按比例增加。照片像素只在浏览器内抽样，不写入缓存。</div>
+      </div>
+      <div class="cfg-field">
+        <div class="cfg-line"><span class="cfg-name">灯箱方向键锁定在当前连拍组内</span><label class="cfg-check"><input type="checkbox" id="uiLockBurstNav"></label></div>
+        <div class="cfg-help">开启后在连拍照片上按 ←/→ 只在当前连拍组内循环；关闭后可自由进出连拍组浏览全部筛选结果。也可在灯箱顶部随时切换。</div>
       </div>
       <div class="cfg-line"><span id="uiSettingsStatus" class="dim"></span><button class="btn" id="uiSettingsSave">保存界面设置</button></div>
     </div>

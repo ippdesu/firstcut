@@ -45,6 +45,193 @@ async function loadPhoto(img, endpoint, path){
     if(!resource.abort.signal.aborted) img.dispatchEvent(new Event('error'));
   }
 }
+
+// ---------- 灯箱原图 LRU 预加载缓存（有界条目与字节上限，不抢占当前主图） ----------
+const FULL_CACHE_MAX_ENTRIES = 10;
+const FULL_CACHE_MAX_BYTES = 180 * 1024 * 1024;
+const MAX_PRELOAD_CONCURRENCY = 2;
+const fullImageCache = new Map(); // cacheKey -> {key, path, url, blobPromise, abort, bytes, status, isPreload}
+const fullImgTargets = new WeakMap();
+let fullImgReqSeq = 0;
+let fullCacheBytes = 0;
+let fullCacheRoot = '';
+let preloadQueue = [];
+let activePreloadCount = 0;
+let preloadTimer = null;
+
+function fullImageCacheKey(path){
+  return `${SNAPSHOT?.root || ''}|${path}`;
+}
+function clearPanePhotos(container){
+  container.querySelectorAll('img').forEach(img=>{
+    fullImgTargets.delete(img);
+    img.removeAttribute('src');
+  });
+  container.replaceChildren();
+}
+function clearFullImageCache(){
+  if(preloadTimer){ clearTimeout(preloadTimer); preloadTimer = null; }
+  preloadQueue = [];
+  activePreloadCount = 0;
+  for(const entry of fullImageCache.values()){
+    entry.abort.abort();
+    if(entry.url) URL.revokeObjectURL(entry.url);
+  }
+  fullImageCache.clear();
+  fullCacheBytes = 0;
+}
+function currentPinnedFullKeys(){
+  const pinned = new Set();
+  for(const p of shownPhotos()) pinned.add(fullImageCacheKey(p.path));
+  return pinned;
+}
+function evictFullImageCache(pinnedKeys){
+  while(fullImageCache.size > FULL_CACHE_MAX_ENTRIES || fullCacheBytes > FULL_CACHE_MAX_BYTES){
+    let candidate = null;
+    for(const entry of fullImageCache.values()){
+      if(!pinnedKeys.has(entry.key)){
+        candidate = entry;
+        break;
+      }
+    }
+    if(!candidate) break;
+    fullImageCache.delete(candidate.key);
+    candidate.abort.abort();
+    if(candidate.url) URL.revokeObjectURL(candidate.url);
+    fullCacheBytes = Math.max(0, fullCacheBytes - (candidate.bytes || 0));
+  }
+}
+function ensureFullImageEntry(path, isPreload=false){
+  const key = fullImageCacheKey(path);
+  let existing = fullImageCache.get(key);
+  if(existing){
+    if(existing.status === 'error'){
+      fullImageCache.delete(key);
+    } else {
+      // 刷新 LRU 顺序
+      fullImageCache.delete(key);
+      fullImageCache.set(key, existing);
+      if(!isPreload) existing.isPreload = false;
+      return existing;
+    }
+  }
+  const abort = new AbortController();
+  const entry = {
+    key, path, url:null, blobPromise:null, abort, bytes:0, status:'loading', isPreload,
+  };
+  entry.blobPromise = (async ()=>{
+    try{
+      const response = await apiFetch(`/image?p=${encodeURIComponent(path)}`, {signal:abort.signal});
+      if(!response.ok) throw new Error(response.status);
+      const blob = await response.blob();
+      if(abort.signal.aborted) return null;
+      const url = URL.createObjectURL(blob);
+      if(abort.signal.aborted){
+        URL.revokeObjectURL(url);
+        return null;
+      }
+      entry.url = url;
+      entry.bytes = blob.size || 0;
+      entry.status = 'ready';
+      fullCacheBytes += entry.bytes;
+      evictFullImageCache(currentPinnedFullKeys());
+      return url;
+    } catch (err) {
+      if(abort.signal.aborted){
+        if(fullImageCache.get(key) === entry) fullImageCache.delete(key);
+        return null;
+      }
+      entry.status = 'error';
+      throw err;
+    }
+  })();
+  fullImageCache.set(key, entry);
+  evictFullImageCache(currentPinnedFullKeys());
+  return entry;
+}
+function loadFullImage(img, path){
+  const token = ++fullImgReqSeq;
+  fullImgTargets.set(img, token);
+  const entry = ensureFullImageEntry(path, false);
+  if(entry.status === 'ready' && entry.url){
+    img.src = entry.url;
+    return;
+  }
+  entry.blobPromise.then(url=>{
+    if(!url || !img.isConnected || fullImgTargets.get(img) !== token) return;
+    img.src = url;
+  }).catch(()=>{
+    if(!img.isConnected || fullImgTargets.get(img) !== token) return;
+    img.dispatchEvent(new Event('error'));
+  });
+}
+function desiredPreloadPaths(){
+  if(!LB) return [];
+  const cur = LB.current || LB.list[LB.idx];
+  if(!cur) return [];
+  const shownSet = new Set(shownPhotos().map(p=>p.path));
+  const out = [];
+  const pushUnique = p=>{
+    if(!p || shownSet.has(p.path) || out.includes(p.path)) return;
+    out.push(p.path);
+  };
+  if(cur.burst && cur.burst.group > 0){
+    const members = groupMembers();
+    const gIdx = members.findIndex(m=>m.path===cur.path);
+    if(gIdx >= 0){
+      for(const off of [1,-1,2,-2,3,-3]){
+        const j = gIdx + off;
+        if(j >= 0 && j < members.length) pushUnique(members[j]);
+      }
+    }
+    if(!lbLockBurstNav && LB.list.length > 1){
+      const lIdx = LB.list.findIndex(p=>p.path===cur.path);
+      if(lIdx >= 0){
+        pushUnique(LB.list[(lIdx + 1) % LB.list.length]);
+        pushUnique(LB.list[(lIdx - 1 + LB.list.length) % LB.list.length]);
+      }
+    }
+  } else if(LB.list.length > 1){
+    const lIdx = LB.list.findIndex(p=>p.path===cur.path);
+    if(lIdx >= 0){
+      for(const off of [1,-1,2,-2]){
+        const j = (lIdx + off + LB.list.length) % LB.list.length;
+        pushUnique(LB.list[j]);
+      }
+    }
+  }
+  return out.slice(0, 6);
+}
+function pumpPreloads(){
+  if(!LB) return;
+  while(activePreloadCount < MAX_PRELOAD_CONCURRENCY && preloadQueue.length){
+    const path = preloadQueue.shift();
+    const key = fullImageCacheKey(path);
+    const existing = fullImageCache.get(key);
+    if(existing && existing.status === 'ready') continue;
+    if(existing && existing.status === 'loading') continue;
+    activePreloadCount++;
+    const entry = ensureFullImageEntry(path, true);
+    entry.blobPromise.catch(()=>{}).finally(()=>{
+      activePreloadCount = Math.max(0, activePreloadCount - 1);
+      pumpPreloads();
+    });
+  }
+}
+function scheduleLightboxPreload(){
+  if(preloadTimer){ clearTimeout(preloadTimer); preloadTimer = null; }
+  if(!LB) return;
+  const targets = desiredPreloadPaths();
+  const keepPaths = new Set([...shownPhotos().map(p=>p.path), ...targets]);
+  for(const [key, entry] of [...fullImageCache.entries()]){
+    if(entry.isPreload && entry.status === 'loading' && !keepPaths.has(entry.path)){
+      entry.abort.abort();
+      fullImageCache.delete(key);
+    }
+  }
+  preloadQueue = targets;
+  pumpPreloads();
+}
 const lazyPhotos = new IntersectionObserver(entries=>{
   for(const {target, isIntersecting} of entries){
     if(!isIntersecting || !target.isConnected) continue;
@@ -240,9 +427,14 @@ const f = {
   sort: "total",
 };
 const VALID_FLAG_FILTERS = new Set(["all", "pick", "exclude_reject", "reject", "unflagged"]);
+const VALID_SORT_MODES = new Set(["total", "-total", "time", "-time", "path", "-path"]);
 
 // ---------- 初始化 ----------
 function ingest(){
+  if(fullCacheRoot !== (SNAPSHOT?.root || '')){
+    clearFullImageCache();
+    fullCacheRoot = SNAPSHOT?.root || '';
+  }
   jpgs = SNAPSHOT.photos.filter(p => !p.is_raw);
   // 先刷新连拍组选项并校正失效的 f.group，再调用 apply() 渲染网格
   rebuildGroupOptions();
@@ -305,14 +497,14 @@ function loadData(){
     if(!r.ok) throw new Error(r.status);
     return r.json();
   }).then(j=>{
-    const currentPath = LB?.list?.[LB.idx]?.path;
+    const currentPath = LB?.current?.path || LB?.list?.[LB.idx]?.path;
     SNAPSHOT = j;
     ingest();
     if(currentPath){
       const list = visible();
       const idx = list.findIndex(p=>p.path===currentPath);
       if(idx < 0) closeLightbox();
-      else { LB.list = list; LB.idx = idx; renderLB(); }
+      else { LB.list = list; LB.idx = idx; LB.current = list[idx]; renderLB(); }
     }
   }).catch(()=>{});
 }
@@ -410,13 +602,20 @@ function visible(){
   });
   const by = f.sort;
   const key = by.replace("-","");
-  const descending = key === "total" ? !by.startsWith("-") : key === "time";
+  const descending = key === "path" ? by.startsWith("-") : !by.startsWith("-");
   list.sort((a,b)=>{
+    if(key === "time"){
+      const da = a.datetime || "", db = b.datetime || "";
+      if(!da && db) return 1;
+      if(da && !db) return -1;
+      if(da !== db) return da < db ? (descending ? 1 : -1) : (descending ? -1 : 1);
+      return a.path < b.path ? (descending ? 1 : -1) : a.path > b.path ? (descending ? -1 : 1) : 0;
+    }
     let va, vb;
     if(key === "total"){ va = a.scores?a.scores.total:-1; vb = b.scores?b.scores.total:-1; }
-    else if(key === "time"){ va = a.datetime || ""; vb = b.datetime || ""; }
     else { va = a.path; vb = b.path; }
-    return va < vb ? (descending ? 1 : -1) : va > vb ? (descending ? -1 : 1) : 0;
+    if(va !== vb) return va < vb ? (descending ? 1 : -1) : (descending ? -1 : 1);
+    return a.path < b.path ? -1 : a.path > b.path ? 1 : 0;
   });
   return list;
 }
@@ -713,8 +912,33 @@ window.addEventListener("scroll", hidePhotoContextMenu, true);
 window.addEventListener("resize", hidePhotoContextMenu);
 
 // ---------- 灯箱（1:1 缩放 / 并排同步对比） ----------
-let LB = null; // {list, idx, compare, sel:Set, activePath, view:{s, ax, ay, fx, fy}}
+let LB = null; // {list, idx, current, compare, sel:Set, activePath, view:{s, ax, ay, fx, fy}}
 const lbEl = document.getElementById("lb");
+let lbLockBurstNav = false;
+try { lbLockBurstNav = localStorage.getItem('fc_lb_lock_burst') === 'true'; } catch (_) {}
+function syncLockBurstNavUi(){
+  const btn = document.getElementById('lbLockBurst');
+  if(btn){
+    btn.classList.toggle('on', lbLockBurstNav);
+    btn.textContent = lbLockBurstNav ? '🔒 锁定连拍组' : '🔓 跨组切换';
+    btn.setAttribute('aria-pressed', String(lbLockBurstNav));
+  }
+  const chk = document.getElementById('uiLockBurstNav');
+  if(chk) chk.checked = lbLockBurstNav;
+}
+function setLockBurstNav(locked){
+  lbLockBurstNav = !!locked;
+  try { localStorage.setItem('fc_lb_lock_burst', String(lbLockBurstNav)); } catch (_) {}
+  syncLockBurstNavUi();
+}
+syncLockBurstNavUi();
+document.getElementById('lbLockBurst').addEventListener('click', ()=>{
+  setLockBurstNav(!lbLockBurstNav);
+  toast(lbLockBurstNav ? '已开启：←/→ 仅在当前连拍组内循环' : '已关闭：←/→ 可跨连拍组自由浏览');
+});
+document.getElementById('uiLockBurstNav')?.addEventListener('change', e=>{
+  setLockBurstNav(e.target.checked);
+});
 let histogramVisible = true;
 let histogramSamplePercent = 10;
 try { histogramVisible = localStorage.getItem('fc_histogram_visible') !== 'false'; } catch (_) {}
@@ -752,40 +976,47 @@ function focalLabel(value){
 }
 
 function openLightbox(p, list){
-  LB = { list, idx: list.indexOf(p), compare:false, sel:new Set([p.path]), activePath:p.path, view:{s:1, ax:.5, ay:.5, fx:.5, fy:.5}, detailsOpen:true, histogramOpen:histogramVisible };
+  const idx = Math.max(0, list.indexOf(p));
+  LB = { list, idx, current:p, compare:false, sel:new Set([p.path]), activePath:p.path, view:{s:1, ax:.5, ay:.5, fx:.5, fy:.5}, detailsOpen:true, histogramOpen:histogramVisible };
   lbEl.style.display = "flex";
+  syncLockBurstNavUi();
   renderLB();
 }
 function closeLightbox(){
   lbEl.style.display = "none";
+  document.body.classList.remove("dragging-pane");
   LB = null;
-  clearPhotos(document.getElementById('panes'));
-  clearPhotos(document.getElementById('strip'));
+  clearPanePhotos(document.getElementById('panes'));
+  const strip = document.getElementById('strip');
+  strip.dataset.key = '';
+  clearPhotos(strip);
+  clearFullImageCache();
 }
 document.getElementById("lbClose").addEventListener("click", closeLightbox);
 
 function lbNavSet(){
-  const cur = LB.list[LB.idx];
-  if(cur.burst && cur.burst.group){
+  const cur = LB.current || LB.list[LB.idx];
+  if(lbLockBurstNav && cur && cur.burst && cur.burst.group){
     const g = cur.burst.group;
-    return LB.list.filter(p => p.burst && p.burst.group === g);
+    const inList = LB.list.filter(p => p.burst && p.burst.group === g);
+    return inList.some(p => p.path === cur.path) ? inList : groupMembers();
   }
   return LB.list;
 }
 function groupMembers(){
-  const cur = LB.list[LB.idx];
-  if(cur.burst && cur.burst.group){
+  const cur = LB.current || LB.list[LB.idx];
+  if(cur && cur.burst && cur.burst.group){
     const g = cur.burst.group;
     return jpgs.filter(p => p.burst && p.burst.group === g);
   }
-  return [cur];
+  return cur ? [cur] : [];
 }
 function shownPhotos(){
   if(!LB) return [];
-  const cur = LB.list[LB.idx];
-  if(!LB.compare) return [cur];
+  const cur = LB.current || LB.list[LB.idx];
+  if(!LB.compare) return cur ? [cur] : [];
   const shown = [...LB.sel].map(path => jpgs.find(p=>p.path===path)).filter(Boolean);
-  return shown.length ? shown : [cur];
+  return shown.length ? shown : (cur ? [cur] : []);
 }
 function activePhoto(){
   if(!LB) return null;
@@ -865,19 +1096,26 @@ document.getElementById("lbFlagUnflag").addEventListener("click", ()=>{ const c 
 document.getElementById("lbFlagReject").addEventListener("click", ()=>{ const c = activePhoto(); if(c) setPhotoFlag(c, "reject"); });
 
 function renderLB(){
-  const cur = LB.list[LB.idx];
+  const cur = LB.current || LB.list[LB.idx];
   document.getElementById("lbCompare").classList.toggle("on", LB.compare);
 
   // 窗格
   const panes = document.getElementById("panes");
-  clearPhotos(panes);
+  clearPanePhotos(panes);
+  if(preloadTimer){ clearTimeout(preloadTimer); preloadTimer = null; }
   const shown = shownPhotos();
   if(!shown.some(p=>p.path===LB.activePath)) LB.activePath = shown[0].path;
+  let preloadStarted = false;
+  const triggerPreloadOnce = ()=>{
+    if(preloadStarted) return;
+    preloadStarted = true;
+    scheduleLightboxPreload();
+  };
   for(const p of shown){
     const pane = document.createElement("div");
     const flag = p.flag || "unflagged";
     pane.className = "pane"; pane.dataset.path = p.path;
-    pane.innerHTML = `<img>
+    pane.innerHTML = `<img draggable="false">
       <span class="tag">${escapeHtml(p.filename)}${p.scores ? " · "+p.scores.total.toFixed(1) : ""}</span>
       <div class="pane-actions">
         <button type="button" class="act-pick${flag==="pick"?" on":""}" title="标记为留用 (P)">⚑</button>
@@ -896,56 +1134,68 @@ function renderLB(){
     for(const eventName of ['load','error']) img.addEventListener(eventName, ()=>{
       if(pane.isConnected && LB){
         layoutPanes();
-        if(LB.activePath === p.path) renderLBHistogram();
+        if(LB.activePath === p.path){
+          renderLBHistogram();
+          triggerPreloadOnce();
+        }
       }
     });
     bindPane(pane);
     panes.appendChild(pane);
-    loadPhoto(img, '/image', p.path);
+    loadFullImage(img, p.path);
   }
+  preloadTimer = setTimeout(triggerPreloadOnce, 150);
   requestAnimationFrame(()=> layoutPanes());
 
-  // 底条（组内成员，供导航与对比勾选）
+  // 底条（同组或切换模式时复用缩略图 DOM，避免闪烁重建）
   const strip = document.getElementById("strip");
-  clearPhotos(strip);
-  for(const m of groupMembers()){
-    const d = document.createElement("div");
-    d.className = "st";
-    d.dataset.path = m.path;
-    const checked = LB.sel.has(m.path) ? "checked" : "";
-    const mFlag = m.flag || "unflagged";
-    d.innerHTML = `<img decoding="async">
-      ${LB.compare ? `<input type="checkbox" ${checked}>` : ""}
-      ${mFlag !== "unflagged" ? `<span class="st-flag ${mFlag}">${mFlag==="pick"?"⚑":"✕"}</span>` : ""}
-      ${m.burst ? `<span class="r">#${m.burst.rank}${m.burst.keep?"✓":"✗"}</span>` : ""}`;
-    d.addEventListener("click", e=>{
-      if(LB.compare && e.target.type === "checkbox"){
-        if(e.target.checked){
-          if(LB.sel.size >= 4){ e.target.checked = false; return; }
-          LB.sel.add(m.path);
-          LB.activePath = m.path;
+  const members = groupMembers();
+  const stripKey = `${LB.compare ? '1' : '0'}|${members.map(m=>m.path).join('\0')}`;
+  if(strip.dataset.key !== stripKey){
+    strip.dataset.key = stripKey;
+    clearPhotos(strip);
+    for(const m of members){
+      const d = document.createElement("div");
+      d.className = "st";
+      d.dataset.path = m.path;
+      const checked = LB.sel.has(m.path) ? "checked" : "";
+      const mFlag = m.flag || "unflagged";
+      d.innerHTML = `<img decoding="async">
+        ${LB.compare ? `<input type="checkbox" ${checked}>` : ""}
+        ${mFlag !== "unflagged" ? `<span class="st-flag ${mFlag}">${mFlag==="pick"?"⚑":"✕"}</span>` : ""}
+        ${m.burst ? `<span class="r">#${m.burst.rank}${m.burst.keep?"✓":"✗"}</span>` : ""}`;
+      d.addEventListener("click", e=>{
+        if(LB.compare && e.target.type === "checkbox"){
+          if(e.target.checked){
+            if(LB.sel.size >= 4){ e.target.checked = false; return; }
+            LB.sel.add(m.path);
+            LB.activePath = m.path;
+          } else {
+            if(LB.sel.size <= 1){ e.target.checked = false; return; }
+            LB.sel.delete(m.path);
+            if(LB.activePath === m.path) LB.activePath = [...LB.sel][0];
+          }
+          renderLB();
+        } else if(LB.compare){
+          if(LB.sel.has(m.path)) selectPane(m.path);
+          else if(LB.sel.size < 4){ LB.sel.add(m.path); LB.activePath = m.path; renderLB(); }
+          else toast('最多并排对比 4 张照片');
         } else {
-          if(LB.sel.size <= 1){ e.target.checked = false; return; }
-          LB.sel.delete(m.path);
-          if(LB.activePath === m.path) LB.activePath = [...LB.sel][0];
+          const idx = LB.list.findIndex(p=>p.path===m.path);
+          if(idx >= 0) LB.idx = idx;
+          LB.current = m;
+          LB.activePath = m.path;
+          LB.view = {s:1, ax:.5, ay:.5, fx:.5, fy:.5};
+          renderLB();
         }
-        renderLB();
-      } else if(LB.compare){
-        if(LB.sel.has(m.path)) selectPane(m.path);
-        else if(LB.sel.size < 4){ LB.sel.add(m.path); LB.activePath = m.path; renderLB(); }
-        else toast('最多并排对比 4 张照片');
-      } else {
-        let idx = LB.list.findIndex(p=>p.path===m.path);
-        if(idx < 0){ LB.list = groupMembers(); idx = LB.list.findIndex(p=>p.path===m.path); }
-        LB.idx = idx;
-        LB.activePath = m.path;
-        renderLB();
-      }
-    });
-    strip.appendChild(d);
-    thumbnail(d.querySelector('img'), m.path);
+      });
+      strip.appendChild(d);
+      thumbnail(d.querySelector('img'), m.path);
+    }
   }
   renderLBActive();
+  syncLBCurationBadges();
+  strip.querySelector('.st.cur')?.scrollIntoView({block:'nearest', inline:'nearest'});
 }
 
 // 最近邻缩图相当于抽取原始 JPEG 像素网格，约取全图 10%，避免插值抹平极值。不写缓存文件。
@@ -1225,14 +1475,19 @@ new ResizeObserver(()=>{
 }).observe(detailsPanel);
 document.getElementById("lbCompare").addEventListener("click", function(){
   LB.compare = !LB.compare;
-  const cur = LB.list[LB.idx];
-  if(LB.compare){ LB.sel = new Set([cur.path]); const g = groupMembers().filter(m=>m.path!==cur.path); if(g[0]) LB.sel.add(g[0].path); }
-  LB.activePath = cur.path;
+  const cur = LB.current || LB.list[LB.idx];
+  if(LB.compare && cur){ LB.sel = new Set([cur.path]); const g = groupMembers().filter(m=>m.path!==cur.path); if(g[0]) LB.sel.add(g[0].path); }
+  if(cur) LB.activePath = cur.path;
   renderLB();
 });
 
 // 窗格缩放/平移：所有窗格将同一图像相对位置 (ax, ay) 放在同一窗格相对位置 (fx, fy)。
 function bindPane(pane){
+  pane.addEventListener("dragstart", e=> e.preventDefault());
+  pane.addEventListener("selectstart", e=> e.preventDefault());
+  pane.addEventListener("mousedown", e=>{
+    if(e.button === 0 && !e.target.closest(".pane-actions")) e.preventDefault();
+  });
   pane.addEventListener("wheel", e=>{
     e.preventDefault();
     const img = pane.querySelector("img");
@@ -1251,13 +1506,16 @@ function bindPane(pane){
   let drag = null;
   pane.addEventListener("pointerdown", e=>{
     if(e.button !== 0 || e.target.closest(".pane-actions")) return;
+    try { window.getSelection?.()?.removeAllRanges?.(); } catch (_) {}
     selectPane(pane.dataset.path);
     drag = {id:e.pointerId, x:e.clientX, y:e.clientY, ax:LB.view.ax, ay:LB.view.ay};
-    pane.setPointerCapture(e.pointerId);
+    try { pane.setPointerCapture(e.pointerId); } catch (_) {}
     pane.classList.add("dragging");
+    document.body.classList.add("dragging-pane");
   });
   pane.addEventListener("pointermove", e=>{
     if(!drag || e.pointerId !== drag.id) return;
+    if(e.buttons === 0){ endPaneDrag(e); return; }
     const img = pane.querySelector("img");
     if(!LB || !img.naturalWidth || !img.naturalHeight) return;
     const k = curK(pane);
@@ -1269,6 +1527,7 @@ function bindPane(pane){
     if(!drag || e.pointerId !== drag.id) return;
     drag = null;
     pane.classList.remove("dragging");
+    document.body.classList.remove("dragging-pane");
   }
   pane.addEventListener("pointerup", endPaneDrag);
   pane.addEventListener("pointercancel", endPaneDrag);
@@ -1315,11 +1574,16 @@ window.addEventListener("keydown", e=>{
       return;
     }
     const set = lbNavSet();
-    const cur = LB.list[LB.idx];
-    let i = set.findIndex(p => p.path === cur.path);
+    if(!set.length) return;
+    const cur = LB.current || LB.list[LB.idx];
+    let i = cur ? set.findIndex(p => p.path === cur.path) : -1;
+    if(i < 0) i = Math.min(set.length - 1, Math.max(0, LB.idx));
     i = e.key === "ArrowRight" ? (i+1) % set.length : (i-1+set.length) % set.length;
-    LB.idx = LB.list.indexOf(set[i]);
-    LB.activePath = set[i].path;
+    const next = set[i];
+    const listIdx = LB.list.findIndex(p => p.path === next.path);
+    if(listIdx >= 0) LB.idx = listIdx;
+    LB.current = next;
+    LB.activePath = next.path;
     LB.view = {s:1, ax:.5, ay:.5, fx:.5, fy:.5};
     renderLB();
   }
@@ -1785,6 +2049,7 @@ document.getElementById('cfgBtn').addEventListener('click', async ()=>{
   histogramSamplePercent = Number(settings.histogram_sample_percent) || 10;
   document.getElementById('histogramSampleNumber').value = histogramSamplePercent;
   document.getElementById('histogramSampleRange').value = histogramSamplePercent;
+  syncLockBurstNavUi();
   document.getElementById('uiSettingsStatus').textContent = '';
   const v = j.values, body = document.getElementById('cfgBody');
   body.innerHTML = '';
@@ -1885,7 +2150,7 @@ try{
     f.keep = saved.keep || "all";
     f.group = saved.group || "all";
     f.aggregate = saved.aggregate !== false;
-    f.faces = !!saved.faces; f.sort = saved.sort || "total";
+    f.faces = !!saved.faces; f.sort = VALID_SORT_MODES.has(saved.sort) ? saved.sort : "total";
     f.min = Object.assign(f.min, saved.min || {});
     f.stars = new Set(saved.stars || []);
   }
